@@ -8,7 +8,7 @@ DeyLauncher is currently under active development.
 
 ## Current Status
 
-### Phase 1 — Authentication & Version Information
+###Authentication & Version Information
 
 - [x] Microsoft account sign-in
 - [x] Microsoft Device Code authentication
@@ -16,7 +16,9 @@ DeyLauncher is currently under active development.
 - [x] XSTS authentication
 - [ ] Minecraft Services authentication approval
 - [x] Mojang/Minecraft version manifest retrieval
-- [ ] Graphical launcher
+- [x] Graphical launcher
+- [x] Java versions fix
+- [ ] Mods manage on forge and fabric
 
 The Microsoft authentication system uses a registered Microsoft Entra application.
 
