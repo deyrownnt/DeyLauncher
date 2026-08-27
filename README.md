@@ -8,7 +8,7 @@ DeyLauncher is currently under active development.
 
 ## Current Status
 
-###Authentication & Version Information
+### Authentication & Version Information
 
 - [x] Microsoft account sign-in
 - [x] Microsoft Device Code authentication
