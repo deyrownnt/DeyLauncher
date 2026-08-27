@@ -18,7 +18,7 @@ DeyLauncher is currently under active development.
 - [x] Mojang/Minecraft version manifest retrieval
 - [x] Graphical launcher
 - [x] Java versions fix
-- [ ] Mods manage on forge and fabric
+- [ ] Mods manageing on forge and fabric
 
 The Microsoft authentication system uses a registered Microsoft Entra application.
 
