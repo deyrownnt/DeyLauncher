@@ -414,9 +414,4 @@ intentionally leave room for a `cape.png` + `capeSource` field later
 (for the planned separate DeyCape mod) without restructuring anything
 built this phase.
 
-## What's next (Phase 7)
 
-- GitHub server registry + friends.
-- Once Microsoft approval lands: wire the real `AuthSession` into Play
-  (currently Play still always uses offline sessions; Account dialog
-  sign-in works standalone but isn't yet the thing Play launches with).
