@@ -22,10 +22,12 @@ import javafx.geometry.Pos;
 import javafx.scene.Node;
 import javafx.scene.Scene;
 import javafx.scene.control.*;
+import javafx.scene.control.ButtonBase;
 import javafx.scene.image.Image;
 import javafx.scene.image.ImageView;
 import javafx.scene.layout.*;
 import javafx.scene.paint.Color;
+import javafx.scene.shape.Circle;
 import javafx.scene.text.Font;
 import javafx.scene.text.FontWeight;
 import javafx.scene.input.TransferMode;
@@ -131,6 +133,7 @@ public class LauncherApp extends Application {
     public void start(Stage stage) {
         this.stage = stage;
         this.prefs = LauncherPrefs.load();
+        boolean firstLaunch = !LauncherPrefs.exists();
         this.darkMode = prefs.darkMode;
         this.identityStore = new IdentityStore(gameFiles.root);
         this.settings = new GameLauncher.LaunchSettings(prefs.ramMinMb, prefs.ramMaxMb,
@@ -147,6 +150,14 @@ public class LauncherApp extends Application {
 
         root.setTop(buildTopBar());
         root.setCenter(buildCenterArea());
+
+        if (firstLaunch) {
+            javafx.geometry.Rectangle2D bounds =
+            javafx.stage.Screen.getPrimary().getVisualBounds();
+
+            prefs.startWidth = bounds.getWidth() * 0.75;
+            prefs.startHeight = bounds.getHeight() * 0.75;
+        }
 
         scene = new Scene(root, prefs.startWidth, prefs.startHeight);
         scene.getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
@@ -272,8 +283,14 @@ public class LauncherApp extends Application {
 
     // ---- Top bar: brand + Home/Library/Servers nav + settings + account ----
     private HBox buildTopBar() {
-        Label logo = new Label("⛏");
-        logo.getStyleClass().add("logo-glyph");
+        ImageView logo = new ImageView(
+        new Image(getClass().getResourceAsStream("/app-icon.png"))
+        );
+        logo.setFitWidth(34);
+        logo.setFitHeight(34);
+        logo.setPreserveRatio(true);
+        logo.setSmooth(true);
+        logo.getStyleClass().add("logo-icon");
 
         Label title = new Label("DEYLAUNCHER");
         title.setFont(Font.font("System", FontWeight.BOLD, 22));
@@ -301,7 +318,9 @@ public class LauncherApp extends Application {
 
         accountBtn = buildAccountButton();
 
-        Button settingsBtn = new Button("⚙");
+        Button settingsBtn = new Button();
+        settingsBtn.setGraphic(icon(IconFactory.Icon.SETTINGS, 18));
+        settingsBtn.setGraphicTextGap(0);
         settingsBtn.getStyleClass().add("icon-button");
         settingsBtn.setOnAction(e -> openSettingsDialog());
 
@@ -331,8 +350,8 @@ public class LauncherApp extends Application {
     }
 
     private VBox buildPlaceholderPage(String title, String subtitle) {
-        Label icon = new Label("🛠");
-        icon.getStyleClass().add("logo-glyph");
+        Node icon = icon(IconFactory.Icon.TOOLS, 34);
+        icon.getStyleClass().add("logo-icon");
         Label heading = new Label(title);
         heading.getStyleClass().add("card-heading");
         Label sub = new Label(subtitle);
@@ -522,7 +541,8 @@ public class LauncherApp extends Application {
                 row.getStyleClass().add("mod-row");
 
                 if (online && address != null && !address.isBlank()) {
-                    Button joinBtn = new Button("▶  Join");
+                    Button joinBtn = new Button();
+                    setButtonIcon(joinBtn, IconFactory.Icon.PLAY, "Join");
                     joinBtn.getStyleClass().add("pill-button");
                     joinBtn.setOnAction(e -> {
                         selectNavTab(navHomeBtn);
@@ -692,14 +712,16 @@ public class LauncherApp extends Application {
         versionBox.getStyleClass().add("input-field");
         versionBox.setMaxWidth(Double.MAX_VALUE);
 
-        modsBtn = new Button("🧩  Mods");
+        modsBtn = new Button();
+        setButtonIcon(modsBtn, IconFactory.Icon.PUZZLE, "Mods");
         modsBtn.getStyleClass().add("pill-button");
         modsBtn.setMaxWidth(Double.MAX_VALUE);
         modsBtn.setOnAction(e -> openModsDialog());
         modsBtn.setVisible(false);
         modsBtn.setManaged(false);
 
-        playButton = new Button("▶   PLAY");
+        playButton = new Button();
+        setButtonIcon(playButton, IconFactory.Icon.PLAY, "PLAY");
         playButton.getStyleClass().add("play-button");
         playButton.setMaxWidth(Double.MAX_VALUE);
         playButton.setOnAction(e -> onPlay());
@@ -925,7 +947,11 @@ public class LauncherApp extends Application {
         scroll.getStyleClass().add("mods-scroll");
         VBox.setVgrow(scroll, Priority.ALWAYS);
 
-        Label dropZone = new Label("⬇  Drag & drop mod .jar files here, or use Add Mods below");
+        Label dropZone = new Label(
+            "Drag & drop mod .jar files here, or use Add Mods below"
+        );
+        dropZone.setGraphic(icon(IconFactory.Icon.DOWNLOAD, 20));
+        dropZone.setGraphicTextGap(8);
         dropZone.getStyleClass().add("drop-zone");
         dropZone.setMaxWidth(Double.MAX_VALUE);
         dropZone.setAlignment(Pos.CENTER);
@@ -1059,7 +1085,7 @@ public class LauncherApp extends Application {
     private HBox buildModRow(ModsManager.ModEntry mod, ModsManager mods, Runnable refresh, boolean locked) {
         Node leading;
         if (locked) {
-            Label lockIcon = new Label("🔒");
+            Node lockIcon = icon(IconFactory.Icon.LOCK, 18);
             lockIcon.getStyleClass().add("mod-lock-icon");
             leading = lockIcon;
         } else {
@@ -1094,7 +1120,9 @@ public class LauncherApp extends Application {
             badge.getStyleClass().add("mod-bundled-badge");
             trailing = badge;
         } else {
-            Button deleteBtn = new Button("🗑");
+            Button deleteBtn = new Button();
+            deleteBtn.setGraphic(icon(IconFactory.Icon.TRASH, 17));
+            deleteBtn.setGraphicTextGap(0);
             deleteBtn.getStyleClass().add("mod-delete-button");
             deleteBtn.setOnAction(e -> {
                 try {
@@ -1169,7 +1197,8 @@ public class LauncherApp extends Application {
             TextField offlineNameField = new TextField();
             offlineNameField.setPromptText("e.g. Steve123");
             offlineNameField.getStyleClass().add("input-field");
-            Button applyBtn = new Button("✔  Apply");
+            Button applyBtn = new Button();
+            setButtonIcon(applyBtn, IconFactory.Icon.CHECK, "Apply");
             applyBtn.getStyleClass().addAll("settings-apply-button", "settings-apply-button-ready");
             applyBtn.setOnAction(e -> {
                 String name = offlineNameField.getText().trim();
@@ -1197,7 +1226,9 @@ public class LauncherApp extends Application {
 
             content.getChildren().addAll(createOfflineBtn, offlineForm);
         } else {
-            Label badge = new Label(active.accountType == AccountType.ONLINE ? "● ONLINE" : "○ OFFLINE");
+            Label badge = statusLabel(
+                active.accountType == AccountType.ONLINE
+            );
             badge.getStyleClass().add(active.accountType == AccountType.ONLINE ? "badge-online" : "badge-offline");
 
             Label nameLabel = new Label(active.username);
@@ -1233,7 +1264,8 @@ public class LauncherApp extends Application {
             });
             content.getChildren().add(invisibleBox);
 
-            Button logoutBtn = new Button("🚪  Log Out");
+            Button logoutBtn = new Button();
+            setButtonIcon(logoutBtn, IconFactory.Icon.LOGOUT, "Log Out");
             logoutBtn.getStyleClass().addAll("pill-button", "logout-button");
             logoutBtn.setOnAction(e -> {
                 // Session-only Microsoft state first, then the persisted account record. Online
@@ -1334,9 +1366,15 @@ public class LauncherApp extends Application {
         HBox modelRow = new HBox(16, classicBtn, slimBtn);
         modelRow.setAlignment(Pos.CENTER);
 
-        Button importBtn = new Button("📁  Import Skin");
+        Button importBtn = new Button();
+        setButtonIcon(importBtn, IconFactory.Icon.FOLDER, "Import Skin");
         importBtn.getStyleClass().add("pill-button");
-        Button removeBtn = new Button("🗑  Remove / Restore");
+        Button removeBtn = new Button();
+        setButtonIcon(
+            removeBtn,
+            IconFactory.Icon.TRASH,
+            "Remove / Restore"
+        );
         removeBtn.getStyleClass().add("pill-button");
         Label capeLimitNote = new Label();
         capeLimitNote.getStyleClass().add("notice-label");
@@ -1346,7 +1384,12 @@ public class LauncherApp extends Application {
 
         HBox actionRow = new HBox(10, importBtn, removeBtn);
         actionRow.setAlignment(Pos.CENTER);
-        Button applyCapeBtn = new Button("✔  APPLY CAPE");
+        Button applyCapeBtn = new Button();
+        setButtonIcon(
+                applyCapeBtn,
+                IconFactory.Icon.CHECK,
+                "APPLY CAPE"
+        );
         applyCapeBtn.getStyleClass().add("settings-apply-button");
         updateCapeApplyButton(applyCapeBtn);
         right.getChildren().addAll(previewHost, modelRow, actionRow, applyCapeBtn, capeLimitNote);
@@ -1558,10 +1601,18 @@ public class LauncherApp extends Application {
         if (capeDirty) {
             button.getStyleClass().add("settings-apply-button-ready");
             button.setDisable(false);
-            button.setText("✔  APPLY CAPE CHANGE");
+            setButtonIcon(
+                button,
+                IconFactory.Icon.CHECK,
+                "APPLY CAPE CHANGE"
+            );
         } else {
             button.setDisable(true);
-            button.setText("✔  CAPE APPLIED");
+            setButtonIcon(
+                button,
+                IconFactory.Icon.CHECK,
+                "CAPE APPLIED"
+            );
         }
     }
 
@@ -1824,14 +1875,23 @@ public class LauncherApp extends Application {
         Label codeLabel = new Label(userCode);
         codeLabel.getStyleClass().add("device-code-label");
 
-        Button copyBtn = new Button("📋  Copy Code");
+        Button copyBtn = new Button();
+        setButtonIcon(
+            copyBtn,
+            IconFactory.Icon.CLIPBOARD,
+            "Copy Code"
+        );
         copyBtn.getStyleClass().add("pill-button");
         copyBtn.setOnAction(e -> {
             var clipboard = javafx.scene.input.Clipboard.getSystemClipboard();
             var contentToCopy = new javafx.scene.input.ClipboardContent();
             contentToCopy.putString(userCode);
             clipboard.setContent(contentToCopy);
-            copyBtn.setText("✔  Copied!");
+            setButtonIcon(
+                copyBtn,
+                IconFactory.Icon.CHECK,
+                "Copied!"
+            );
         });
 
         VBox box = new VBox(8, step1, link, urlSelectable, step2, codeLabel, copyBtn);
@@ -1910,16 +1970,29 @@ public class LauncherApp extends Application {
         Label savedLabel = new Label();
         savedLabel.getStyleClass().add("notice-label");
 
-        Button applyBtn = new Button("✔  APPLY");
+        Button applyBtn = new Button();
+        setButtonIcon(
+            applyBtn,
+            IconFactory.Icon.CHECK,
+            "APPLY"
+        );
         applyBtn.getStyleClass().add("settings-apply-button");
         dirty.addListener((obs, old, changed) -> {
             if (changed) {
                 if (!applyBtn.getStyleClass().contains("settings-apply-button-ready"))
                     applyBtn.getStyleClass().add("settings-apply-button-ready");
-                applyBtn.setText("✔  APPLY CHANGES");
+                setButtonIcon(
+                    applyBtn,
+                    IconFactory.Icon.CHECK,
+                    "APPLY CHANGES"
+                );
             } else {
                 applyBtn.getStyleClass().remove("settings-apply-button-ready");
-                applyBtn.setText("✔  APPLY");
+                setButtonIcon(
+                    applyBtn,
+                    IconFactory.Icon.CHECK,
+                    "APPLY"
+                );
             }
         });
         applyBtn.setOnAction(e -> {
@@ -2002,12 +2075,25 @@ public class LauncherApp extends Application {
     }
 
     private GridPane buildLauncherSettingsPane(Runnable markDirty, DialogPane dialogPane) {
-        ToggleButton themeToggle = new ToggleButton(darkMode ? "🌙  Dark" : "☀  Light");
+        ToggleButton themeToggle = new ToggleButton();
+        setButtonIcon(
+            themeToggle,
+            darkMode
+                ? IconFactory.Icon.MOON
+                : IconFactory.Icon.SUN,
+            darkMode ? "Dark" : "Light"
+        );
         themeToggle.getStyleClass().add("pill-button");
         themeToggle.setSelected(darkMode);
         themeToggle.setOnAction(e -> {
             darkMode = themeToggle.isSelected();
-            themeToggle.setText(darkMode ? "🌙  Dark" : "☀  Light");
+            setButtonIcon(
+                themeToggle,
+                darkMode
+                    ? IconFactory.Icon.MOON
+                    : IconFactory.Icon.SUN,
+                darkMode ? "Dark" : "Light"
+            );
             prefs.darkMode = darkMode;
             prefs.save();
             applyTheme();
@@ -2371,5 +2457,35 @@ public class LauncherApp extends Application {
 
     private void log(String line) {
         logArea.appendText(line + "\n");
+    }
+
+    // ---- Cross-platform icon helpers ----
+
+    private Node icon(IconFactory.Icon icon) {
+        return IconFactory.create(icon, 18);
+    }
+
+    private Node icon(IconFactory.Icon icon, double size) {
+        return IconFactory.create(icon, size);
+    }
+
+    private void setButtonIcon(ButtonBase button, IconFactory.Icon icon, String text) {
+        button.setGraphic(icon(icon, 17));
+        button.setText(text);
+        button.setGraphicTextGap(7);
+    }
+
+    /**
+     * Keeps the original ONLINE/OFFLINE appearance: text + a small status dot.
+     * The dot is a JavaFX Circle instead of a Unicode glyph, so it renders
+     * identically on Windows/Linux without depending on an emoji font.
+     */
+    private Label statusLabel(boolean online) {
+        Label label = new Label(online ? "ONLINE" : "OFFLINE");
+        Circle dot = new Circle(4.0);
+        dot.getStyleClass().add(online ? "status-dot-online" : "status-dot-offline");
+        label.setGraphic(dot);
+        label.setGraphicTextGap(6);
+        return label;
     }
 }
