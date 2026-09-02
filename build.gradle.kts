@@ -2,7 +2,7 @@ plugins {
     id("java")
     id("application")
     id("org.openjfx.javafxplugin") version "0.1.0"
-    id("com.gradleup.shadow") version "8.3.5" // produces the single runnable .jar
+    id("com.gradleup.shadow") version "9.2.2" // produces the single runnable .jar
 }
 
 group = "com.deylauncher"
@@ -32,6 +32,10 @@ dependencies {
 }
 
 application {
+    mainClass.set("com.deylauncher.ui.LauncherApp")
+}
+
+tasks.withType<JavaExec>().configureEach {
     mainClass.set("com.deylauncher.ui.LauncherApp")
 }
 
@@ -95,4 +99,19 @@ tasks.register<Sync>("prepareJpackage") {
     from(configurations.runtimeClasspath)
 
     into(layout.buildDirectory.dir("jpackage-input"))
+}
+
+tasks.named("distZip") {
+    dependsOn(tasks.named("shadowJar"))
+}
+
+tasks.named("distTar") {
+    dependsOn(tasks.named("shadowJar"))
+}
+
+tasks.named("startScripts") {
+    dependsOn(tasks.named("shadowJar"))
+}
+tasks.named("startShadowScripts") {
+    dependsOn(tasks.named("jar"))
 }

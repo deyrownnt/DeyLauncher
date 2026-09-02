@@ -51,6 +51,10 @@ public class LauncherPrefs {
     private static Path file() {
         return Path.of(System.getProperty("user.home"), ".deylauncher", "launcher.properties");
     }
+    
+    public static boolean exists() {
+    return Files.exists(file());
+    }
 
     public static LauncherPrefs load() {
         LauncherPrefs p = new LauncherPrefs();

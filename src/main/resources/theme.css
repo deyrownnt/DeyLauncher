@@ -482,3 +482,70 @@
 }
 .theme-light .dialog-pane .button-bar .button { -fx-background-color: #ffffff; -fx-text-fill: #17181b; -fx-border-color: #e2e2e4; -fx-border-radius: 8; }
 .theme-light .dialog-pane .button-bar .button:hover { -fx-background-color: #f0f0f1; }
+
+/* ============================================================
+   Cross-platform JavaFX SVG icon system
+   Icons are vector paths, not Unicode glyphs.
+   ============================================================ */
+
+.icon-svg {
+    -fx-fill: #f5f5f6;
+}
+
+.theme-dark .icon-svg {
+    -fx-fill: #f5f5f6;
+}
+
+.theme-light .icon-svg {
+    -fx-fill: #17181b;
+}
+
+.icon-online {
+    -fx-fill: #ff7a1f;
+}
+
+.icon-offline {
+    -fx-fill: #9a9ba3;
+}
+
+/* Logo */
+.theme-dark .logo-icon,
+.theme-light .logo-icon {
+    -fx-fill: #ff7a1f;
+}
+
+/* Icon buttons */
+.theme-dark .icon-button .icon-svg {
+    -fx-fill: #f5f5f6;
+}
+
+.theme-dark .icon-button:hover .icon-svg {
+    -fx-fill: #ff7a1f;
+}
+
+.theme-light .icon-button .icon-svg {
+    -fx-fill: #17181b;
+}
+
+.theme-light .icon-button:hover .icon-svg {
+    -fx-fill: #ff7a1f;
+}
+
+/* Buttons that have an icon followed by text */
+.button .icon-svg {
+    -fx-fill: -fx-text-fill;
+}
+
+/* Keep status dots visually small */
+.status-icon {
+    -fx-scale-x: 0.7;
+    -fx-scale-y: 0.7;
+}
+.status-dot-online {
+    -fx-fill: #55d66b;
+}
+
+.status-dot-offline {
+    -fx-fill: #888888;
+}
+
