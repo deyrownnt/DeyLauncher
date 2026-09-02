@@ -63,7 +63,7 @@ DeyLauncher is designed around a simple goal: provide a modern launcher experien
 |---|---|
 | Linux x64 | ✅ |
 | Windows x64 | ✅ |
-| macOS | 🟡 Planned |
+| macOS | ❌ |
 
 The launcher itself is built with Java/JavaFX, while the release packaging is handled through `jpackage`.
 
