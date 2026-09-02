@@ -1,0 +1,135 @@
+name: Build DeyLauncher
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    name: Build Linux
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Create embedded GitHub config
+        shell: bash
+        env:
+          GITHUB_TOKEN_VALUE: ${{ secrets.DEYLAUNCHER_GITHUB_TOKEN }}
+          GITHUB_OWNER: ${{ secrets.DEYLAUNCHER_GITHUB_OWNER }}
+          GITHUB_REPO: ${{ secrets.DEYLAUNCHER_GITHUB_REPO }}
+          GITHUB_FRIENDS_PATH: ${{ secrets.DEYLAUNCHER_GITHUB_FRIENDS_PATH }}
+        run: |
+          mkdir -p secrets
+
+          cat > secrets/embedded-github.properties <<EOF
+          token=${GITHUB_TOKEN_VALUE}
+          owner=${GITHUB_OWNER}
+          repo=${GITHUB_REPO}
+          friendsPath=${GITHUB_FRIENDS_PATH}
+          EOF
+
+      - name: Build
+        run: ./gradlew clean prepareJpackage
+
+      - name: Create Linux app-image
+        run: |
+          rm -rf dist
+          mkdir -p dist
+
+          jpackage \
+            --type app-image \
+            --input build/jpackage-input \
+            --main-jar DeyLauncher-0.1.0.jar \
+            --main-class com.deylauncher.ui.LauncherApp \
+            --name DeyLauncher \
+            --icon src/main/resources/app-icon.png \
+            --dest dist \
+            --java-options "--module-path \$APPDIR --add-modules javafx.controls,javafx.graphics" \
+            --java-options "--enable-native-access=javafx.graphics"
+
+      - name: Create Linux archive
+        run: |
+          cd dist
+          tar -czf DeyLauncher-Linux.tar.gz DeyLauncher
+
+      - name: Upload Linux build
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeyLauncher-Linux
+          path: dist/DeyLauncher-Linux.tar.gz
+
+
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Create embedded GitHub config
+        shell: pwsh
+        env:
+          GITHUB_TOKEN_VALUE: ${{ secrets.DEYLAUNCHER_GITHUB_TOKEN }}
+          GITHUB_OWNER: ${{ secrets.DEYLAUNCHER_GITHUB_OWNER }}
+          GITHUB_REPO: ${{ secrets.DEYLAUNCHER_GITHUB_REPO }}
+          GITHUB_FRIENDS_PATH: ${{ secrets.DEYLAUNCHER_GITHUB_FRIENDS_PATH }}
+        run: |
+          New-Item -ItemType Directory -Force -Path secrets | Out-Null
+
+          @"
+          token=$env:GITHUB_TOKEN_VALUE
+          owner=$env:GITHUB_OWNER
+          repo=$env:GITHUB_REPO
+          friendsPath=$env:GITHUB_FRIENDS_PATH
+          "@ | Set-Content secrets/embedded-github.properties
+
+      - name: Build
+        run: .\gradlew.bat clean prepareJpackage
+
+      - name: Create Windows app-image
+        shell: pwsh
+        run: |
+          Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          jpackage `
+            --type app-image `
+            --input build/jpackage-input `
+            --main-jar DeyLauncher-0.1.0.jar `
+            --main-class com.deylauncher.ui.LauncherApp `
+            --name DeyLauncher `
+            --icon src/main/resources/app-icon.ico `
+            --dest dist `
+            --java-options '--module-path $APPDIR --add-modules javafx.controls,javafx.graphics' `
+            --java-options '--enable-native-access=javafx.graphics'
+
+      - name: Create Windows archive
+        shell: pwsh
+        run: |
+          Compress-Archive `
+            -Path dist/DeyLauncher `
+            -DestinationPath dist/DeyLauncher-Windows.zip
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: DeyLauncher-Windows
+          path: dist/DeyLauncher-Windows.zip
