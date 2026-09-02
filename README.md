@@ -47,24 +47,6 @@ No unrelated systems were rewritten -- GameFiles, GameLauncher,
 VersionResolver, the mod loader installers, and the mods UI are all
 untouched.
 
-## Please test
-
-I can't run a Java GUI from this sandbox (no network, no display):
-```bash
-./gradlew clean run
-```
-- Offline: Account > type a name > Apply > close/reopen dialog > name
-  persists > Play uses it without retyping or ever having played before.
-- Online: Sign in with Microsoft (should now complete, not just reach
-  a known 403) > Play > confirm the game actually connects online, not
-  as a local/offline player.
-- Device code: confirm the link opens your browser, the URL field is
-  actually selectable, and Copy Code puts the exact code on your
-  clipboard.
-
-Paste back what you see either way, especially anything unexpected --
-this round touches a genuinely load-bearing path (which session actually
-reaches the game), so I'd rather verify against real output than assume.
 
 ## Files changed this round, and why
 
