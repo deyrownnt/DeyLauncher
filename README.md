@@ -391,13 +391,14 @@ Some systems are still evolving, particularly online account persistence, skin s
 
 Planned improvements include:
 
-- [ ] macOS packaging
 - [ ] More complete account/session persistence
 - [ ] Offline skin synchronization through a companion system
 - [ ] Cape support
 - [ ] Improved release/update distribution
 - [ ] Additional launcher customization
 - [ ] Further UI/UX improvements
+- [ ] Self hosted servers
+- [ ] Original fatures in self-hosted severs(multi-host)
 
 ## Development philosophy
 
