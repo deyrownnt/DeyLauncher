@@ -12,6 +12,7 @@ import com.deylauncher.modloader.FabricInstaller;
 import com.deylauncher.modloader.FabricApiInstaller;
 import com.deylauncher.modloader.ForgeInstaller;
 import com.deylauncher.modloader.SodiumInstaller;
+import com.deylauncher.server.*;
 import com.google.gson.JsonObject;
 import com.deylauncher.version.VersionManifest;
 import javafx.application.Application;
@@ -38,7 +39,10 @@ import javafx.stage.Stage;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 
 /**
@@ -67,6 +71,9 @@ public class LauncherApp extends Application {
     private Label accountStatusNotice;
     private FriendsService friendsService; // null until github.properties/embedded config is set -- see GitHubConfig
     private FriendsCache friendsCache;
+    private ServerStore serverStore;
+    private AddedServersStore addedServersStore;
+    private final java.util.Map<String, ServerProcessManager> runningServers = new java.util.HashMap<>(); // serverId -> process manager, for whatever's live this session
 
     // Main-page account button (face + name + online/offline dot) -- see buildAccountButton()/refreshAccountButton()
     private Button accountBtn;
@@ -139,6 +146,8 @@ public class LauncherApp extends Application {
         this.settings = new GameLauncher.LaunchSettings(prefs.ramMinMb, prefs.ramMaxMb,
                 prefs.gameWidth, prefs.gameHeight, prefs.fullscreen);
         this.friendsCache = new FriendsCache(gameFiles.root);
+        this.serverStore = new ServerStore(gameFiles.root);
+        this.addedServersStore = new AddedServersStore(gameFiles.root);
         GitHubConfig githubConfig = GitHubConfig.load();
         this.friendsService = githubConfig.isConfigured() ? new FriendsService(githubConfig) : null;
 
@@ -344,8 +353,7 @@ public class LauncherApp extends Application {
         } else if (selected == navFriendsBtn) {
             pageHost.getChildren().setAll(buildFriendsPage());
         } else {
-            pageHost.getChildren().setAll(buildPlaceholderPage("Servers",
-                    "Browse and quick-join self-hosted servers from here -- coming soon."));
+            pageHost.getChildren().setAll(buildServersPage());
         }
     }
 
@@ -530,13 +538,28 @@ public class LauncherApp extends Application {
                 Region dot = new Region();
                 dot.getStyleClass().addAll("account-status-dot", online ? "dot-online" : "dot-offline");
 
+                ImageView avatarView = new ImageView();
+                avatarView.setFitWidth(28);
+                avatarView.setFitHeight(28);
+                avatarView.setSmooth(false); // keep skin pixels crisp, not blurred
+                avatarView.getStyleClass().add("account-btn-face");
+                Image cachedAvatar = friendFaceCached(friend.uuid, online);
+                if (cachedAvatar != null) {
+                    avatarView.setImage(cachedAvatar);
+                } else {
+                    avatarView.setImage(faceThumbnail(null)); // placeholder while an online friend's real skin fetches
+                    if (online) {
+                        fetchFriendAvatarAsync(friend.uuid, () -> renderFriendsPageContent(active, view));
+                    }
+                }
+
                 Label name = new Label(friend.username);
                 name.getStyleClass().add("mod-name");
 
                 Region spacer = new Region();
                 HBox.setHgrow(spacer, Priority.ALWAYS);
 
-                HBox row = new HBox(10, dot, name, spacer);
+                HBox row = new HBox(10, avatarView, dot, name, spacer);
                 row.setAlignment(Pos.CENTER_LEFT);
                 row.getStyleClass().add("mod-row");
 
@@ -560,6 +583,1042 @@ public class LauncherApp extends Application {
                 friendsPageContent.getChildren().add(row);
             }
         }
+    }
+
+    /**
+     * Returns a cached, cropped face for a friend if we already have one, else null (caller
+     * shows a placeholder and, for online friends, kicks off fetchFriendAvatarAsync). Offline
+     * friends never get a real fetch attempt -- DeyLauncher has no access to another player's
+     * local custom skin (no sync layer exists yet, see DEYLAUNCHER_SKIN_PROTOCOL.md), so they
+     * always get the same clean default face rather than ever showing broken/whole-skin data.
+     */
+    private Image friendFaceCached(String uuid, boolean online) {
+        if (!online) return faceThumbnail(null);
+        java.nio.file.Path cache = gameFiles.root.resolve("friend-avatars").resolve(uuid + ".png");
+        if (java.nio.file.Files.exists(cache)) {
+            try {
+                return faceThumbnail(new Image(cache.toUri().toString()));
+            } catch (Exception ignored) {
+                // Fall through -- treat a corrupt cache file the same as "not cached yet."
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Looks up an online friend's real skin via Mojang's public session-profile endpoint (no
+     * auth needed -- this is standard public player data) and caches the PNG locally, then
+     * re-renders so the placeholder swaps for the real face. Never touched for offline friends.
+     */
+    private void fetchFriendAvatarAsync(String uuid, Runnable onDone) {
+        Task<Void> task = new Task<>() {
+            @Override
+            protected Void call() {
+                try {
+                    var http = java.net.http.HttpClient.newHttpClient();
+                    var profileReq = java.net.http.HttpRequest.newBuilder(java.net.URI.create(
+                            "https://sessionserver.mojang.com/session/minecraft/profile/" + uuid)).GET().build();
+                    var profileResp = http.send(profileReq, java.net.http.HttpResponse.BodyHandlers.ofString());
+                    if (profileResp.statusCode() != 200) return null;
+
+                    var json = com.google.gson.JsonParser.parseString(profileResp.body()).getAsJsonObject();
+                    String texturesB64 = null;
+                    for (var prop : json.getAsJsonArray("properties")) {
+                        var obj = prop.getAsJsonObject();
+                        if ("textures".equals(obj.get("name").getAsString())) {
+                            texturesB64 = obj.get("value").getAsString();
+                            break;
+                        }
+                    }
+                    if (texturesB64 == null) return null;
+
+                    String decoded = new String(java.util.Base64.getDecoder().decode(texturesB64),
+                            java.nio.charset.StandardCharsets.UTF_8);
+                    var texturesJson = com.google.gson.JsonParser.parseString(decoded).getAsJsonObject();
+                    var skinObj = texturesJson.getAsJsonObject("textures").getAsJsonObject("SKIN");
+                    if (skinObj == null) return null;
+                    String skinUrl = skinObj.get("url").getAsString();
+
+                    java.nio.file.Path cache = gameFiles.root.resolve("friend-avatars").resolve(uuid + ".png");
+                    java.nio.file.Files.createDirectories(cache.getParent());
+                    var imgReq = java.net.http.HttpRequest.newBuilder(java.net.URI.create(skinUrl)).GET().build();
+                    http.send(imgReq, java.net.http.HttpResponse.BodyHandlers.ofFile(cache));
+                } catch (Exception ignored) {
+                    // Best-effort -- the placeholder just stays up if this fails.
+                }
+                return null;
+            }
+        };
+        task.setOnSucceeded(e -> Platform.runLater(onDone));
+        new Thread(task, "friend-avatar-fetch").start();
+    }
+
+    // ---- Servers page: Your Servers / Added Servers / Friends Playing Now ----
+    private VBox serversPageContent;
+    private ScrollPane serversPageScroll;
+
+    private Node buildServersPage() {
+        if (serversPageScroll == null) {
+            serversPageContent = new VBox(24);
+            serversPageContent.setPadding(new Insets(32));
+            serversPageContent.setMaxWidth(920);
+            VBox wrapper = new VBox(serversPageContent);
+            wrapper.setAlignment(Pos.TOP_CENTER);
+            serversPageScroll = new ScrollPane(wrapper);
+            serversPageScroll.setFitToWidth(true);
+            serversPageScroll.getStyleClass().add("settings-scroll");
+        }
+        renderServersPageContent();
+        return serversPageScroll;
+    }
+
+    private ToggleButton sortToggleButton(String label, ServerSortMode mode, ToggleGroup group) {
+        ToggleButton btn = new ToggleButton(label);
+        btn.getStyleClass().add("pill-button");
+        btn.setToggleGroup(group);
+        btn.setSelected(serversSortMode == mode);
+        btn.setOnAction(e -> {
+            serversSortMode = mode;
+            renderServersPageContent();
+        });
+        return btn;
+    }
+
+    private List<ServerInstance> sortInstances(List<ServerInstance> list) {
+        var out = new ArrayList<>(list);
+        switch (serversSortMode) {
+            case NAME_ASC -> out.sort(Comparator.comparing(s -> s.name == null ? "" : s.name.toLowerCase()));
+            case NAME_DESC -> out.sort(Comparator.comparing((ServerInstance s) -> s.name == null ? "" : s.name.toLowerCase()).reversed());
+            case RECENTLY_PLAYED -> out.sort(Comparator.comparingLong((ServerInstance s) -> s.lastJoinedAt).reversed());
+            case LEAST_RECENTLY_PLAYED -> out.sort(Comparator.comparingLong(s -> s.lastJoinedAt));
+        }
+        return out;
+    }
+
+    private List<AddedServersStore.AddedServer> sortAdded(List<AddedServersStore.AddedServer> list) {
+        var out = new ArrayList<>(list);
+        switch (serversSortMode) {
+            case NAME_ASC -> out.sort(Comparator.comparing(s -> s.name().toLowerCase()));
+            case NAME_DESC -> out.sort(Comparator.comparing((AddedServersStore.AddedServer s) -> s.name().toLowerCase()).reversed());
+            case RECENTLY_PLAYED -> out.sort(Comparator.comparingLong((AddedServersStore.AddedServer s) -> s.lastJoinedAt).reversed());
+            case LEAST_RECENTLY_PLAYED -> out.sort(Comparator.comparingLong(s -> s.lastJoinedAt));
+        }
+        return out;
+    }
+
+    private enum ServerSortMode { NAME_ASC, NAME_DESC, RECENTLY_PLAYED, LEAST_RECENTLY_PLAYED }
+    private ServerSortMode serversSortMode = ServerSortMode.RECENTLY_PLAYED;
+
+    private void renderServersPageContent() {
+        serversPageContent.getChildren().clear();
+
+        // ---- Header: title, sort buttons, Add Server, Create Server ----
+        Label heading = new Label("Servers");
+        heading.getStyleClass().add("card-heading");
+
+        ToggleGroup sortGroup = new ToggleGroup();
+        ToggleButton nameAscBtn = sortToggleButton("Name A-Z", ServerSortMode.NAME_ASC, sortGroup);
+        ToggleButton nameDescBtn = sortToggleButton("Name Z-A", ServerSortMode.NAME_DESC, sortGroup);
+        ToggleButton recentBtn = sortToggleButton("Recently Played", ServerSortMode.RECENTLY_PLAYED, sortGroup);
+        ToggleButton leastRecentBtn = sortToggleButton("Least Recently Played", ServerSortMode.LEAST_RECENTLY_PLAYED, sortGroup);
+        HBox sortBar = new HBox(6, nameAscBtn, nameDescBtn, recentBtn, leastRecentBtn);
+
+        Button addServerBtn = new Button("+  Add Server");
+        addServerBtn.getStyleClass().add("pill-button");
+        addServerBtn.setOnAction(e -> openAddServerDialog());
+
+        Button createServerBtn = new Button("+  Create Server");
+        createServerBtn.getStyleClass().add("play-button");
+        createServerBtn.setOnAction(e -> openCreateServerDialog());
+
+        Region headerSpacer = new Region();
+        HBox.setHgrow(headerSpacer, Priority.ALWAYS);
+        HBox headerRow = new HBox(12, heading, headerSpacer, addServerBtn, createServerBtn);
+        headerRow.setAlignment(Pos.CENTER_LEFT);
+        serversPageContent.getChildren().addAll(headerRow, sortBar);
+
+        // ---- YOUR SERVERS ----
+        serversPageContent.getChildren().add(sectionLabel("YOUR SERVERS"));
+        var yourServers = sortInstances(serverStore.listAll());
+        if (yourServers.isEmpty()) {
+            Label none = new Label("No servers yet -- hit \"Create Server\" to host your first one.");
+            none.getStyleClass().add("notice-label");
+            serversPageContent.getChildren().add(none);
+        } else {
+            FlowPane yourGrid = new FlowPane(16, 16);
+            for (var server : yourServers) yourGrid.getChildren().add(buildYourServerCard(server));
+            serversPageContent.getChildren().add(yourGrid);
+        }
+
+        // ---- ADDED SERVERS ----
+        serversPageContent.getChildren().add(sectionLabel("ADDED SERVERS"));
+        var added = sortAdded(addedServersStore.list());
+        if (added.isEmpty()) {
+            Label none = new Label("No bookmarked servers yet -- \"Add Server\" saves a DeyServer or any Minecraft server address for quick joining later.");
+            none.getStyleClass().add("notice-label");
+            none.setWrapText(true);
+            serversPageContent.getChildren().add(none);
+        } else {
+            for (var s : added) serversPageContent.getChildren().add(buildAddedServerRow(s));
+        }
+
+        // ---- FRIENDS PLAYING NOW ----
+        serversPageContent.getChildren().add(sectionLabel("FRIENDS PLAYING NOW"));
+        if (friendsService == null) {
+            Label none = new Label("Set up Friends (see GITHUB_SETUP.md) to see when friends are on a joinable server.");
+            none.getStyleClass().add("notice-label");
+            none.setWrapText(true);
+            serversPageContent.getChildren().add(none);
+        } else {
+            PlayerIdentity active = identityStore.getActive();
+            var cached = active != null ? friendsCache.load() : null;
+            renderFriendsPlayingNow(cached);
+            if (active != null) {
+                Task<FriendsService.FriendsView> task = new Task<>() {
+                    @Override
+                    protected FriendsService.FriendsView call() throws Exception {
+                        return friendsService.load(active.uuid);
+                    }
+                };
+                task.setOnSucceeded(e -> {
+                    friendsCache.save(task.getValue());
+                    // Only refresh this section in-place if we're still looking at the Servers page.
+                    if (serversPageContent.getScene() != null) renderFriendsPlayingNow(task.getValue());
+                });
+                new Thread(task, "servers-friends-refresh").start();
+            }
+        }
+    }
+
+    private void renderFriendsPlayingNow(FriendsService.FriendsView view) {
+        // Remove any previously-rendered "playing now" rows before re-adding (identified by user data marker).
+        serversPageContent.getChildren().removeIf(n -> "friends-playing-now-row".equals(n.getUserData()));
+        if (view == null) return;
+
+        var playing = view.friends().stream()
+                .map(f -> java.util.Map.entry(f, view.allUsers().get(f.uuid)))
+                .filter(e -> e.getValue() != null && "ONLINE".equals(e.getValue().status)
+                        && e.getValue().serverAddress != null && !e.getValue().serverAddress.isBlank())
+                .toList();
+
+        if (playing.isEmpty()) {
+            Label none = new Label("No friends currently playing on a joinable server.");
+            none.getStyleClass().add("notice-label");
+            none.setUserData("friends-playing-now-row");
+            serversPageContent.getChildren().add(none);
+            return;
+        }
+        for (var e : playing) {
+            var friend = e.getKey();
+            var entry = e.getValue();
+
+            ImageView avatarView = new ImageView();
+            avatarView.setFitWidth(28);
+            avatarView.setFitHeight(28);
+            avatarView.setSmooth(false);
+            avatarView.getStyleClass().add("account-btn-face");
+            Image cached = friendFaceCached(friend.uuid, true);
+            avatarView.setImage(cached != null ? cached : faceThumbnail(null));
+            if (cached == null) fetchFriendAvatarAsync(friend.uuid, () -> renderServersPageContent());
+
+            Label name = new Label(friend.username + "  ·  " + entry.serverAddress);
+            name.getStyleClass().add("mod-name");
+
+            Region spacer = new Region();
+            HBox.setHgrow(spacer, Priority.ALWAYS);
+
+            Button joinBtn = new Button("▶  Join");
+            joinBtn.getStyleClass().add("pill-button");
+            joinBtn.setOnAction(ev -> {
+                selectNavTab(navHomeBtn);
+                onPlay(entry.serverAddress);
+            });
+
+            HBox row = new HBox(10, avatarView, name, spacer, joinBtn);
+            row.setAlignment(Pos.CENTER_LEFT);
+            row.getStyleClass().add("mod-row");
+            row.setUserData("friends-playing-now-row");
+            serversPageContent.getChildren().add(row);
+        }
+    }
+
+    private VBox buildYourServerCard(ServerInstance server) {
+        boolean running = runningServers.containsKey(server.id) && runningServers.get(server.id).isRunning();
+
+        Label nameLabel = new Label(server.name);
+        nameLabel.getStyleClass().add("mod-name");
+        Label subLabel = new Label(server.type.displayName() + "  ·  " + server.minecraftVersion);
+        subLabel.getStyleClass().add("notice-label");
+
+        Label statusBadge = new Label(running ? "● RUNNING" : "○ STOPPED");
+        statusBadge.getStyleClass().add(running ? "badge-online" : "badge-offline");
+
+        VBox card = new VBox(6, nameLabel, subLabel, statusBadge);
+        card.setPadding(new Insets(16));
+        card.setPrefWidth(260);
+        card.getStyleClass().add("skin-library-tile");
+        card.setOnMouseClicked(e -> openServerManagementDialog(server));
+        return card;
+    }
+
+    private HBox buildAddedServerRow(AddedServersStore.AddedServer s) {
+        Label name = new Label(s.name());
+        name.getStyleClass().add("mod-name");
+        Label address = new Label(s.address());
+        address.getStyleClass().add("notice-label");
+        VBox textBox = new VBox(2, name, address);
+
+        Region spacer = new Region();
+        HBox.setHgrow(spacer, Priority.ALWAYS);
+
+        Button joinBtn = new Button("▶  Join");
+        joinBtn.getStyleClass().add("pill-button");
+        joinBtn.setOnAction(e -> {
+            addedServersStore.touchLastJoined(s.id());
+            selectNavTab(navHomeBtn);
+            onPlay(s.address());
+        });
+        Button removeBtn = new Button("Remove");
+        removeBtn.getStyleClass().add("pill-button");
+        removeBtn.setOnAction(e -> {
+            addedServersStore.remove(s.id());
+            renderServersPageContent();
+        });
+
+        HBox row = new HBox(12, textBox, spacer, joinBtn, removeBtn);
+        row.setAlignment(Pos.CENTER_LEFT);
+        row.getStyleClass().add("mod-row");
+        return row;
+    }
+
+    private void openAddServerDialog() {
+        Dialog<Void> dialog = new Dialog<>();
+        dialog.setTitle("Add Server");
+        dialog.getDialogPane().getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
+        dialog.getDialogPane().getStylesheets().add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
+        dialog.getDialogPane().getStyleClass().addAll("root-pane", darkMode ? "theme-dark" : "theme-light");
+        dialog.getDialogPane().getButtonTypes().addAll(ButtonType.CLOSE);
+
+        TextField nameField = new TextField();
+        nameField.setPromptText("Display name, e.g. \"Bob's SMP\"");
+        nameField.getStyleClass().add("input-field");
+        TextField addressField = new TextField();
+        addressField.setPromptText("Address, e.g. mc.example.com:25565");
+        addressField.getStyleClass().add("input-field");
+        Button saveBtn = new Button("Save");
+        saveBtn.getStyleClass().addAll("settings-apply-button", "settings-apply-button-ready");
+        saveBtn.setOnAction(e -> {
+            if (addressField.getText().isBlank()) return;
+            String name = nameField.getText().isBlank() ? addressField.getText() : nameField.getText();
+            addedServersStore.add(name, addressField.getText().trim());
+            renderServersPageContent();
+            dialog.hide();
+        });
+
+        VBox content = new VBox(14, sectionLabel("NAME"), nameField, sectionLabel("ADDRESS"), addressField, saveBtn);
+        content.setPadding(new Insets(24));
+        dialog.getDialogPane().setContent(content);
+        dialog.getDialogPane().setPrefWidth(420);
+        dialog.showAndWait();
+    }
+
+    private void openCreateServerDialog() {
+        Dialog<Void> dialog = new Dialog<>();
+        dialog.setTitle("Create Server");
+        dialog.getDialogPane().getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
+        dialog.getDialogPane().getStylesheets().add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
+        dialog.getDialogPane().getStyleClass().addAll("root-pane", darkMode ? "theme-dark" : "theme-light");
+        dialog.getDialogPane().getButtonTypes().addAll(ButtonType.CLOSE);
+        dialog.setResizable(true);
+
+        TextField nameField = new TextField();
+        nameField.setPromptText("e.g. \"Our SMP\"");
+        nameField.getStyleClass().add("input-field");
+
+        ComboBox<ServerType> typeBox = new ComboBox<>();
+        typeBox.getItems().addAll(ServerType.values());
+        typeBox.setValue(ServerType.VANILLA);
+        typeBox.getStyleClass().add("input-field");
+        typeBox.setMaxWidth(Double.MAX_VALUE);
+
+        ComboBox<String> versionBox2 = new ComboBox<>();
+        versionBox2.setPromptText("Loading versions...");
+        versionBox2.getStyleClass().add("input-field");
+        versionBox2.setMaxWidth(Double.MAX_VALUE);
+
+        Task<List<VersionManifest.VersionEntry>> loadTask = new Task<>() {
+            @Override
+            protected List<VersionManifest.VersionEntry> call() throws Exception {
+                return new VersionManifest().fetchAll();
+            }
+        };
+        loadTask.setOnSucceeded(e -> {
+            versionBox2.getItems().clear();
+            for (var v : loadTask.getValue()) {
+                if (v.type().equals("release")) versionBox2.getItems().add(v.id());
+            }
+            if (!versionBox2.getItems().isEmpty()) versionBox2.setValue(versionBox2.getItems().get(0));
+        });
+        new Thread(loadTask, "server-version-load").start();
+
+        Slider minRam = new Slider(512, 8192, 1024);
+        Slider maxRam = new Slider(1024, 16384, 2048);
+        Label minRamLabel = new Label("Min RAM: 1024 MB");
+        minRamLabel.getStyleClass().add("settings-value-label");
+        Label maxRamLabel = new Label("Max RAM: 2048 MB");
+        maxRamLabel.getStyleClass().add("settings-value-label");
+        minRam.valueProperty().addListener((o, a, b) -> minRamLabel.setText("Min RAM: " + b.intValue() + " MB"));
+        maxRam.valueProperty().addListener((o, a, b) -> maxRamLabel.setText("Max RAM: " + b.intValue() + " MB"));
+
+        Label errorLabel = new Label();
+        errorLabel.getStyleClass().add("notice-label");
+        errorLabel.setWrapText(true);
+
+        Button createBtn = new Button("Create Server");
+        createBtn.getStyleClass().addAll("settings-apply-button", "settings-apply-button-ready");
+        createBtn.setOnAction(e -> {
+            if (nameField.getText().isBlank() || versionBox2.getValue() == null) {
+                errorLabel.setText("Give it a name and pick a version first.");
+                return;
+            }
+            ServerInstance server = new ServerInstance(nameField.getText().trim(), typeBox.getValue(), versionBox2.getValue());
+            server.ramMinMb = (int) minRam.getValue();
+            server.ramMaxMb = (int) maxRam.getValue();
+            serverStore.save(server);
+            renderServersPageContent();
+            dialog.hide();
+            // Deferred one pulse: opening a second modal Dialog synchronously in the same
+            // handler that just called hide() on this one is a known JavaFX timing issue --
+            // the new dialog's first layout/paint pass can land before its stylesheet is
+            // actually applied, showing a blank white window for a frame (or longer). Platform.
+            // runLater lets this dialog's close fully settle first.
+            Platform.runLater(() -> openServerManagementDialog(server));
+        });
+
+        VBox content = new VBox(14,
+                sectionLabel("NAME"), nameField,
+                sectionLabel("SERVER TYPE"), typeBox,
+                sectionLabel("MINECRAFT VERSION"), versionBox2,
+                sectionLabel("MEMORY"), minRamLabel, minRam, maxRamLabel, maxRam,
+                errorLabel, createBtn);
+        content.setPadding(new Insets(24));
+        ScrollPane scroll = new ScrollPane(content);
+        scroll.setFitToWidth(true);
+        scroll.getStyleClass().add("settings-scroll");
+        dialog.getDialogPane().setContent(scroll);
+        dialog.getDialogPane().setPrefSize(460, 620);
+        dialog.showAndWait();
+    }
+
+    // ---- Server management dialog: Console/Version, Properties, Permissions, Players tabs ----
+    private TextArea serverConsoleArea;
+
+    private void openServerManagementDialog(ServerInstance server) {
+        Dialog<Void> dialog = new Dialog<>();
+        dialog.setTitle(server.name);
+        dialog.getDialogPane().getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
+        dialog.getDialogPane().getStylesheets().add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
+        dialog.getDialogPane().getStyleClass().addAll("root-pane", darkMode ? "theme-dark" : "theme-light");
+        dialog.getDialogPane().getButtonTypes().addAll(ButtonType.CLOSE);
+        dialog.setResizable(true);
+        dialog.getDialogPane().setPrefSize(760, 640);
+        dialog.getDialogPane().setMinWidth(560);
+        dialog.getDialogPane().setMinHeight(460);
+
+        TabPane tabs = new TabPane();
+        tabs.getStyleClass().add("account-skin-tabs");
+        tabs.setTabClosingPolicy(TabPane.TabClosingPolicy.UNAVAILABLE);
+        tabs.getTabs().addAll(
+                new Tab("Console", buildServerConsoleTab(server)),
+                new Tab("Properties", buildServerPropertiesTab(server)),
+                new Tab("Players", buildServerPlayersTab(server)),
+                new Tab("Permissions", buildServerPermissionsTab(server, dialog))
+        );
+        dialog.getDialogPane().setContent(tabs);
+        dialog.showAndWait();
+    }
+
+    private Node buildServerConsoleTab(ServerInstance server) {
+        VBox box = new VBox(14);
+        box.setPadding(new Insets(20));
+
+        boolean running = runningServers.containsKey(server.id) && runningServers.get(server.id).isRunning();
+        Label statusBadge = new Label(running ? "● RUNNING" : "○ STOPPED");
+        statusBadge.getStyleClass().add(running ? "badge-online" : "badge-offline");
+
+        // ---- Version display + change ----
+        Label typeLabel = new Label(server.type.displayName());
+        typeLabel.getStyleClass().add("notice-label");
+        ComboBox<String> serverVersionBox = new ComboBox<>();
+        serverVersionBox.getItems().add(server.minecraftVersion);
+        serverVersionBox.setValue(server.minecraftVersion);
+        serverVersionBox.getStyleClass().add("input-field");
+        Task<List<VersionManifest.VersionEntry>> versionsTask = new Task<>() {
+            @Override
+            protected List<VersionManifest.VersionEntry> call() throws Exception {
+                return new VersionManifest().fetchAll();
+            }
+        };
+        versionsTask.setOnSucceeded(ev -> {
+            String current = serverVersionBox.getValue();
+            serverVersionBox.getItems().clear();
+            for (var v : versionsTask.getValue()) if (v.type().equals("release")) serverVersionBox.getItems().add(v.id());
+            serverVersionBox.setValue(current);
+        });
+        new Thread(versionsTask, "server-console-versions").start();
+
+        Button changeVersionBtn = new Button("Change Version");
+        changeVersionBtn.getStyleClass().add("pill-button");
+        Label versionChangeNote = new Label();
+        versionChangeNote.getStyleClass().add("notice-label");
+        changeVersionBtn.setOnAction(ev -> {
+            String chosen = serverVersionBox.getValue();
+            if (chosen == null || chosen.equals(server.minecraftVersion)) return;
+            if (runningServers.containsKey(server.id) && runningServers.get(server.id).isRunning()) {
+                versionChangeNote.setText("Stop the server before changing its version.");
+                return;
+            }
+            server.minecraftVersion = chosen;
+            serverStore.save(server);
+            Path dir = serverStore.serverDir(server.id);
+            // The old server.jar (and, for Forge, its generated run.sh/run.bat/libraries) is for
+            // the PREVIOUS version -- delete just the software, not the world, so the next Start
+            // downloads a fresh server for the new version instead of silently reusing the old one.
+            try {
+                Files.deleteIfExists(dir.resolve("server.jar"));
+                Files.deleteIfExists(dir.resolve("run.sh"));
+                Files.deleteIfExists(dir.resolve("run.bat"));
+                Files.deleteIfExists(dir.resolve("user_jvm_args.txt"));
+            } catch (Exception ignored) {
+            }
+            versionChangeNote.setText("Version changed to " + chosen + " -- will download fresh on next Start.");
+            renderServersPageContent();
+        });
+
+        // ---- Copyable server IP (top right) ----
+        String localAddress = localIpAddress() + ":" + server.port;
+        TextField ipField = new TextField(localAddress);
+        ipField.setEditable(false);
+        ipField.getStyleClass().add("device-url-field");
+        ipField.setPrefWidth(180);
+        Button copyIpBtn = new Button("📋 Copy");
+        copyIpBtn.getStyleClass().add("pill-button");
+        copyIpBtn.setOnAction(ev -> {
+            var clipboard = javafx.scene.input.Clipboard.getSystemClipboard();
+            var content = new javafx.scene.input.ClipboardContent();
+            content.putString(localAddress);
+            clipboard.setContent(content);
+            copyIpBtn.setText("✔ Copied");
+        });
+        Label ipNote = new Label("Local address -- port-forward or use a tunnel for players outside your network.");
+        ipNote.getStyleClass().add("notice-label");
+        Region ipSpacer = new Region();
+        HBox.setHgrow(ipSpacer, Priority.ALWAYS);
+        HBox ipRow = new HBox(8, ipSpacer, ipField, copyIpBtn);
+        ipRow.setAlignment(Pos.CENTER_RIGHT);
+
+        Button startBtn = new Button("▶  Start");
+        startBtn.getStyleClass().add("play-button");
+        Button stopBtn = new Button("■  Stop");
+        stopBtn.getStyleClass().add("pill-button");
+        stopBtn.setDisable(!running);
+        startBtn.setDisable(running);
+
+        // ---- Play on this Server: pick a profile + client version/loader, then launch straight in ----
+        ComboBox<String> playAsBox = new ComboBox<>();
+        PlayerIdentity currentActive = identityStore.getActive();
+        for (var acc : identityStore.loadIndex().accounts()) playAsBox.getItems().add(acc.username);
+        if (currentActive != null && !playAsBox.getItems().contains(currentActive.username)) {
+            playAsBox.getItems().add(0, currentActive.username);
+        }
+        playAsBox.setValue(currentActive != null ? currentActive.username : null);
+        playAsBox.getStyleClass().add("input-field");
+
+        ComboBox<String> clientVersionBox = new ComboBox<>();
+        clientVersionBox.getItems().add(server.minecraftVersion);
+        clientVersionBox.setValue(server.minecraftVersion);
+        clientVersionBox.getStyleClass().add("input-field");
+
+        Button playBtn = new Button("▶  Play on this Server");
+        playBtn.getStyleClass().add("play-button");
+        playBtn.setOnAction(ev -> {
+            String chosenUsername = playAsBox.getValue();
+            var match = identityStore.loadIndex().accounts().stream()
+                    .filter(a -> a.username.equals(chosenUsername)).findFirst();
+            match.ifPresent(a -> identityStore.setActive(a.uuid));
+
+            setMode(false); // Vanilla-mode client dropdown has Vanilla/Fabric/Forge -- matches every server type
+            String loader = switch (server.type) {
+                case FABRIC -> "Fabric";
+                case FORGE -> "Forge";
+                case VANILLA, PURPUR -> "Vanilla";
+            };
+            String clientVersion = clientVersionBox.getValue();
+            if (!versionBox.getItems().contains(clientVersion)) versionBox.getItems().add(clientVersion);
+            versionBox.setValue(clientVersion);
+            modLoaderBox.setValue(loader);
+            syncPlayCardFromActiveIdentity();
+
+            String target = "localhost:" + server.port;
+            // Dialogs stack awkwardly if we navigate synchronously out from under this one --
+            // same deferred-close pattern as the create-server flow's white-window fix.
+            Platform.runLater(() -> {
+                selectNavTab(navHomeBtn);
+                onPlay(target);
+            });
+        });
+
+        HBox statusRow = new HBox(12, typeLabel, statusBadge);
+        statusRow.setAlignment(Pos.CENTER_LEFT);
+        HBox versionRow = new HBox(10, serverVersionBox, changeVersionBtn);
+        versionRow.setAlignment(Pos.CENTER_LEFT);
+        HBox buttonRow = new HBox(10, startBtn, stopBtn);
+        HBox playRow = new HBox(10, new Label("Play as:"), playAsBox, new Label("Version:"), clientVersionBox, playBtn);
+        playRow.setAlignment(Pos.CENTER_LEFT);
+        for (var n : playRow.getChildren()) {
+            if (n instanceof Label l) l.getStyleClass().add("field-label");
+        }
+
+        serverConsoleArea = new TextArea();
+        serverConsoleArea.setEditable(false);
+        serverConsoleArea.getStyleClass().add("log-area");
+        serverConsoleArea.setPrefRowCount(16);
+        VBox.setVgrow(serverConsoleArea, Priority.ALWAYS);
+
+        TextField commandField = new TextField();
+        commandField.setPromptText("Type a server command and press Enter...");
+        commandField.getStyleClass().add("input-field");
+        HBox.setHgrow(commandField, Priority.ALWAYS);
+        Button sendBtn = new Button("Send");
+        sendBtn.getStyleClass().add("pill-button");
+
+        Runnable sendCommand = () -> {
+            String cmd = commandField.getText().trim();
+            if (cmd.isEmpty()) return;
+            var pm = runningServers.get(server.id);
+            if (pm != null && pm.isRunning()) {
+                try {
+                    pm.sendCommand(cmd);
+                    commandField.clear();
+                } catch (Exception ex) {
+                    serverConsoleArea.appendText("[DeyLauncher] Couldn't send command: " + ex.getMessage() + "\n");
+                }
+            }
+        };
+        sendBtn.setOnAction(e -> sendCommand.run());
+        commandField.setOnAction(e -> sendCommand.run());
+
+        startBtn.setOnAction(e -> {
+            startBtn.setDisable(true);
+            server.lastJoinedAt = System.currentTimeMillis();
+            serverStore.save(server);
+            serverConsoleArea.appendText("[DeyLauncher] Preparing server files...\n");
+            Task<Void> task = new Task<>() {
+                @Override
+                protected Void call() throws Exception {
+                    Path serverDir = serverStore.serverDir(server.id);
+                    JavaRuntimeManager runtimeManager = new JavaRuntimeManager(gameFiles.root);
+                    // Reuse whatever runtime the equivalent client version needs -- servers have
+                    // the same Java-version requirements as their matching client release.
+                    VersionManifest manifest = new VersionManifest();
+                    var all = manifest.fetchAll();
+                    var entry = manifest.findById(all, server.minecraftVersion);
+                    JsonObject versionJson = entry != null ? manifest.fetchVersionDetail(entry) : null;
+                    String javaBinary = versionJson != null
+                            ? runtimeManager.ensureRuntimeFor(versionJson).toString() : "java";
+
+                    Platform.runLater(() -> serverConsoleArea.appendText("[DeyLauncher] Downloading/verifying "
+                            + server.type.displayName() + " " + server.minecraftVersion + "...\n"));
+                    ServerDownloader downloader = new ServerDownloader(manifest);
+                    Path jar = downloader.ensureServerJar(server, serverDir, javaBinary);
+
+                    Platform.runLater(() -> serverConsoleArea.appendText("[DeyLauncher] Starting...\n"));
+                    ServerProcessManager pm = new ServerProcessManager();
+                    Process process = pm.start(server, serverDir, jar, javaBinary);
+                    runningServers.put(server.id, pm);
+
+                    try (var reader = new java.io.BufferedReader(new java.io.InputStreamReader(process.getInputStream()))) {
+                        String line;
+                        while ((line = reader.readLine()) != null) {
+                            String finalLine = line;
+                            Platform.runLater(() -> serverConsoleArea.appendText(finalLine + "\n"));
+                        }
+                    }
+                    int exit = process.waitFor();
+                    Platform.runLater(() -> {
+                        serverConsoleArea.appendText("[DeyLauncher] Server exited with code " + exit + "\n");
+                        startBtn.setDisable(false);
+                        stopBtn.setDisable(true);
+                        statusBadge.setText("○ STOPPED");
+                        statusBadge.getStyleClass().setAll("badge-offline");
+                        renderServersPageContent();
+                    });
+                    return null;
+                }
+            };
+            task.setOnFailed(failEvent -> Platform.runLater(() -> {
+                serverConsoleArea.appendText("[DeyLauncher] Failed to start: " + task.getException().getMessage() + "\n");
+                startBtn.setDisable(false);
+            }));
+            new Thread(task, "server-start-" + server.id).start();
+            stopBtn.setDisable(false);
+            statusBadge.setText("● RUNNING");
+            statusBadge.getStyleClass().setAll("badge-online");
+        });
+
+        stopBtn.setOnAction(e -> {
+            var pm = runningServers.get(server.id);
+            if (pm != null) {
+                serverConsoleArea.appendText("[DeyLauncher] Stopping...\n");
+                new Thread(() -> {
+                    pm.stop();
+                    Platform.runLater(() -> {
+                        stopBtn.setDisable(true);
+                        startBtn.setDisable(false);
+                        statusBadge.setText("○ STOPPED");
+                        statusBadge.getStyleClass().setAll("badge-offline");
+                        renderServersPageContent();
+                    });
+                }, "server-stop-" + server.id).start();
+            }
+        });
+
+        HBox inputRow = new HBox(10, commandField, sendBtn);
+
+        box.getChildren().addAll(ipRow, ipNote, statusRow, versionRow, versionChangeNote, buttonRow,
+                sectionLabel("PLAY"), playRow, serverConsoleArea, inputRow);
+        return box;
+    }
+
+    private Node buildServerPropertiesTab(ServerInstance server) {
+        VBox box = new VBox(16);
+        box.setPadding(new Insets(20));
+        ScrollPane scroll = new ScrollPane(box);
+        scroll.setFitToWidth(true);
+        scroll.getStyleClass().add("settings-scroll");
+
+        Path serverDir = serverStore.serverDir(server.id);
+        ServerPropertiesManager propsManager = new ServerPropertiesManager(serverDir);
+        var props = propsManager.read();
+
+        // ---- Server icon drag-and-drop ----
+        Label iconLabel = sectionLabel("SERVER ICON (64x64 PNG)");
+        Path iconPath = serverDir.resolve("server-icon.png");
+        ImageView iconPreview = new ImageView();
+        iconPreview.setFitWidth(64);
+        iconPreview.setFitHeight(64);
+        if (Files.exists(iconPath)) {
+            try {
+                iconPreview.setImage(new Image(iconPath.toUri().toString()));
+            } catch (Exception ignored) {
+            }
+        }
+        Label dropHint = new Label("Drag & drop a 64x64 PNG here");
+        dropHint.getStyleClass().add("notice-label");
+        VBox dropZone = new VBox(8, iconPreview, dropHint);
+        dropZone.setAlignment(Pos.CENTER);
+        dropZone.getStyleClass().add("drop-zone");
+        dropZone.setPrefSize(140, 120);
+        dropZone.setOnDragOver(e -> {
+            if (e.getDragboard().hasFiles()) e.acceptTransferModes(javafx.scene.input.TransferMode.COPY);
+            dropZone.getStyleClass().add("drop-zone-active");
+        });
+        dropZone.setOnDragExited(e -> dropZone.getStyleClass().remove("drop-zone-active"));
+        dropZone.setOnDragDropped(e -> {
+            var files = e.getDragboard().getFiles();
+            if (files != null && !files.isEmpty()) {
+                try {
+                    var img = javax.imageio.ImageIO.read(files.get(0));
+                    if (img != null && img.getWidth() == 64 && img.getHeight() == 64) {
+                        Files.copy(files.get(0).toPath(), iconPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                        iconPreview.setImage(new Image(iconPath.toUri().toString()));
+                        dropHint.setText("Saved.");
+                    } else {
+                        dropHint.setText("Must be exactly 64x64 PNG.");
+                    }
+                } catch (Exception ex) {
+                    dropHint.setText("Couldn't read that file.");
+                }
+            }
+            e.setDropCompleted(true);
+        });
+
+        // ---- Common properties, real controls ----
+        TextField motdField = new TextField(props.getOrDefault("motd", "A DeyLauncher server"));
+        motdField.getStyleClass().add("input-field");
+        TextField maxPlayersField = new TextField(props.getOrDefault("max-players", "20"));
+        maxPlayersField.getStyleClass().add("input-field");
+
+        ComboBox<String> difficultyBox = new ComboBox<>();
+        difficultyBox.getItems().addAll("peaceful", "easy", "normal", "hard");
+        difficultyBox.setValue(props.getOrDefault("difficulty", "easy"));
+        difficultyBox.getStyleClass().add("input-field");
+
+        CheckBox hardcoreBox = new CheckBox("Hardcore (permadeath -- forces difficulty to Hard)");
+        hardcoreBox.setSelected("true".equals(props.getOrDefault("hardcore", "false")));
+        difficultyBox.setDisable(hardcoreBox.isSelected());
+        hardcoreBox.selectedProperty().addListener((o, a, b) -> {
+            difficultyBox.setDisable(b);
+            if (b) difficultyBox.setValue("hard");
+        });
+
+        ComboBox<String> gamemodeBox = new ComboBox<>();
+        gamemodeBox.getItems().addAll("survival", "creative", "adventure", "spectator");
+        gamemodeBox.setValue(props.getOrDefault("gamemode", "survival"));
+        gamemodeBox.getStyleClass().add("input-field");
+
+        CheckBox pvpBox = new CheckBox("PvP enabled");
+        pvpBox.setSelected(!"false".equals(props.getOrDefault("pvp", "true")));
+        CheckBox onlineModeBox = new CheckBox("Online mode (requires real Microsoft accounts)");
+        onlineModeBox.setSelected(!"false".equals(props.getOrDefault("online-mode", "true")));
+        CheckBox whitelistBox = new CheckBox("Whitelist enabled");
+        whitelistBox.setSelected("true".equals(props.getOrDefault("white-list", "false")));
+        CheckBox netherBox = new CheckBox("Nether enabled");
+        netherBox.setSelected(!"false".equals(props.getOrDefault("allow-nether", "true")));
+        Label netherNote = new Label("Vanilla has no official server.properties toggle for The End "
+                + "specifically (only the Nether has one) -- so there's no equivalent switch here to "
+                + "wire up honestly. Paper/Purpur can restrict it via their own per-world config, not "
+                + "covered by this tab.");
+        netherNote.getStyleClass().add("notice-label");
+        netherNote.setWrapText(true);
+
+        TextField viewDistanceField = new TextField(props.getOrDefault("view-distance", "10"));
+        viewDistanceField.getStyleClass().add("input-field");
+        TextField simDistanceField = new TextField(props.getOrDefault("simulation-distance", "10"));
+        simDistanceField.getStyleClass().add("input-field");
+
+        Slider spawnProtectionSlider = new Slider(0, 32,
+                parseIntSafe(props.getOrDefault("spawn-protection", "16"), 16));
+        spawnProtectionSlider.setShowTickMarks(true);
+        spawnProtectionSlider.setMajorTickUnit(8);
+        Label spawnProtectionLabel = new Label("Spawn protection radius: " + (int) spawnProtectionSlider.getValue());
+        spawnProtectionLabel.getStyleClass().add("settings-value-label");
+        spawnProtectionSlider.valueProperty().addListener((o, a, b) ->
+                spawnProtectionLabel.setText("Spawn protection radius: " + b.intValue()));
+
+        // ---- Resource pack ----
+        CheckBox requirePackBox = new CheckBox("Require resource pack");
+        requirePackBox.setSelected("true".equals(props.getOrDefault("require-resource-pack", "false")));
+        TextField packUrlField = new TextField(props.getOrDefault("resource-pack", ""));
+        packUrlField.setPromptText("Direct download URL for the .zip (must be reachable by players)");
+        packUrlField.getStyleClass().add("input-field");
+        TextField packPromptField = new TextField(props.getOrDefault("resource-pack-prompt", ""));
+        packPromptField.setPromptText("Message shown asking players to accept the pack");
+        packPromptField.getStyleClass().add("input-field");
+        Label packSha1Label = new Label(props.containsKey("resource-pack-sha1")
+                ? "SHA-1 on file: " + props.get("resource-pack-sha1") : "No pack hashed yet.");
+        packSha1Label.getStyleClass().add("notice-label");
+        String[] computedSha1 = { props.get("resource-pack-sha1") };
+
+        Label packDropHint = new Label("Drag & drop the pack .zip here to compute its SHA-1");
+        packDropHint.getStyleClass().add("notice-label");
+        VBox packDropZone = new VBox(8, packDropHint);
+        packDropZone.setAlignment(Pos.CENTER);
+        packDropZone.getStyleClass().add("drop-zone");
+        packDropZone.setPrefSize(300, 70);
+        packDropZone.setOnDragOver(e -> {
+            if (e.getDragboard().hasFiles()) e.acceptTransferModes(javafx.scene.input.TransferMode.COPY);
+            packDropZone.getStyleClass().add("drop-zone-active");
+        });
+        packDropZone.setOnDragExited(e -> packDropZone.getStyleClass().remove("drop-zone-active"));
+        packDropZone.setOnDragDropped(e -> {
+            var files = e.getDragboard().getFiles();
+            if (files != null && !files.isEmpty() && files.get(0).getName().endsWith(".zip")) {
+                try {
+                    byte[] bytes = Files.readAllBytes(files.get(0).toPath());
+                    var digest = java.security.MessageDigest.getInstance("SHA-1");
+                    byte[] hash = digest.digest(bytes);
+                    StringBuilder hex = new StringBuilder();
+                    for (byte bb : hash) hex.append(String.format("%02x", bb));
+                    computedSha1[0] = hex.toString();
+                    packSha1Label.setText("SHA-1 computed: " + computedSha1[0]
+                            + " -- now upload this exact file somewhere reachable and paste the URL above.");
+                } catch (Exception ex) {
+                    packSha1Label.setText("Couldn't hash that file: " + ex.getMessage());
+                }
+            } else {
+                packSha1Label.setText("Drop the pack's .zip file specifically.");
+            }
+            e.setDropCompleted(true);
+        });
+        Label packHonestNote = new Label("DeyLauncher can't host this zip for you -- Minecraft needs a "
+                + "real URL players can download it from. Drop the file here to get its SHA-1, then "
+                + "upload it yourself (e.g. GitHub Releases) and paste the direct link above.");
+        packHonestNote.getStyleClass().add("notice-label");
+        packHonestNote.setWrapText(true);
+
+        Button saveBtn = new Button("Save Properties");
+        saveBtn.getStyleClass().addAll("settings-apply-button", "settings-apply-button-ready");
+        Label savedNote = new Label();
+        savedNote.getStyleClass().add("notice-label");
+        saveBtn.setOnAction(e -> {
+            props.put("motd", motdField.getText());
+            props.put("max-players", maxPlayersField.getText());
+            props.put("difficulty", difficultyBox.getValue());
+            props.put("hardcore", String.valueOf(hardcoreBox.isSelected()));
+            props.put("gamemode", gamemodeBox.getValue());
+            props.put("pvp", String.valueOf(pvpBox.isSelected()));
+            props.put("online-mode", String.valueOf(onlineModeBox.isSelected()));
+            props.put("white-list", String.valueOf(whitelistBox.isSelected()));
+            props.put("allow-nether", String.valueOf(netherBox.isSelected()));
+            props.put("view-distance", viewDistanceField.getText());
+            props.put("simulation-distance", simDistanceField.getText());
+            props.put("spawn-protection", String.valueOf((int) spawnProtectionSlider.getValue()));
+            props.put("require-resource-pack", String.valueOf(requirePackBox.isSelected()));
+            props.put("resource-pack", packUrlField.getText());
+            props.put("resource-pack-prompt", packPromptField.getText());
+            if (computedSha1[0] != null) props.put("resource-pack-sha1", computedSha1[0]);
+            props.putIfAbsent("server-port", String.valueOf(server.port));
+            try {
+                propsManager.write(props);
+                savedNote.setText("Saved -- takes effect next server start.");
+            } catch (java.io.IOException ex) {
+                savedNote.setText("Couldn't save: " + ex.getMessage());
+            }
+        });
+
+        box.getChildren().addAll(
+                iconLabel, dropZone,
+                sectionLabel("MOTD"), motdField,
+                sectionLabel("MAX PLAYERS"), maxPlayersField,
+                sectionLabel("DIFFICULTY"), difficultyBox, hardcoreBox,
+                sectionLabel("GAME MODE"), gamemodeBox,
+                pvpBox, onlineModeBox, whitelistBox, netherBox, netherNote,
+                sectionLabel("VIEW DISTANCE (CHUNKS)"), viewDistanceField,
+                sectionLabel("SIMULATION DISTANCE (CHUNKS)"), simDistanceField,
+                spawnProtectionLabel, spawnProtectionSlider,
+                sectionLabel("RESOURCE PACK"), requirePackBox, packUrlField, packPromptField,
+                packDropZone, packSha1Label, packHonestNote,
+                saveBtn, savedNote);
+        return scroll;
+    }
+
+    private int parseIntSafe(String s, int fallback) {
+        try {
+            return Integer.parseInt(s.trim());
+        } catch (Exception e) {
+            return fallback;
+        }
+    }
+
+    private Node buildServerPlayersTab(ServerInstance server) {
+        VBox box = new VBox(18);
+        box.setPadding(new Insets(20));
+        ScrollPane scroll = new ScrollPane(box);
+        scroll.setFitToWidth(true);
+        scroll.getStyleClass().add("settings-scroll");
+
+        ServerPlayerManager playerManager = new ServerPlayerManager(serverStore.serverDir(server.id));
+        box.getChildren().add(buildPlayerListSection("OPERATORS (OP)", playerManager.listOps(), playerManager, playerManager.opsFile()));
+        box.getChildren().add(buildPlayerListSection("WHITELIST", playerManager.listWhitelist(), playerManager, playerManager.whitelistFile()));
+        box.getChildren().add(buildPlayerListSection("BANNED", playerManager.listBanned(), playerManager, playerManager.bannedFile()));
+        return scroll;
+    }
+
+    private VBox buildPlayerListSection(String title, List<ServerPlayerManager.PlayerEntry> entries,
+                                         ServerPlayerManager playerManager, Path file) {
+        VBox section = new VBox(10, sectionLabel(title));
+        for (var entry : entries) {
+            Label name = new Label(entry.name());
+            name.getStyleClass().add("mod-name");
+            Region spacer = new Region();
+            HBox.setHgrow(spacer, Priority.ALWAYS);
+            Button removeBtn = new Button("Remove");
+            removeBtn.getStyleClass().add("pill-button");
+            removeBtn.setOnAction(e -> {
+                try {
+                    playerManager.removeByName(file, entry.name());
+                    section.getChildren().clear();
+                    section.getChildren().add(sectionLabel(title));
+                } catch (Exception ignored) {
+                }
+            });
+            HBox row = new HBox(10, name, spacer, removeBtn);
+            row.setAlignment(Pos.CENTER_LEFT);
+            row.getStyleClass().add("mod-row");
+            section.getChildren().add(row);
+        }
+        TextField addField = new TextField();
+        addField.setPromptText("Player name");
+        addField.getStyleClass().add("input-field");
+        Button addBtn = new Button("Add");
+        addBtn.getStyleClass().add("pill-button");
+        addBtn.setOnAction(e -> {
+            if (addField.getText().isBlank()) return;
+            try {
+                playerManager.addByName(file, addField.getText().trim());
+                addField.clear();
+            } catch (Exception ignored) {
+            }
+        });
+        HBox addRow = new HBox(10, addField, addBtn);
+        section.getChildren().add(addRow);
+        return section;
+    }
+
+    private Node buildServerPermissionsTab(ServerInstance server, Dialog<Void> dialog) {
+        VBox box = new VBox(16);
+        box.setPadding(new Insets(20));
+
+        CheckBox friendsJoinBox = new CheckBox("Allow friends to join while this server is running");
+        friendsJoinBox.setSelected(server.allowFriendsJoin);
+        Label friendsJoinNote = new Label("When on and this server is running, your online friends "
+                + "see it under \"Friends Playing Now\" and can Join directly.");
+        friendsJoinNote.getStyleClass().add("notice-label");
+        friendsJoinNote.setWrapText(true);
+
+        CheckBox saveBox = new CheckBox("Allow whitelisted players to save/download this server to self-host");
+        saveBox.setSelected(server.allowPlayerSave);
+        Label saveNote = new Label("Matches the original hand-off hosting design -- not wired to a "
+                + "real download/handoff flow yet, this just records the permission for when it is.");
+        saveNote.getStyleClass().add("notice-label");
+        saveNote.setWrapText(true);
+
+        CheckBox multihostBox = new CheckBox("Multihosting (coming later)");
+        multihostBox.setSelected(false);
+        multihostBox.setDisable(true);
+        Label multihostNote = new Label("Reserved for the planned multihosting feature -- not implemented yet.");
+        multihostNote.getStyleClass().add("notice-label");
+
+        Button saveBtn = new Button("Save Permissions");
+        saveBtn.getStyleClass().addAll("settings-apply-button", "settings-apply-button-ready");
+        saveBtn.setOnAction(e -> {
+            server.allowFriendsJoin = friendsJoinBox.isSelected();
+            server.allowPlayerSave = saveBox.isSelected();
+            serverStore.save(server);
+        });
+
+        box.getChildren().addAll(
+                sectionLabel("FRIENDS"), friendsJoinBox, friendsJoinNote,
+                sectionLabel("PLAYER SAVE"), saveBox, saveNote,
+                sectionLabel("MULTIHOSTING"), multihostBox, multihostNote,
+                saveBtn);
+        return box;
+    }
+
+    /** Best-effort local LAN address for the copyable server IP box -- falls back to loopback if detection fails. */
+    private String localIpAddress() {
+        try {
+            var addr = java.net.InetAddress.getLocalHost();
+            if (!addr.isLoopbackAddress()) return addr.getHostAddress();
+        } catch (Exception ignored) {
+        }
+        try {
+            var interfaces = java.net.NetworkInterface.getNetworkInterfaces();
+            while (interfaces.hasMoreElements()) {
+                var iface = interfaces.nextElement();
+                if (!iface.isUp() || iface.isLoopback()) continue;
+                var addresses = iface.getInetAddresses();
+                while (addresses.hasMoreElements()) {
+                    var addr = addresses.nextElement();
+                    if (addr instanceof java.net.Inet4Address && !addr.isLoopbackAddress()) {
+                        return addr.getHostAddress();
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return "localhost";
     }
 
     private void runFriendsAction(PlayerIdentity active, java.util.concurrent.Callable<FriendsService.FriendsView> action) {
@@ -623,28 +1682,42 @@ public class LauncherApp extends Application {
     /** Crops just the front-facing head (8x8 region at (8,8)) out of a skin texture, so the button shows a face, not the whole sheet. */
     private Image faceIcon(PlayerIdentity identity) {
         java.nio.file.Path skinPath = identityStore.skinFile(identity.uuid);
-        if (identity.skinSource == SkinSource.DEFAULT || !java.nio.file.Files.exists(skinPath)) return defaultSteveImage();
+        if (identity.skinSource == SkinSource.DEFAULT || !java.nio.file.Files.exists(skinPath)) {
+            return faceThumbnail(null); // no custom skin set yet -- still must be a cropped face, not the whole placeholder sheet
+        }
         try {
             Image full = new Image(skinPath.toUri().toString());
             return faceThumbnail(full);
         } catch (Exception e) {
-            return null;
+            return faceThumbnail(null);
         }
     }
 
     /**
-     * Shared face crop used both by the main account button and the Skin Profile tiles in the
-     * Skins tab -- the tiles used to pass the whole raw skin sheet to skinTile() instead of this,
-     * which is why offline skin-profile thumbnails showed the entire texture instead of a face.
+     * Shared face crop used everywhere a small avatar is shown (main account button, Skin
+     * Profile tiles, Friends list). Bug fixed here: every fallback branch used to return
+     * defaultSteveImage() directly -- the WHOLE 64x64 placeholder sheet, uncropped -- instead of
+     * a face. That's exactly why offline accounts with no custom skin set yet (the default state
+     * for a brand-new offline account) showed the entire skin texture as their "face," while
+     * online accounts never hit this path at all (their real skin syncs locally on sign-in, so
+     * skinSource is never DEFAULT for them) -- which is why only offline looked broken. Every
+     * return path below is now guaranteed to be an 8x8 crop, never the raw sheet.
      */
     private Image faceThumbnail(Image skin) {
-        if (skin == null) return defaultSteveImage();
-        javafx.scene.image.PixelReader reader = skin.getPixelReader();
-        if (reader == null || skin.getWidth() < 16 || skin.getHeight() < 16) return defaultSteveImage();
+        Image source = skin;
+        if (source == null || source.getPixelReader() == null || source.getWidth() < 16 || source.getHeight() < 16) {
+            source = defaultSteveImage(); // still a full sheet at this point -- cropped below, never returned as-is
+        }
         try {
-            return new javafx.scene.image.WritableImage(reader, 8, 8, 8, 8);
+            return new javafx.scene.image.WritableImage(source.getPixelReader(), 8, 8, 8, 8);
         } catch (Exception e) {
-            return defaultSteveImage();
+            // Last-resort flat-color 8x8 face -- guarantees we never fall back to the whole sheet.
+            var img = new javafx.scene.image.WritableImage(8, 8);
+            var w = img.getPixelWriter();
+            for (int x = 0; x < 8; x++) {
+                for (int y = 0; y < 8; y++) w.setColor(x, y, Color.web("#dca57a"));
+            }
+            return img;
         }
     }
 
@@ -764,12 +1837,12 @@ public class LauncherApp extends Application {
 
         modLoaderBox.getItems().clear();
         if (dey) {
-            modLoaderBox.getItems().addAll("Fabric", "Forge");
+            modLoaderBox.getItems().addAll("Fabric");
             modLoaderBox.setValue("Fabric");
             modLoaderBox.setDisable(false);
             mainDescriptionLabel.setText(
                     "DEY builds run a curated set of performance and quality-of-life mods -- "
-                            + "Sodium + Fabric API install automatically on Fabric, Embeddium on Forge, no setup needed.");
+                            + "Sodium + Fabric API install automatically, no setup needed.");
         } else {
             modLoaderBox.getItems().addAll("Vanilla", "Fabric", "Forge");
             modLoaderBox.setValue("Vanilla");
@@ -2104,14 +3177,14 @@ public class LauncherApp extends Application {
             dialogPane.getStyleClass().add(darkMode ? "theme-dark" : "theme-light");
         });
 
-        Slider uiScaleSlider = new Slider(0.75, 1.75, prefs.uiScale);
+        Slider uiScaleSlider = new Slider(0.75, 2.5, prefs.uiScale);
         uiScaleSlider.setShowTickMarks(true);
         uiScaleSlider.setMajorTickUnit(0.25);
         uiScaleSlider.setPrefWidth(300);
         Label uiScaleLabel = new Label(Math.round(prefs.uiScale * 100) + "%");
         uiScaleLabel.getStyleClass().add("settings-value-label");
 
-        Slider textScaleSlider = new Slider(0.75, 1.75, prefs.textScale);
+        Slider textScaleSlider = new Slider(0.75, 2.5, prefs.textScale);
         textScaleSlider.setShowTickMarks(true);
         textScaleSlider.setMajorTickUnit(0.25);
         textScaleSlider.setPrefWidth(300);
@@ -2397,8 +3470,8 @@ public class LauncherApp extends Application {
                         + (modLoader.equals("Vanilla") ? "" : "-" + modLoader.toLowerCase()));
                 java.nio.file.Files.createDirectories(gameDir);
 
-                if ((modLoader.equals("Fabric") || modLoader.equals("Forge")) && deyMode) {
-                    updateMessage("Making sure " + (modLoader.equals("Forge") ? "Embeddium" : "Sodium") + " is installed...");
+                if (modLoader.equals("Fabric") && deyMode) {
+                    updateMessage("Making sure Sodium is installed...");
                     try {
                         String installed = new SodiumInstaller(modLoader).ensureInstalled(entry.id(), gameDir.resolve("mods"));
                         if (installed != null) {
@@ -2411,8 +3484,6 @@ public class LauncherApp extends Application {
                     }
                 }
                 if (modLoader.equals("Fabric") && deyMode) {
-                    // Fabric API only -- there's no Forge build and no Forge equivalent to swap
-                    // in, so this never runs for a DEY Forge instance.
                     updateMessage("Making sure Fabric API is installed...");
                     try {
                         String installed = new FabricApiInstaller().ensureInstalled(entry.id(), gameDir.resolve("mods"));
