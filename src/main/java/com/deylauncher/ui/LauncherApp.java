@@ -940,7 +940,15 @@ public class LauncherApp extends Application {
         boolean deyEligible = server.type != ServerType.FORGE;
         boolean actuallyDey = useDey && deyEligible;
         setMode(actuallyDey);
-        String loader = switch (server.type) {
+        // Bug fixed here: setMode(true) restricts modLoaderBox to ONLY "Fabric" (that's the
+        // whole point of DEY mode), but this used to still try setting it to "Vanilla" for
+        // Vanilla/Purpur servers while in DEY mode -- an invalid value not in that list, which
+        // silently failed to select anything real and broke the join. DEY mode is always
+        // Fabric-based regardless of server type (a Fabric client connects fine to
+        // Vanilla/Purpur servers -- Fabric doesn't touch the network protocol), so it always
+        // gets Fabric plus DEY's forced Sodium/Fabric API mods for that version. Only when NOT
+        // using DEY does the loader need to actually match the server's own type.
+        String loader = actuallyDey ? "Fabric" : switch (server.type) {
             case FABRIC -> "Fabric";
             case FORGE -> "Forge";
             case VANILLA, PURPUR -> "Vanilla";
@@ -1237,6 +1245,25 @@ public class LauncherApp extends Application {
         clientVersionBox.setValue(server.minecraftVersion);
         clientVersionBox.getStyleClass().add("input-field");
 
+        boolean[] playUseDey = { server.type != ServerType.FORGE };
+        ToggleGroup playModeGroup = new ToggleGroup();
+        ToggleButton playDeyBtn = new ToggleButton("DEY");
+        playDeyBtn.getStyleClass().add("pill-button");
+        playDeyBtn.setToggleGroup(playModeGroup);
+        ToggleButton playVanillaBtn = new ToggleButton("Vanilla");
+        playVanillaBtn.getStyleClass().add("pill-button");
+        playVanillaBtn.setToggleGroup(playModeGroup);
+        if (server.type == ServerType.FORGE) {
+            playDeyBtn.setDisable(true);
+            playVanillaBtn.setDisable(true);
+            playVanillaBtn.setSelected(true);
+        } else {
+            (playUseDey[0] ? playDeyBtn : playVanillaBtn).setSelected(true);
+        }
+        playDeyBtn.setOnAction(modeEvent -> playUseDey[0] = true);
+        playVanillaBtn.setOnAction(modeEvent -> playUseDey[0] = false);
+        HBox playModeRow = new HBox(6, playDeyBtn, playVanillaBtn);
+
         Button playBtn = new Button("▶  Play on this Server");
         playBtn.getStyleClass().add("play-button");
         playBtn.setOnAction(ev -> {
@@ -1245,8 +1272,11 @@ public class LauncherApp extends Application {
                     .filter(a -> a.username.equals(chosenUsername)).findFirst();
             match.ifPresent(a -> identityStore.setActive(a.uuid));
 
-            setMode(false); // Vanilla-mode client dropdown has Vanilla/Fabric/Forge -- matches every server type
-            String loader = switch (server.type) {
+            boolean actuallyDeyForPlay = playUseDey[0] && server.type != ServerType.FORGE;
+            setMode(actuallyDeyForPlay);
+            // Same fix as launchIntoOwnServer: DEY mode only ever has "Fabric" as a valid
+            // modLoaderBox value, so it must never fall through to "Vanilla"/"Forge" here either.
+            String loader = actuallyDeyForPlay ? "Fabric" : switch (server.type) {
                 case FABRIC -> "Fabric";
                 case FORGE -> "Forge";
                 case VANILLA, PURPUR -> "Vanilla";
@@ -1271,7 +1301,8 @@ public class LauncherApp extends Application {
         HBox versionRow = new HBox(10, serverVersionBox, changeVersionBtn);
         versionRow.setAlignment(Pos.CENTER_LEFT);
         HBox buttonRow = new HBox(10, startBtn, stopBtn);
-        HBox playRow = new HBox(10, new Label("Play as:"), playAsBox, new Label("Version:"), clientVersionBox, playBtn);
+        HBox playRow = new HBox(10, new Label("Play as:"), playAsBox, new Label("Version:"), clientVersionBox,
+                playModeRow, playBtn);
         playRow.setAlignment(Pos.CENTER_LEFT);
         for (var n : playRow.getChildren()) {
             if (n instanceof Label l) l.getStyleClass().add("field-label");
