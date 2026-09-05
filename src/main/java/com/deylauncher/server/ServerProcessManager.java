@@ -12,6 +12,30 @@ public class ServerProcessManager {
 
     private Process process;
     private OutputStream stdin;
+    private final java.util.Set<String> onlinePlayers = java.util.Collections.synchronizedSet(new java.util.LinkedHashSet<>());
+    private static final java.util.regex.Pattern JOINED_PATTERN =
+            java.util.regex.Pattern.compile(":\\s*([A-Za-z0-9_]{1,16}) joined the game");
+    private static final java.util.regex.Pattern LEFT_PATTERN =
+            java.util.regex.Pattern.compile(":\\s*([A-Za-z0-9_]{1,16}) left the game");
+
+    /** Feeds one console line through the join/leave parser -- call this for every line read from the process, alongside whatever also displays it in the Console tab. */
+    public void observeConsoleLine(String line) {
+        var joined = JOINED_PATTERN.matcher(line);
+        if (joined.find()) {
+            onlinePlayers.add(joined.group(1));
+            return;
+        }
+        var left = LEFT_PATTERN.matcher(line);
+        if (left.find()) {
+            onlinePlayers.remove(left.group(1));
+        }
+    }
+
+    public List<String> getOnlinePlayers() {
+        synchronized (onlinePlayers) {
+            return new ArrayList<>(onlinePlayers);
+        }
+    }
 
     public boolean isRunning() {
         return process != null && process.isAlive();
@@ -23,6 +47,7 @@ public class ServerProcessManager {
      * @args files instead of a single -jar target).
      */
     public Process start(ServerInstance server, Path serverDir, Path jarOrNull, String javaBinary) throws Exception {
+        onlinePlayers.clear();
         acceptEula(serverDir);
 
         List<String> command = new ArrayList<>();
@@ -67,6 +92,8 @@ public class ServerProcessManager {
             }
         } catch (Exception e) {
             process.destroyForcibly();
+        } finally {
+            onlinePlayers.clear();
         }
     }
 

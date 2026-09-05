@@ -35,9 +35,11 @@ import javafx.scene.input.TransferMode;
 import javafx.beans.property.SimpleBooleanProperty;
 import javafx.stage.FileChooser;
 import javafx.stage.Modality;
+import javafx.stage.Popup;
 import javafx.stage.Stage;
 
 import java.io.BufferedReader;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -845,20 +847,113 @@ public class LauncherApp extends Application {
     private VBox buildYourServerCard(ServerInstance server) {
         boolean running = runningServers.containsKey(server.id) && runningServers.get(server.id).isRunning();
 
-        Label nameLabel = new Label(server.name);
-        nameLabel.getStyleClass().add("mod-name");
-        Label subLabel = new Label(server.type.displayName() + "  ·  " + server.minecraftVersion);
-        subLabel.getStyleClass().add("notice-label");
+        Label cardNameLabel = new Label(server.name);
+        cardNameLabel.getStyleClass().add("mod-name");
+        Label cardSubLabel = new Label(server.type.displayName() + "  ·  " + server.minecraftVersion);
+        cardSubLabel.getStyleClass().add("notice-label");
 
-        Label statusBadge = new Label(running ? "● RUNNING" : "○ STOPPED");
-        statusBadge.getStyleClass().add(running ? "badge-online" : "badge-offline");
+        Label cardStatusBadge = new Label(running ? "● RUNNING" : "○ STOPPED");
+        cardStatusBadge.getStyleClass().add(running ? "badge-online" : "badge-offline");
 
-        VBox card = new VBox(6, nameLabel, subLabel, statusBadge);
+        // Only this header (not the whole card) opens management on click, so the Join row
+        // below has its own buttons that work independently without the click bubbling up.
+        VBox cardHeader = new VBox(6, cardNameLabel, cardSubLabel, cardStatusBadge);
+        cardHeader.setOnMouseClicked(e -> openServerManagementDialog(server));
+
+        HBox cardJoinRow = buildJoinSplitRow(server);
+
+        VBox card = new VBox(10, cardHeader, cardJoinRow);
         card.setPadding(new Insets(16));
         card.setPrefWidth(260);
         card.getStyleClass().add("skin-library-tile");
-        card.setOnMouseClicked(e -> openServerManagementDialog(server));
         return card;
+    }
+
+    /**
+     * A Join button plus a "▼" arrow that reveals a small popup with the version (locked to
+     * this server's exact Minecraft version -- protocol only allows an exact match) and, for
+     * anything except Forge, a DEY/Vanilla toggle (defaulting to DEY, matching what was asked --
+     * Forge has no DEY client build, so that toggle is skipped entirely for Forge servers).
+     */
+    private HBox buildJoinSplitRow(ServerInstance server) {
+        boolean[] joinUseDey = { server.type != ServerType.FORGE }; // default DEY unless Forge
+
+        Button joinMainBtn = new Button("▶  Join");
+        joinMainBtn.getStyleClass().add("pill-button");
+        joinMainBtn.setOnAction(e -> launchIntoOwnServer(server, joinUseDey[0]));
+
+        Button joinArrowBtn = new Button("▼");
+        joinArrowBtn.getStyleClass().add("pill-button");
+        joinArrowBtn.setOnAction(e -> {
+            Popup joinPopup = new Popup();
+            joinPopup.setAutoHide(true);
+
+            VBox popupBox = new VBox(10);
+            popupBox.setPadding(new Insets(14));
+            popupBox.getStyleClass().addAll("root-pane", darkMode ? "theme-dark" : "theme-light", "device-code-box");
+            popupBox.getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
+            popupBox.getStylesheets().add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
+
+            Label popupVersionValue = new Label(server.minecraftVersion);
+            popupVersionValue.getStyleClass().add("mod-name");
+            Label popupVersionNote = new Label("Only this exact version can connect to this server.");
+            popupVersionNote.getStyleClass().add("notice-label");
+            popupBox.getChildren().addAll(sectionLabel("VERSION"), popupVersionValue, popupVersionNote);
+
+            if (server.type != ServerType.FORGE) {
+                ToggleGroup popupModeGroup = new ToggleGroup();
+                ToggleButton popupDeyBtn = new ToggleButton("DEY");
+                popupDeyBtn.getStyleClass().add("pill-button");
+                popupDeyBtn.setToggleGroup(popupModeGroup);
+                ToggleButton popupVanillaBtn = new ToggleButton("Vanilla");
+                popupVanillaBtn.getStyleClass().add("pill-button");
+                popupVanillaBtn.setToggleGroup(popupModeGroup);
+                (joinUseDey[0] ? popupDeyBtn : popupVanillaBtn).setSelected(true);
+                popupDeyBtn.setOnAction(modeEvent -> joinUseDey[0] = true);
+                popupVanillaBtn.setOnAction(modeEvent -> joinUseDey[0] = false);
+                HBox popupModeRow = new HBox(8, popupDeyBtn, popupVanillaBtn);
+                popupBox.getChildren().addAll(sectionLabel("MODE"), popupModeRow);
+            }
+
+            Button popupJoinBtn = new Button("▶  Join");
+            popupJoinBtn.getStyleClass().add("play-button");
+            popupJoinBtn.setOnAction(joinEvent -> {
+                joinPopup.hide();
+                launchIntoOwnServer(server, joinUseDey[0]);
+            });
+            popupBox.getChildren().add(popupJoinBtn);
+
+            joinPopup.getContent().add(popupBox);
+            var arrowBounds = joinArrowBtn.localToScreen(joinArrowBtn.getBoundsInLocal());
+            joinPopup.show(joinArrowBtn, arrowBounds.getMinX(), arrowBounds.getMaxY() + 4);
+        });
+
+        return new HBox(4, joinMainBtn, joinArrowBtn);
+    }
+
+    /** Shared by the server-card Join button and its popup's confirm button -- launches straight into this locally-hosted server. */
+    private void launchIntoOwnServer(ServerInstance server, boolean useDey) {
+        if (identityStore.getActive() == null) {
+            log("Set up an account first (Account button) before joining a server.");
+            return;
+        }
+        boolean deyEligible = server.type != ServerType.FORGE;
+        boolean actuallyDey = useDey && deyEligible;
+        setMode(actuallyDey);
+        String loader = switch (server.type) {
+            case FABRIC -> "Fabric";
+            case FORGE -> "Forge";
+            case VANILLA, PURPUR -> "Vanilla";
+        };
+        if (!versionBox.getItems().contains(server.minecraftVersion)) versionBox.getItems().add(server.minecraftVersion);
+        versionBox.setValue(server.minecraftVersion);
+        modLoaderBox.setValue(loader);
+
+        String target = "localhost:" + server.port;
+        Platform.runLater(() -> {
+            selectNavTab(navHomeBtn);
+            onPlay(target);
+        });
     }
 
     private HBox buildAddedServerRow(AddedServersStore.AddedServer s) {
@@ -1021,9 +1116,9 @@ public class LauncherApp extends Application {
         dialog.getDialogPane().getStyleClass().addAll("root-pane", darkMode ? "theme-dark" : "theme-light");
         dialog.getDialogPane().getButtonTypes().addAll(ButtonType.CLOSE);
         dialog.setResizable(true);
-        dialog.getDialogPane().setPrefSize(760, 640);
-        dialog.getDialogPane().setMinWidth(560);
-        dialog.getDialogPane().setMinHeight(460);
+        dialog.getDialogPane().setPrefSize(880, 680);
+        dialog.getDialogPane().setMinWidth(620);
+        dialog.getDialogPane().setMinHeight(480);
 
         TabPane tabs = new TabPane();
         tabs.getStyleClass().add("account-skin-tabs");
@@ -1032,6 +1127,9 @@ public class LauncherApp extends Application {
                 new Tab("Console", buildServerConsoleTab(server)),
                 new Tab("Properties", buildServerPropertiesTab(server)),
                 new Tab("Players", buildServerPlayersTab(server)),
+                new Tab("Addons", buildServerAddonsTab(server)),
+                new Tab("Files", buildServerFilesTab(server)),
+                new Tab("Settings", buildServerSettingsTab(server)),
                 new Tab("Permissions", buildServerPermissionsTab(server, dialog))
         );
         dialog.getDialogPane().setContent(tabs);
@@ -1241,6 +1339,7 @@ public class LauncherApp extends Application {
                         String line;
                         while ((line = reader.readLine()) != null) {
                             String finalLine = line;
+                            pm.observeConsoleLine(finalLine);
                             Platform.runLater(() -> serverConsoleArea.appendText(finalLine + "\n"));
                         }
                     }
@@ -1509,10 +1608,146 @@ public class LauncherApp extends Application {
         scroll.getStyleClass().add("settings-scroll");
 
         ServerPlayerManager playerManager = new ServerPlayerManager(serverStore.serverDir(server.id));
+
+        // ---- Online now (from live join/leave parsing -- only populated while the server is running) ----
+        VBox onlineSection = new VBox(10);
+        Button refreshOnlineBtn = new Button("↻ Refresh");
+        refreshOnlineBtn.getStyleClass().add("pill-button");
+        Runnable renderOnline = () -> {
+            onlineSection.getChildren().setAll(sectionLabel("ONLINE NOW"), refreshOnlineBtn);
+            var pm = runningServers.get(server.id);
+            List<String> online = (pm != null && pm.isRunning()) ? pm.getOnlinePlayers() : List.of();
+            if (pm == null || !pm.isRunning()) {
+                Label offlineNote = new Label("Server isn't running -- start it to see who's online.");
+                offlineNote.getStyleClass().add("notice-label");
+                onlineSection.getChildren().add(offlineNote);
+            } else if (online.isEmpty()) {
+                Label none = new Label("Nobody online right now.");
+                none.getStyleClass().add("notice-label");
+                onlineSection.getChildren().add(none);
+            } else {
+                for (String playerName : online) {
+                    onlineSection.getChildren().add(buildOnlinePlayerRow(playerName, playerManager));
+                }
+            }
+        };
+        refreshOnlineBtn.setOnAction(e -> renderOnline.run());
+        renderOnline.run();
+
+        // ---- Server managers (permission record for future remote management) ----
+        VBox managersSection = new VBox(10, sectionLabel("SERVER MANAGERS"));
+        Label managersNote = new Label("DeyLauncher friends recorded as permitted to manage this server. "
+                + "Not enforced remotely yet -- this just records who's permitted for when "
+                + "multihosting/remote management is built.");
+        managersNote.getStyleClass().add("notice-label");
+        managersNote.setWrapText(true);
+        managersSection.getChildren().add(managersNote);
+        Runnable renderManagers = () -> {
+            managersSection.getChildren().setAll(sectionLabel("SERVER MANAGERS"), managersNote);
+            for (String managerName : server.managerUsernames) {
+                Label managerLabel = new Label(managerName);
+                managerLabel.getStyleClass().add("mod-name");
+                Region managerSpacer = new Region();
+                HBox.setHgrow(managerSpacer, Priority.ALWAYS);
+                Button removeManagerBtn = new Button("Remove");
+                removeManagerBtn.getStyleClass().add("pill-button");
+                removeManagerBtn.setOnAction(e -> {
+                    server.managerUsernames.remove(managerName);
+                    serverStore.save(server);
+                });
+                HBox managerRow = new HBox(10, managerLabel, managerSpacer, removeManagerBtn);
+                managerRow.setAlignment(Pos.CENTER_LEFT);
+                managerRow.getStyleClass().add("mod-row");
+                managersSection.getChildren().add(managerRow);
+            }
+        };
+        TextField addManagerField = new TextField();
+        addManagerField.setPromptText("DeyLauncher username");
+        addManagerField.getStyleClass().add("input-field");
+        Button addManagerBtn = new Button("Add");
+        addManagerBtn.getStyleClass().add("pill-button");
+        addManagerBtn.setOnAction(e -> {
+            String username = addManagerField.getText().trim();
+            if (username.isEmpty() || server.managerUsernames.contains(username)) return;
+            server.managerUsernames.add(username);
+            serverStore.save(server);
+            addManagerField.clear();
+            renderManagers.run();
+        });
+        HBox addManagerRow = new HBox(10, addManagerField, addManagerBtn);
+        renderManagers.run();
+        managersSection.getChildren().add(addManagerRow);
+
+        box.getChildren().add(onlineSection);
         box.getChildren().add(buildPlayerListSection("OPERATORS (OP)", playerManager.listOps(), playerManager, playerManager.opsFile()));
         box.getChildren().add(buildPlayerListSection("WHITELIST", playerManager.listWhitelist(), playerManager, playerManager.whitelistFile()));
         box.getChildren().add(buildPlayerListSection("BANNED", playerManager.listBanned(), playerManager, playerManager.bannedFile()));
+        box.getChildren().add(managersSection);
         return scroll;
+    }
+
+    /**
+     * One online player's row: face avatar + name, click to expand quick op/whitelist/ban
+     * account-info controls. Live inventory viewing is NOT implemented -- that would need a real
+     * NBT parser reading playerdata (reflecting last save, not truly live), which is a
+     * meaningfully bigger feature than fits honestly in this pass.
+     */
+    private VBox buildOnlinePlayerRow(String playerName, ServerPlayerManager playerManager) {
+        ImageView avatarView = new ImageView(faceThumbnail(null)); // no local skin data for an arbitrary server player -- honest placeholder
+        avatarView.setFitWidth(28);
+        avatarView.setFitHeight(28);
+        avatarView.setSmooth(false);
+        avatarView.getStyleClass().add("account-btn-face");
+
+        Label nameLabel = new Label(playerName);
+        nameLabel.getStyleClass().add("mod-name");
+        Region spacer = new Region();
+        HBox.setHgrow(spacer, Priority.ALWAYS);
+        Label expandHint = new Label("Server account info ▾");
+        expandHint.getStyleClass().add("notice-label");
+
+        HBox summaryRow = new HBox(10, avatarView, nameLabel, spacer, expandHint);
+        summaryRow.setAlignment(Pos.CENTER_LEFT);
+        summaryRow.getStyleClass().add("mod-row");
+
+        VBox detailBox = new VBox(8);
+        detailBox.setVisible(false);
+        detailBox.setManaged(false);
+        Button opToggleBtn = new Button(playerManager.listOps().stream().anyMatch(p -> p.name().equalsIgnoreCase(playerName))
+                ? "Remove OP" : "Make OP");
+        opToggleBtn.getStyleClass().add("pill-button");
+        opToggleBtn.setOnAction(e -> {
+            try {
+                boolean isOp = playerManager.listOps().stream().anyMatch(p -> p.name().equalsIgnoreCase(playerName));
+                if (isOp) playerManager.removeByName(playerManager.opsFile(), playerName);
+                else playerManager.addByName(playerManager.opsFile(), playerName);
+                opToggleBtn.setText(isOp ? "Make OP" : "Remove OP");
+            } catch (Exception ignored) {
+            }
+        });
+        Button banBtn = new Button("Ban");
+        banBtn.getStyleClass().add("pill-button");
+        banBtn.setOnAction(e -> {
+            try {
+                playerManager.addByName(playerManager.bannedFile(), playerName);
+            } catch (Exception ignored) {
+            }
+        });
+        Label inventoryNote = new Label("Live inventory viewing isn't implemented -- Minecraft doesn't "
+                + "expose that through the console, only through the player's saved data file, "
+                + "which only updates on save/disconnect (not truly live).");
+        inventoryNote.getStyleClass().add("notice-label");
+        inventoryNote.setWrapText(true);
+        detailBox.getChildren().addAll(new HBox(10, opToggleBtn, banBtn), inventoryNote);
+
+        summaryRow.setOnMouseClicked(e -> {
+            boolean showing = detailBox.isVisible();
+            detailBox.setVisible(!showing);
+            detailBox.setManaged(!showing);
+            expandHint.setText(showing ? "Server account info ▾" : "Server account info ▴");
+        });
+
+        return new VBox(6, summaryRow, detailBox);
     }
 
     private VBox buildPlayerListSection(String title, List<ServerPlayerManager.PlayerEntry> entries,
@@ -1554,6 +1789,260 @@ public class LauncherApp extends Application {
         HBox addRow = new HBox(10, addField, addBtn);
         section.getChildren().add(addRow);
         return section;
+    }
+
+    private Node buildServerAddonsTab(ServerInstance server) {
+        VBox box = new VBox(14);
+        box.setPadding(new Insets(20));
+        ScrollPane scroll = new ScrollPane(box);
+        scroll.setFitToWidth(true);
+        scroll.getStyleClass().add("settings-scroll");
+
+        ServerAddonsManager addonsManager = new ServerAddonsManager(serverStore.serverDir(server.id), server.type);
+        if (!addonsManager.supported()) {
+            Label none = new Label("Vanilla servers don't support plugins or mods -- switch this "
+                    + "server to Fabric, Forge, or Purpur to use addons.");
+            none.getStyleClass().add("notice-label");
+            none.setWrapText(true);
+            box.getChildren().add(none);
+            return scroll;
+        }
+
+        String folderKind = server.type == ServerType.PURPUR ? "plugin" : "mod";
+        Label heading = new Label((server.type == ServerType.PURPUR ? "Plugins" : "Mods")
+                + " -- drag & drop " + folderKind + " jars below");
+        heading.getStyleClass().add("card-heading");
+
+        VBox listBox = new VBox(8);
+        Runnable renderAddons = () -> {
+            listBox.getChildren().clear();
+            var addons = addonsManager.list();
+            if (addons.isEmpty()) {
+                Label none = new Label("No " + folderKind + "s installed yet.");
+                none.getStyleClass().add("notice-label");
+                listBox.getChildren().add(none);
+                return;
+            }
+            for (var addon : addons) {
+                CheckBox enabledBox = new CheckBox();
+                enabledBox.setSelected(addon.enabled());
+                enabledBox.getStyleClass().add("mod-checkbox");
+                Label nameLabel = new Label(addon.fileName().replace(".disabled", ""));
+                nameLabel.getStyleClass().add(addon.enabled() ? "mod-name" : "mod-filename");
+                Region rowSpacer = new Region();
+                HBox.setHgrow(rowSpacer, Priority.ALWAYS);
+                Button deleteBtn = new Button("🗑");
+                deleteBtn.getStyleClass().add("mod-delete-button");
+                enabledBox.setOnAction(e -> {
+                    try {
+                        addonsManager.setEnabled(addon.fileName(), enabledBox.isSelected());
+                    } catch (Exception ignored) {
+                    }
+                    // Re-render on next pulse so we pick up the file's new on-disk name.
+                });
+                deleteBtn.setOnAction(e -> {
+                    try {
+                        addonsManager.delete(addon.fileName());
+                    } catch (Exception ignored) {
+                    }
+                });
+                HBox row = new HBox(10, enabledBox, nameLabel, rowSpacer, deleteBtn);
+                row.setAlignment(Pos.CENTER_LEFT);
+                row.getStyleClass().add("mod-row");
+                if (!addon.enabled()) row.getStyleClass().add("mod-row-disabled");
+                listBox.getChildren().add(row);
+            }
+        };
+
+        VBox dropZone = new VBox(new Label("Drop " + folderKind + " .jar files here"));
+        dropZone.setAlignment(Pos.CENTER);
+        dropZone.getStyleClass().add("drop-zone");
+        dropZone.setPrefHeight(70);
+        for (var n : dropZone.getChildren()) if (n instanceof Label l) l.getStyleClass().add("notice-label");
+        dropZone.setOnDragOver(e -> {
+            if (e.getDragboard().hasFiles()) e.acceptTransferModes(javafx.scene.input.TransferMode.COPY);
+            dropZone.getStyleClass().add("drop-zone-active");
+        });
+        dropZone.setOnDragExited(e -> dropZone.getStyleClass().remove("drop-zone-active"));
+        dropZone.setOnDragDropped(e -> {
+            var files = e.getDragboard().getFiles();
+            if (files != null) {
+                for (var f : files) {
+                    try {
+                        addonsManager.addFile(f.toPath());
+                    } catch (Exception ignored) {
+                    }
+                }
+            }
+            renderAddons.run();
+            e.setDropCompleted(true);
+        });
+
+        renderAddons.run();
+        box.getChildren().addAll(heading, dropZone, listBox);
+        return scroll;
+    }
+
+    private Node buildServerFilesTab(ServerInstance server) {
+        VBox box = new VBox(12);
+        box.setPadding(new Insets(20));
+        Path serverRoot = serverStore.serverDir(server.id);
+
+        Label pathLabel = new Label(serverRoot.toString());
+        pathLabel.getStyleClass().add("notice-label");
+        pathLabel.setWrapText(true);
+
+        VBox listBox = new VBox(4);
+        ScrollPane listScroll = new ScrollPane(listBox);
+        listScroll.setFitToWidth(true);
+        listScroll.getStyleClass().add("settings-scroll");
+        VBox.setVgrow(listScroll, Priority.ALWAYS);
+
+        Path[] currentDir = { serverRoot };
+        Label currentPathLabel = new Label();
+        currentPathLabel.getStyleClass().add("field-label");
+
+        Runnable[] renderFiles = new Runnable[1];
+        renderFiles[0] = () -> {
+            currentPathLabel.setText(serverRoot.relativize(currentDir[0]).toString().isEmpty()
+                    ? "/" : "/" + serverRoot.relativize(currentDir[0]));
+            listBox.getChildren().clear();
+
+            if (!currentDir[0].equals(serverRoot)) {
+                Button upBtn = new Button(".. (up)");
+                upBtn.getStyleClass().add("pill-button");
+                upBtn.setOnAction(e -> {
+                    currentDir[0] = currentDir[0].getParent();
+                    renderFiles[0].run();
+                });
+                listBox.getChildren().add(upBtn);
+            }
+
+            try (var stream = Files.list(currentDir[0])) {
+                var entries = stream.sorted(Comparator
+                        .comparing((Path p) -> !Files.isDirectory(p))
+                        .thenComparing(p -> p.getFileName().toString().toLowerCase()))
+                        .toList();
+                for (Path entry : entries) {
+                    boolean isDir = Files.isDirectory(entry);
+                    Label icon = new Label(isDir ? "📁" : "📄");
+                    Label nameLabel = new Label(entry.getFileName().toString());
+                    nameLabel.getStyleClass().add(isDir ? "mod-name" : "mod-filename");
+                    Region rowSpacer = new Region();
+                    HBox.setHgrow(rowSpacer, Priority.ALWAYS);
+                    Button deleteBtn = new Button("🗑");
+                    deleteBtn.getStyleClass().add("mod-delete-button");
+                    deleteBtn.setOnAction(e -> {
+                        try {
+                            if (isDir) {
+                                try (var walk = Files.walk(entry)) {
+                                    walk.sorted(Comparator.reverseOrder()).forEach(p -> {
+                                        try {
+                                            Files.delete(p);
+                                        } catch (IOException ignored) {
+                                        }
+                                    });
+                                }
+                            } else {
+                                Files.deleteIfExists(entry);
+                            }
+                        } catch (IOException ignored) {
+                        }
+                        renderFiles[0].run();
+                    });
+                    HBox row = new HBox(10, icon, nameLabel, rowSpacer, deleteBtn);
+                    row.setAlignment(Pos.CENTER_LEFT);
+                    row.getStyleClass().add("mod-row");
+                    if (isDir) {
+                        row.setOnMouseClicked(e -> {
+                            // Security: never navigate above serverRoot -- entry is always a
+                            // direct child of currentDir[0], which itself is only ever set from
+                            // serverRoot or one of its descendants below, so this can't escape.
+                            currentDir[0] = entry;
+                            renderFiles[0].run();
+                        });
+                    }
+                    listBox.getChildren().add(row);
+                }
+            } catch (IOException ignored) {
+            }
+        };
+        renderFiles[0].run();
+
+        Button refreshBtn = new Button("↻ Refresh");
+        refreshBtn.getStyleClass().add("pill-button");
+        refreshBtn.setOnAction(e -> renderFiles[0].run());
+        HBox topRow = new HBox(10, currentPathLabel, refreshBtn);
+        topRow.setAlignment(Pos.CENTER_LEFT);
+
+        box.getChildren().addAll(pathLabel, topRow, listScroll);
+        VBox.setVgrow(box, Priority.ALWAYS);
+        return box;
+    }
+
+    private Node buildServerSettingsTab(ServerInstance server) {
+        VBox box = new VBox(16);
+        box.setPadding(new Insets(20));
+        ScrollPane scroll = new ScrollPane(box);
+        scroll.setFitToWidth(true);
+        scroll.getStyleClass().add("settings-scroll");
+
+        Slider minRamSlider = new Slider(512, 8192, server.ramMinMb);
+        Label minRamLabel = new Label("Min RAM: " + server.ramMinMb + " MB");
+        minRamLabel.getStyleClass().add("settings-value-label");
+        minRamSlider.valueProperty().addListener((o, a, b) -> minRamLabel.setText("Min RAM: " + b.intValue() + " MB"));
+
+        Slider maxRamSlider = new Slider(1024, 16384, server.ramMaxMb);
+        Label maxRamLabel = new Label("Max RAM: " + server.ramMaxMb + " MB");
+        maxRamLabel.getStyleClass().add("settings-value-label");
+        maxRamSlider.valueProperty().addListener((o, a, b) -> maxRamLabel.setText("Max RAM: " + b.intValue() + " MB"));
+
+        TextField portField = new TextField(String.valueOf(server.port));
+        portField.getStyleClass().add("input-field");
+
+        ComboBox<String> javaEnvBox = new ComboBox<>();
+        javaEnvBox.getItems().add("Auto (recommended for this version)");
+        Path runtimesRoot = gameFiles.root.resolve("runtimes");
+        if (Files.isDirectory(runtimesRoot)) {
+            try (var platforms = Files.list(runtimesRoot)) {
+                for (Path platformDir : (Iterable<Path>) platforms.filter(Files::isDirectory)::iterator) {
+                    try (var components = Files.list(platformDir)) {
+                        for (Path componentDir : (Iterable<Path>) components.filter(Files::isDirectory)::iterator) {
+                            String label = platformDir.getFileName() + " / " + componentDir.getFileName();
+                            javaEnvBox.getItems().add(label);
+                        }
+                    }
+                }
+            } catch (IOException ignored) {
+            }
+        }
+        javaEnvBox.setValue(server.javaOverridePath == null ? javaEnvBox.getItems().get(0) : server.javaOverridePath);
+        javaEnvBox.getStyleClass().add("input-field");
+        javaEnvBox.setMaxWidth(Double.MAX_VALUE);
+        Label javaEnvNote = new Label("Only already-downloaded runtimes show up here -- launch this "
+                + "server's matching client version once first if you want a specific one available.");
+        javaEnvNote.getStyleClass().add("notice-label");
+        javaEnvNote.setWrapText(true);
+
+        Button saveBtn = new Button("Save Settings");
+        saveBtn.getStyleClass().addAll("settings-apply-button", "settings-apply-button-ready");
+        Label savedNote = new Label();
+        savedNote.getStyleClass().add("notice-label");
+        saveBtn.setOnAction(e -> {
+            server.ramMinMb = (int) minRamSlider.getValue();
+            server.ramMaxMb = (int) maxRamSlider.getValue();
+            server.port = parseIntSafe(portField.getText(), server.port);
+            server.javaOverridePath = javaEnvBox.getValue().startsWith("Auto") ? null : javaEnvBox.getValue();
+            serverStore.save(server);
+            savedNote.setText("Saved -- some changes (port, RAM) take effect next server start.");
+        });
+
+        box.getChildren().addAll(
+                sectionLabel("MEMORY"), minRamLabel, minRamSlider, maxRamLabel, maxRamSlider,
+                sectionLabel("PORT"), portField,
+                sectionLabel("JAVA ENVIRONMENT"), javaEnvBox, javaEnvNote,
+                saveBtn, savedNote);
+        return scroll;
     }
 
     private Node buildServerPermissionsTab(ServerInstance server, Dialog<Void> dialog) {

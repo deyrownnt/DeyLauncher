@@ -37,6 +37,11 @@ public class ServerInstance {
     public boolean allowPlayerSave = false;
     /** Reserved for the future Multihosting feature -- intentionally not implemented yet. */
     public boolean multihostingEnabled = false;
+    /** DeyLauncher friend usernames recorded as permitted to manage this server. Not enforced
+     *  remotely yet (this machine is the only one that can actually edit the server today) --
+     *  this is the permission record the future multihosting/remote-management feature will
+     *  read, so it doesn't need a data-format change when that's built. */
+    public java.util.List<String> managerUsernames = new java.util.ArrayList<>();
 
     public ServerInstance() {}
 
