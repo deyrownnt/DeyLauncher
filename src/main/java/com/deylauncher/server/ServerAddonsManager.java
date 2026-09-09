@@ -34,6 +34,11 @@ public class ServerAddonsManager {
         return folder != null;
     }
 
+    /** The mods/ or plugins/ directory itself (or null if unsupported), for direct downloads. */
+    public Path folder() {
+        return folder;
+    }
+
     public List<AddonEntry> list() {
         List<AddonEntry> out = new ArrayList<>();
         if (folder == null) return out;

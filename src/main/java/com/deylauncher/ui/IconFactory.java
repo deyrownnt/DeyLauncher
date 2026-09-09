@@ -27,7 +27,13 @@ public final class IconFactory {
         FOLDER,
         CLIPBOARD,
         MOON,
-        SUN
+        SUN,
+        CHEVRON_DOWN,
+        CHEVRON_UP,
+        FILE,
+        STOP,
+        SEARCH,
+        ADD
     }
 
     public static Node create(Icon icon, double size) {
@@ -55,6 +61,12 @@ public final class IconFactory {
             case PUZZLE -> "M20 11h-2.1a2.9 2.9 0 1 0-5.8 0H10V8.9a2.9 2.9 0 1 0-5.8 0V11H2v6h2.2a2.9 2.9 0 1 0 5.8 0V17h2.1v2.1a2.9 2.9 0 1 0 5.8 0V17H20v-6z";
             case TOOLS -> "M21.7 19.3l-5.1-5.1a6.5 6.5 0 0 0-8.5-8.5l3.2 3.2-2.8 2.8-3.2-3.2a6.5 6.5 0 0 0 8.5 8.5l5.1 5.1a2 2 0 0 0 2.8-2.8z";
             case PICKAXE -> "M4 5h7l9 9-3 3-9-9v7H4V5zm2 2v3h3L6 7zm9.59 7L18 15.41 16.41 17 14 14.59 15.59 13z";
+            case CHEVRON_DOWN -> "M12 5L5 19 19 19Z";
+            case CHEVRON_UP -> "M12 19L5 5 19 5Z";
+            case FILE -> "M4 4h16v16h-16zM16 2l4 4-4 0-0-4z";
+            case STOP -> "M6 6h12v12h-12z";
+            case SEARCH -> "M15.5 15.5a3.5 3.5 0 1 1-7-7a3.5 3.5 0 0 0-7-7 3.5 3.5 0 1 0 7 7z";
+            case ADD -> "M5 11h14v2h-14zM11 5v14h2v-14z";
         };
     }
 }

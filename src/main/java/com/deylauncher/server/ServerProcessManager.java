@@ -17,9 +17,18 @@ public class ServerProcessManager {
             java.util.regex.Pattern.compile(":\\s*([A-Za-z0-9_]{1,16}) joined the game");
     private static final java.util.regex.Pattern LEFT_PATTERN =
             java.util.regex.Pattern.compile(":\\s*([A-Za-z0-9_]{1,16}) left the game");
+    // The vanilla `list` command replies with either:
+    //   "There are 3 of a max of 8 players online: Alice, Bob, Carol"  or
+    //   "There are 0 of a max of 8 players online:"
+    // This is the SERVER's authoritative answer, so parsing it lets us repair the online list
+    // (join/leave lines can be missed if the console scrolls fast), which is what makes the
+    // Players tab's Refresh actually show the true current players.
+    private static final java.util.regex.Pattern LIST_PATTERN =
+            java.util.regex.Pattern.compile("players online:\s*(.*)");
 
     /** Feeds one console line through the join/leave parser -- call this for every line read from the process, alongside whatever also displays it in the Console tab. */
     public void observeConsoleLine(String line) {
+        if (line == null) return;
         var joined = JOINED_PATTERN.matcher(line);
         if (joined.find()) {
             onlinePlayers.add(joined.group(1));
@@ -28,7 +37,34 @@ public class ServerProcessManager {
         var left = LEFT_PATTERN.matcher(line);
         if (left.find()) {
             onlinePlayers.remove(left.group(1));
+            return;
         }
+        var listed = LIST_PATTERN.matcher(line);
+        if (listed.find()) {
+            // A `list` reply is authoritative -- replace the whole set with what the server says.
+            String raw = listed.group(1).trim();
+            java.util.Set<String> fresh = new java.util.LinkedHashSet<>();
+            if (!raw.isEmpty()) {
+                for (String name : raw.split("\s*,\s*")) {
+                    if (!name.isEmpty()) fresh.add(name);
+                }
+            }
+            synchronized (onlinePlayers) {
+                onlinePlayers.clear();
+                onlinePlayers.addAll(fresh);
+            }
+        }
+    }
+
+    /** True if this console line looks like a vanilla `list` command reply header. */
+    public static boolean isListReply(String line) {
+        return line != null && line.contains("players online:");
+    }
+
+    /** Whether the last action was a `list` request waiting on its reply (so Refresh can send one). */
+    public void sendListCommand() throws IOException {
+        if (!isRunning()) throw new IllegalStateException("Server isn't running.");
+        sendCommand("list");
     }
 
     public List<String> getOnlinePlayers() {

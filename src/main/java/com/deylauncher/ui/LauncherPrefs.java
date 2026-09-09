@@ -45,8 +45,8 @@ public class LauncherPrefs {
 
     // Friends / presence (Account tab, Settings > Launcher)
     public boolean invisibleMode = false;         // broadcast OFFLINE to friends even while actually online
-    public boolean shareServerAddress = false;    // whether myServerAddress is published to friends.json at all
-    public String myServerAddress = "";           // manually entered -- DeyLauncher can't detect this automatically
+    public boolean shareServerAddress = false;    // whether the current server address is published to friends.json at all
+    public String myServerAddress = "";            // auto-filled with the last remote server you joined (see LauncherApp.rememberCurrentlyJoined); still editable as an override
 
     private static Path file() {
         return Path.of(System.getProperty("user.home"), ".deylauncher", "launcher.properties");
