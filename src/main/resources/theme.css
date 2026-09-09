@@ -167,7 +167,10 @@
 
 .theme-dark .account-skin-tabs .tab-header-area .tab-header-background,
 .theme-dark .settings-tabs .tab-header-area .tab-header-background { -fx-background-color: transparent; }
-.theme-dark .settings-tabs .tab-header-area { -fx-background-color: #17181b; -fx-padding: 6 6 0 6; }
+.theme-dark .account-skin-tabs .tab-header-area,
+.theme-dark .settings-tabs .tab-header-area {
+    -fx-background-color: #17181b; -fx-padding: 6 6 0 6;
+}
 .theme-dark .account-skin-tabs .tab, .theme-dark .settings-tabs .tab {
     -fx-background-color: #17181b; -fx-background-radius: 10 10 0 0; -fx-padding: 10 22;
 }
@@ -175,6 +178,25 @@
 .theme-dark .account-skin-tabs .tab .tab-label, .theme-dark .settings-tabs .tab .tab-label { -fx-text-fill: #9a9ba3; -fx-font-weight: bold; }
 .theme-dark .account-skin-tabs .tab:selected .tab-label, .theme-dark .settings-tabs .tab:selected .tab-label { -fx-text-fill: #ff7a1f; }
 .theme-dark .account-skin-tabs .tab-content-area, .theme-dark .settings-tabs .tab-content-area { -fx-background-color: #0d0d0f; }
+
+/* The tab-overflow arrows that appear when a dialog is too small for every tab to fit -- these
+   default to JavaFX's blue/Caspian look, so restyle them in the three-color theme. */
+.theme-dark .account-skin-tabs .tab-header-area .control-buttons-tab,
+.theme-dark .settings-tabs .tab-header-area .control-buttons-tab {
+    -fx-background-color: #202126; -fx-background-radius: 8; -fx-padding: 2 6;
+}
+.theme-dark .account-skin-tabs .tab-header-area .control-buttons-tab > .container > .tab-down-button,
+.theme-dark .settings-tabs .tab-header-area .control-buttons-tab > .container > .tab-down-button,
+.theme-dark .account-skin-tabs .tab-header-area .control-buttons-tab > .container > .tab-up-button,
+.theme-dark .settings-tabs .tab-header-area .control-buttons-tab > .container > .tab-up-button {
+    -fx-background-color: transparent; -fx-padding: 3 6; -fx-cursor: hand; -fx-background-radius: 6;
+}
+.theme-dark .account-skin-tabs .tab-header-area .control-buttons-tab > .container > .tab-down-button > .tab-down-button-graphic,
+.theme-dark .settings-tabs .tab-header-area .control-buttons-tab > .container > .tab-down-button > .tab-down-button-graphic,
+.theme-dark .account-skin-tabs .tab-header-area .control-buttons-tab > .container > .tab-up-button > .tab-up-button-graphic,
+.theme-dark .settings-tabs .tab-header-area .control-buttons-tab > .container > .tab-up-button > .tab-up-button-graphic {
+    -fx-fill: #ff7a1f;
+}
 
 .theme-dark .skin-preview-host {
     -fx-background-color: #17181b; -fx-background-radius: 12; -fx-border-color: #2a2b30; -fx-border-radius: 12;
@@ -210,6 +232,20 @@
 .theme-dark .main-split { -fx-background-color: #0d0d0f; }
 .theme-dark .main-split > .split-pane-divider { -fx-background-color: #2a2b30; }
 
+/* Console-tab toolbar: Start/Stop + version + Play cluster on one wrapping line. */
+.theme-dark .server-toolbar {
+    -fx-background-color: #17181b; -fx-background-radius: 12; -fx-padding: 10 14;
+    -fx-border-color: #2a2b30; -fx-border-radius: 12;
+}
+
+/* Pinned bottom bar on server tabs holding the dirty-aware SAVE button -- never scrolls away. */
+.theme-dark .tab-action-bar {
+    -fx-background-color: #17181b;
+    -fx-border-color: #2a2b30 transparent transparent transparent;
+    -fx-border-width: 1 0 0 0;
+    -fx-padding: 12 20;
+}
+
 .theme-dark .drop-zone { -fx-background-color: #17181b; -fx-border-color: #2a2b30; -fx-border-style: dashed; -fx-border-radius: 12; -fx-background-radius: 12; }
 .theme-dark .drop-zone-active { -fx-border-color: #ff7a1f; -fx-background-color: rgba(255,122,31,0.08); }
 .theme-dark .mods-dialog-content { -fx-background-color: #0d0d0f; }
@@ -226,6 +262,38 @@
 .theme-dark .mod-bundled-badge {
     -fx-text-fill: #ff7a1f; -fx-background-color: rgba(255,122,31,0.15); -fx-background-radius: 20;
     -fx-padding: 4 12; -fx-font-weight: bold; -fx-font-size: 11px;
+}
+
+/* "Share over the Internet" card on the server Console tab. */
+.theme-dark .server-share-card {
+    -fx-background-color: #17181b; -fx-background-radius: 12; -fx-padding: 14 16;
+    -fx-border-color: #2a2b30; -fx-border-radius: 12;
+}
+
+/* Square tile holding a mod/addon thumbnail (with the placeholder glyph until the image loads). */
+.theme-dark .mod-icon-tile {
+    -fx-background-color: #202126; -fx-background-radius: 8;
+    -fx-border-color: #2a2b30; -fx-border-radius: 8;
+}
+.theme-dark .mod-icon-img { -fx-cursor: hand; }
+
+/* The "suggest online players" popup (Operators / Whitelist / Banned / Server managers). */
+.theme-dark .suggest-pop {
+    -fx-background-color: #17181b; -fx-background-radius: 12; -fx-padding: 12;
+    -fx-border-color: #2a2b30; -fx-border-radius: 12;
+    -fx-effect: dropshadow(gaussian, rgba(0,0,0,0.35), 18, 0, 6, 10);
+}
+.theme-dark .suggest-item { -fx-text-fill: #f5f5f6; -fx-background-color: #202126; -fx-background-radius: 8; }
+
+/* Tab-overflow dropdown that JavaFX renders as a ContextMenu -- restyle off the default blue. */
+.theme-dark .settings-tabs .context-menu, .theme-dark .account-skin-tabs .context-menu {
+    -fx-background-color: #17181b; -fx-background-radius: 8; -fx-border-color: #2a2b30; -fx-border-radius: 8;
+}
+.theme-dark .settings-tabs .context-menu .menu-item, .theme-dark .account-skin-tabs .context-menu .menu-item {
+    -fx-background-color: transparent; -fx-text-fill: #f5f5f6; -fx-padding: 7 18;
+}
+.theme-dark .settings-tabs .context-menu .menu-item:hover, .theme-dark .account-skin-tabs .context-menu .menu-item:hover {
+    -fx-background-color: rgba(255,122,31,0.12);
 }
 
 .theme-dark .device-code-box { -fx-background-color: #17181b; -fx-background-radius: 12; -fx-padding: 20; -fx-border-color: #2a2b30; -fx-border-radius: 12; }
@@ -393,7 +461,10 @@
 
 .theme-light .account-skin-tabs .tab-header-area .tab-header-background,
 .theme-light .settings-tabs .tab-header-area .tab-header-background { -fx-background-color: transparent; }
-.theme-light .settings-tabs .tab-header-area { -fx-background-color: #ffffff; -fx-padding: 6 6 0 6; }
+.theme-light .account-skin-tabs .tab-header-area,
+.theme-light .settings-tabs .tab-header-area {
+    -fx-background-color: #ffffff; -fx-padding: 6 6 0 6;
+}
 .theme-light .account-skin-tabs .tab, .theme-light .settings-tabs .tab {
     -fx-background-color: #f0f0f1; -fx-background-radius: 10 10 0 0; -fx-padding: 10 22;
 }
@@ -401,6 +472,24 @@
 .theme-light .account-skin-tabs .tab .tab-label, .theme-light .settings-tabs .tab .tab-label { -fx-text-fill: #6b6c72; -fx-font-weight: bold; }
 .theme-light .account-skin-tabs .tab:selected .tab-label, .theme-light .settings-tabs .tab:selected .tab-label { -fx-text-fill: #e8690f; }
 .theme-light .account-skin-tabs .tab-content-area, .theme-light .settings-tabs .tab-content-area { -fx-background-color: #f6f6f7; }
+
+/* Tab-overflow arrows, restyled from JavaFX's default blue/Caspian look. */
+.theme-light .account-skin-tabs .tab-header-area .control-buttons-tab,
+.theme-light .settings-tabs .tab-header-area .control-buttons-tab {
+    -fx-background-color: #ffffff; -fx-background-radius: 8; -fx-padding: 2 6;
+}
+.theme-light .account-skin-tabs .tab-header-area .control-buttons-tab > .container > .tab-down-button,
+.theme-light .settings-tabs .tab-header-area .control-buttons-tab > .container > .tab-down-button,
+.theme-light .account-skin-tabs .tab-header-area .control-buttons-tab > .container > .tab-up-button,
+.theme-light .settings-tabs .tab-header-area .control-buttons-tab > .container > .tab-up-button {
+    -fx-background-color: transparent; -fx-padding: 3 6; -fx-cursor: hand; -fx-background-radius: 6;
+}
+.theme-light .account-skin-tabs .tab-header-area .control-buttons-tab > .container > .tab-down-button > .tab-down-button-graphic,
+.theme-light .settings-tabs .tab-header-area .control-buttons-tab > .container > .tab-down-button > .tab-down-button-graphic,
+.theme-light .account-skin-tabs .tab-header-area .control-buttons-tab > .container > .tab-up-button > .tab-up-button-graphic,
+.theme-light .settings-tabs .tab-header-area .control-buttons-tab > .container > .tab-up-button > .tab-up-button-graphic {
+    -fx-fill: #e8690f;
+}
 
 .theme-light .skin-preview-host {
     -fx-background-color: #ffffff; -fx-background-radius: 12; -fx-border-color: #e2e2e4; -fx-border-radius: 12;
@@ -436,6 +525,20 @@
 .theme-light .main-split { -fx-background-color: #f6f6f7; }
 .theme-light .main-split > .split-pane-divider { -fx-background-color: #e2e2e4; }
 
+/* Console-tab toolbar: Start/Stop + version + Play cluster on one wrapping line. */
+.theme-light .server-toolbar {
+    -fx-background-color: #f0f0f1; -fx-background-radius: 12; -fx-padding: 10 14;
+    -fx-border-color: #e2e2e4; -fx-border-radius: 12;
+}
+
+/* Pinned bottom bar on server tabs holding the dirty-aware SAVE button -- never scrolls away. */
+.theme-light .tab-action-bar {
+    -fx-background-color: #ffffff;
+    -fx-border-color: #e2e2e4 transparent transparent transparent;
+    -fx-border-width: 1 0 0 0;
+    -fx-padding: 12 20;
+}
+
 .theme-light .drop-zone { -fx-background-color: #ffffff; -fx-border-color: #e2e2e4; -fx-border-style: dashed; -fx-border-radius: 12; -fx-background-radius: 12; }
 .theme-light .drop-zone-active { -fx-border-color: #ff7a1f; -fx-background-color: rgba(255,122,31,0.06); }
 .theme-light .mods-dialog-content { -fx-background-color: #f6f6f7; }
@@ -452,6 +555,38 @@
 .theme-light .mod-bundled-badge {
     -fx-text-fill: #e8690f; -fx-background-color: rgba(255,122,31,0.12); -fx-background-radius: 20;
     -fx-padding: 4 12; -fx-font-weight: bold; -fx-font-size: 11px;
+}
+
+/* "Share over the Internet" card on the server Console tab. */
+.theme-light .server-share-card {
+    -fx-background-color: #ffffff; -fx-background-radius: 12; -fx-padding: 14 16;
+    -fx-border-color: #e2e2e4; -fx-border-radius: 12;
+}
+
+/* Square tile holding a mod/addon thumbnail (with the placeholder glyph until the image loads). */
+.theme-light .mod-icon-tile {
+    -fx-background-color: #f0f0f1; -fx-background-radius: 8;
+    -fx-border-color: #e2e2e4; -fx-border-radius: 8;
+}
+.theme-light .mod-icon-img { -fx-cursor: hand; }
+
+/* The "suggest online players" popup (Operators / Whitelist / Banned / Server managers). */
+.theme-light .suggest-pop {
+    -fx-background-color: #ffffff; -fx-background-radius: 12; -fx-padding: 12;
+    -fx-border-color: #e2e2e4; -fx-border-radius: 12;
+    -fx-effect: dropshadow(gaussian, rgba(0,0,0,0.12), 18, 0, 6, 10);
+}
+.theme-light .suggest-item { -fx-text-fill: #17181b; -fx-background-color: #f0f0f1; -fx-background-radius: 8; }
+
+/* Tab-overflow dropdown that JavaFX renders as a ContextMenu -- restyle off the default blue. */
+.theme-light .settings-tabs .context-menu, .theme-light .account-skin-tabs .context-menu {
+    -fx-background-color: #ffffff; -fx-background-radius: 8; -fx-border-color: #e2e2e4; -fx-border-radius: 8;
+}
+.theme-light .settings-tabs .context-menu .menu-item, .theme-light .account-skin-tabs .context-menu .menu-item {
+    -fx-background-color: transparent; -fx-text-fill: #17181b; -fx-padding: 7 18;
+}
+.theme-light .settings-tabs .context-menu .menu-item:hover, .theme-light .account-skin-tabs .context-menu .menu-item:hover {
+    -fx-background-color: rgba(255,122,31,0.10);
 }
 
 .theme-light .device-code-box { -fx-background-color: #ffffff; -fx-background-radius: 12; -fx-padding: 20; -fx-border-color: #e2e2e4; -fx-border-radius: 12; }

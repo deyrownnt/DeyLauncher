@@ -76,6 +76,13 @@ public class LauncherApp extends Application {
     private ServerStore serverStore;
     private AddedServersStore addedServersStore;
     private final java.util.Map<String, ServerProcessManager> runningServers = new java.util.HashMap<>(); // serverId -> process manager, for whatever's live this session
+    private final java.util.Map<String, PlayitTunnel> serverTunnels = new java.util.HashMap<>(); // serverId -> playit agent for Internet sharing this session
+
+    // Modrinth enrichment caches for installed addons/mods: display-name -> slug, slug -> local icon path.
+    private final java.util.Map<String, String> addonSlugByBase = new java.util.HashMap<>();
+    private final java.util.Map<String, String> modrinthIconCache = new java.util.HashMap<>(); // slug -> icon path ("" = known-none)
+    // Online-player UUID lookup: player name (as parsed from console) -> UUID (for avatars).
+    private final java.util.Map<String, String> playerUuidByName = new java.util.HashMap<>();
 
     // Main-page account button (face + name + online/offline dot) -- see buildAccountButton()/refreshAccountButton()
     private Button accountBtn;
@@ -217,6 +224,38 @@ public class LauncherApp extends Application {
                     friendsService.publishPresence(active.uuid, active.username, status, address);
                 } catch (Exception ignored) {
                     // Best-effort -- a failed presence update isn't worth interrupting anything for.
+                }
+                return null;
+            }
+        };
+        new Thread(task, "presence-publish").start();
+    }
+
+    /**
+     * Publishes presence with this server's live address while it runs (only if the owner turned
+     * on "Allow friends to join" for it), so online friends see it under "Friends Playing Now" and
+     * can join straight in. On stop / when disabled, falls back to the manual Settings address.
+     */
+    private void publishPresenceWithServer(ServerInstance server, boolean running) {
+        if (friendsService == null) return;
+        PlayerIdentity active = identityStore.getActive();
+        if (active == null) return;
+        String status = prefs.invisibleMode ? "OFFLINE" : "ONLINE";
+        String address;
+        if (!prefs.invisibleMode && running && server.allowFriendsJoin) {
+            PlayitTunnel tunnel = serverTunnels.get(server.id);
+            String pub = tunnel != null ? tunnel.publicAddress() : null;
+            address = (pub != null && !pub.isBlank()) ? pub : (localIpAddress() + ":" + server.port);
+        } else {
+            address = (prefs.shareServerAddress && prefs.myServerAddress != null && !prefs.myServerAddress.isBlank())
+                    ? prefs.myServerAddress.trim() : null;
+        }
+        Task<Void> task = new Task<>() {
+            @Override
+            protected Void call() {
+                try {
+                    friendsService.publishPresence(active.uuid, active.username, status, address);
+                } catch (Exception ignored) {
                 }
                 return null;
             }
@@ -829,8 +868,9 @@ public class LauncherApp extends Application {
             Region spacer = new Region();
             HBox.setHgrow(spacer, Priority.ALWAYS);
 
-            Button joinBtn = new Button("▶  Join");
+            Button joinBtn = new Button();
             joinBtn.getStyleClass().add("pill-button");
+            setButtonIcon(joinBtn, IconFactory.Icon.PLAY, "Join");
             joinBtn.setOnAction(ev -> {
                 selectNavTab(navHomeBtn);
                 onPlay(entry.serverAddress);
@@ -852,8 +892,7 @@ public class LauncherApp extends Application {
         Label cardSubLabel = new Label(server.type.displayName() + "  ·  " + server.minecraftVersion);
         cardSubLabel.getStyleClass().add("notice-label");
 
-        Label cardStatusBadge = new Label(running ? "● RUNNING" : "○ STOPPED");
-        cardStatusBadge.getStyleClass().add(running ? "badge-online" : "badge-offline");
+        Label cardStatusBadge = badgeLabel(running);
 
         // Only this header (not the whole card) opens management on click, so the Join row
         // below has its own buttons that work independently without the click bubbling up.
@@ -878,12 +917,14 @@ public class LauncherApp extends Application {
     private HBox buildJoinSplitRow(ServerInstance server) {
         boolean[] joinUseDey = { server.type != ServerType.FORGE }; // default DEY unless Forge
 
-        Button joinMainBtn = new Button("▶  Join");
+        Button joinMainBtn = new Button();
         joinMainBtn.getStyleClass().add("pill-button");
+        setButtonIcon(joinMainBtn, IconFactory.Icon.PLAY, "Join");
         joinMainBtn.setOnAction(e -> launchIntoOwnServer(server, joinUseDey[0]));
 
-        Button joinArrowBtn = new Button("▼");
+        Button joinArrowBtn = new Button();
         joinArrowBtn.getStyleClass().add("pill-button");
+        setButtonIconOnly(joinArrowBtn, IconFactory.Icon.CHEVRON_DOWN);
         joinArrowBtn.setOnAction(e -> {
             Popup joinPopup = new Popup();
             joinPopup.setAutoHide(true);
@@ -915,8 +956,9 @@ public class LauncherApp extends Application {
                 popupBox.getChildren().addAll(sectionLabel("MODE"), popupModeRow);
             }
 
-            Button popupJoinBtn = new Button("▶  Join");
+            Button popupJoinBtn = new Button();
             popupJoinBtn.getStyleClass().add("play-button");
+            setButtonIcon(popupJoinBtn, IconFactory.Icon.PLAY, "Join");
             popupJoinBtn.setOnAction(joinEvent -> {
                 joinPopup.hide();
                 launchIntoOwnServer(server, joinUseDey[0]);
@@ -974,8 +1016,9 @@ public class LauncherApp extends Application {
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
 
-        Button joinBtn = new Button("▶  Join");
+        Button joinBtn = new Button();
         joinBtn.getStyleClass().add("pill-button");
+        setButtonIcon(joinBtn, IconFactory.Icon.PLAY, "Join");
         joinBtn.setOnAction(e -> {
             addedServersStore.touchLastJoined(s.id());
             selectNavTab(navHomeBtn);
@@ -1144,13 +1187,232 @@ public class LauncherApp extends Application {
         dialog.showAndWait();
     }
 
+/**
+     * Internet hosting for a server via the free playit.ggs tunnel. Start/Stop controls plus the
+     * resulting public address (auto-parsed from the agent, or pasted from the playit dashboard),
+     * which -- while this server runs and "Allow friends to join" is on -- is what gets shared to
+     * online friends automatically (see publishPresenceWithServer).
+     */
+    private Node buildInternetShareSection(ServerInstance server) {
+        VBox box = new VBox(12);
+        box.getStyleClass().add("server-share-card");
+
+        Label title = sectionLabel("SHARE OVER THE INTERNET -- PLAYIT (FREE)");
+        Label note = new Label("Expose this server to players on any network without touching a "
+                + "router: with the free playit.ggs tunnel, add a TCP tunnel to 127.0.0.1:" + server.port
+                + " in the playit dashboard, Start here, and your public address is shared automatically "
+                + "to online friends whenever this server is running.");
+        note.getStyleClass().add("notice-label");
+        note.setWrapText(true);
+
+        Button startBtn = new Button();
+        setButtonIcon(startBtn, IconFactory.Icon.PLAY, "Start Tunnel");
+        startBtn.getStyleClass().add("pill-button");
+        Button stopBtn = new Button();
+        setButtonIcon(stopBtn, IconFactory.Icon.STOP, "Stop Tunnel");
+        stopBtn.getStyleClass().add("pill-button");
+        stopBtn.setDisable(true);
+        Button openBtn = new Button("Open playit.ggs");
+        openBtn.getStyleClass().add("pill-button");
+        openBtn.setOnAction(e -> openUrl("https://playit.gg"));
+        Button pairBtn = new Button("Pair / Claim");
+        pairBtn.getStyleClass().add("pill-button");
+
+        Label status = new Label("Stopped.");
+        status.getStyleClass().add("notice-label");
+        status.setWrapText(true);
+
+        TextField publicField = new TextField();
+        publicField.getStyleClass().add("device-url-field");
+        publicField.setPromptText("Public address appears here when connected");
+        HBox.setHgrow(publicField, Priority.ALWAYS);
+        Button copyBtn = new Button();
+        setButtonIcon(copyBtn, IconFactory.Icon.CLIPBOARD, "Copy");
+        copyBtn.getStyleClass().add("pill-button");
+        copyBtn.setOnAction(ev -> {
+            String a = publicField.getText().trim();
+            if (a.isEmpty()) return;
+            var cb = javafx.scene.input.Clipboard.getSystemClipboard();
+            var c = new javafx.scene.input.ClipboardContent();
+            c.putString(a);
+            cb.setContent(c);
+            setButtonIcon(copyBtn, IconFactory.Icon.CHECK, "Copied");
+        });
+        HBox fieldRow = new HBox(8, publicField, copyBtn);
+
+        Runnable renderState = () -> {
+            PlayitTunnel t = serverTunnels.get(server.id);
+            boolean on = t != null && t.isRunning();
+            startBtn.setDisable(on);
+            stopBtn.setDisable(!on);
+            if (on) {
+                String pub = t.publicAddress();
+                if (pub != null && !pub.isBlank()) publicField.setText(pub);
+            }
+        };
+
+        startBtn.setOnAction(e -> startPlayitTunnel(server, status, publicField, renderState));
+        stopBtn.setOnAction(e -> stopPlayitTunnel(server, status, renderState));
+        pairBtn.setOnAction(e -> showPlayitPairDialog(server, status, renderState));
+
+        HBox controls = new HBox(8, startBtn, stopBtn, openBtn, pairBtn);
+        controls.setAlignment(Pos.CENTER_LEFT);
+
+        HBox liveRow = new HBox(8, new Label("Public address:"), fieldRow);
+        liveRow.setAlignment(Pos.CENTER_LEFT);
+
+        box.getChildren().addAll(title, note, controls, status, liveRow);
+        renderState.run();
+        return box;
+    }
+
+    /** True if this server's process is currently running. */
+    private boolean isServerRunning(ServerInstance server) {
+        var pm = runningServers.get(server.id);
+        return pm != null && pm.isRunning();
+    }
+/** Ensures the tunnel object exists, then starts the playit agent in the background. */
+    private void startPlayitTunnel(ServerInstance server, Label status, TextField publicField,
+                                   Runnable renderState) {
+        PlayitTunnel t = serverTunnels.get(server.id);
+        if (t == null) {
+            t = new PlayitTunnel(gameFiles.root.resolve("tools"),
+                    gameFiles.root.resolve("tunnels").resolve(server.id));
+            serverTunnels.put(server.id, t);
+        }
+        PlayitTunnel tunnel = t;
+        status.setText("Ensuring the free playit agent (one-time download)...");
+        Task<Void> task = new Task<>() {
+            @Override
+            protected Void call() throws Exception {
+                tunnel.start(new PlayitTunnel.Listener() {
+                    @Override
+                    public void onLine(String line) {
+                        String trim = line.length() > 150 ? line.substring(0, 150) : line;
+                        Platform.runLater(() -> status.setText("Agent: " + trim));
+                    }
+                    @Override
+                    public void onAddress(String addr) {
+                        Platform.runLater(() -> {
+                            publicField.setText(addr);
+                            status.setText("Public address detected: " + addr
+                                    + (isServerRunning(server) && server.allowFriendsJoin
+                                    ? "  -- shared with online friends." : ""));
+                            publishPresenceWithServer(server, isServerRunning(server));
+                        });
+                    }
+                    @Override
+                    public void onPairingNeeded(String hint) {
+                        String trim = hint.length() > 150 ? hint.substring(0, 150) : hint;
+                        Platform.runLater(() -> status.setText("Needs pairing: " + trim
+                                + "  (start the tunnel already -- then Pair / Claim)"));
+                    }
+                });
+                return null;
+            }
+        };
+        task.setOnSucceeded(ev -> Platform.runLater(() -> {
+            renderState.run();
+            status.setText("Tunnel started. Add a TCP tunnel to 127.0.0.1:" + server.port
+                    + " in the playit dashboard and its address should show above.");
+        }));
+        task.setOnFailed(ev -> Platform.runLater(() -> {
+            renderState.run();
+            status.setText("Couldn't start tunnel: " + task.getException().getMessage());
+        }));
+        new Thread(task, "playit-start-" + server.id).start();
+    }
+
+    private void stopPlayitTunnel(ServerInstance server, Label status, Runnable renderState) {
+        PlayitTunnel t = serverTunnels.get(server.id);
+        if (t == null) return;
+        status.setText("Stopping tunnel...");
+        new Thread(() -> {
+            t.stop();
+            Platform.runLater(() -> {
+                renderState.run();
+                status.setText("Tunnel stopped.");
+                publishPresenceWithServer(server, isServerRunning(server));
+            });
+        }, "playit-stop-" + server.id).start();
+    }
+
+    /** Dialog to paste a one-time playit claim code and run the device-flow pairing against the agent. */
+    private void showPlayitPairDialog(ServerInstance server, Label status, Runnable renderState) {
+        Dialog<Void> d = new Dialog<>();
+        d.setTitle("Pair with playit.ggs -- " + server.name);
+        d.getDialogPane().getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
+        d.getDialogPane().getStylesheets().add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
+        d.getDialogPane().getStyleClass().addAll("root-pane", darkMode ? "theme-dark" : "theme-light");
+        d.getDialogPane().getButtonTypes().addAll(ButtonType.CLOSE);
+
+        VBox content = new VBox(12);
+        content.setPadding(new Insets(20));
+        Label how = new Label("In the playit.ggs dashboard, get your agent claim code (or agent "
+                + "token), paste it here and click Pair. This logs the agent into your free account; "
+                + "it needs to happen once per server.");
+        how.getStyleClass().add("notice-label");
+        how.setWrapText(true);
+        TextField codeField = new TextField();
+        codeField.setPromptText("Claim code / agent token");
+        codeField.getStyleClass().add("input-field");
+        Button openBtn = new Button("Get claim code on playit.ggs");
+        openBtn.getStyleClass().add("pill-button");
+        openBtn.setOnAction(e -> openUrl("https://playit.gg/agent"));
+        Button pairBtn = new Button();
+        setButtonIcon(pairBtn, IconFactory.Icon.CHECK, "Pair");
+        pairBtn.getStyleClass().addAll("settings-apply-button", "settings-apply-button-ready");
+        Label out = new Label();
+        out.getStyleClass().add("notice-label");
+        out.setWrapText(true);
+        pairBtn.setOnAction(ev -> {
+            if (codeField.getText().isBlank()) {
+                out.setText("Paste a claim code first.");
+                return;
+            }
+            pairBtn.setDisable(true);
+            out.setText("Pairing (up to ~45s)...");
+            Task<PlayitTunnel.PairResult> task = new Task<>() {
+                @Override
+                protected PlayitTunnel.PairResult call() throws Exception {
+                    PlayitTunnel t = serverTunnels.get(server.id);
+                    if (t == null) {
+                        t = new PlayitTunnel(gameFiles.root.resolve("tools"),
+                                gameFiles.root.resolve("tunnels").resolve(server.id));
+                        serverTunnels.put(server.id, t);
+                    }
+                    return t.pair(codeField.getText());
+                }
+            };
+            task.setOnSucceeded(r -> Platform.runLater(() -> {
+                pairBtn.setDisable(false);
+                var res = task.getValue();
+                if (res.paired()) {
+                    out.setText("Paired! You can close this and Start the tunnel.");
+                    renderState.run();
+                } else {
+                    String tail = res.output().isEmpty() ? "(no output)"
+                            : res.output().get(res.output().size() - 1);
+                    out.setText("Pairing didn't confirm. Last message: " + tail
+                            + "  -- double-check the code.");
+                }
+            }));
+            task.setOnFailed(r -> Platform.runLater(() -> {
+                pairBtn.setDisable(false);
+                out.setText("Pairing failed: " + task.getException().getMessage());
+            }));
+            new Thread(task, "playit-pair").start();
+        });
+        content.getChildren().addAll(how, codeField, new HBox(10, openBtn, pairBtn), out);
+        d.getDialogPane().setContent(content);
+        d.showAndWait();
+    }
     private Node buildServerConsoleTab(ServerInstance server) {
         VBox box = new VBox(14);
         box.setPadding(new Insets(20));
 
         boolean running = runningServers.containsKey(server.id) && runningServers.get(server.id).isRunning();
-        Label statusBadge = new Label(running ? "● RUNNING" : "○ STOPPED");
-        statusBadge.getStyleClass().add(running ? "badge-online" : "badge-offline");
+        Label statusBadge = badgeLabel(running);
 
         // ---- Version display + change ----
         Label typeLabel = new Label(server.type.displayName());
@@ -1207,14 +1469,15 @@ public class LauncherApp extends Application {
         ipField.setEditable(false);
         ipField.getStyleClass().add("device-url-field");
         ipField.setPrefWidth(180);
-        Button copyIpBtn = new Button("📋 Copy");
+        Button copyIpBtn = new Button();
         copyIpBtn.getStyleClass().add("pill-button");
+        setButtonIcon(copyIpBtn, IconFactory.Icon.CLIPBOARD, "Copy");
         copyIpBtn.setOnAction(ev -> {
             var clipboard = javafx.scene.input.Clipboard.getSystemClipboard();
             var content = new javafx.scene.input.ClipboardContent();
             content.putString(localAddress);
             clipboard.setContent(content);
-            copyIpBtn.setText("✔ Copied");
+            setButtonIcon(copyIpBtn, IconFactory.Icon.CHECK, "Copied");
         });
         Label ipNote = new Label("Local address -- port-forward or use a tunnel for players outside your network.");
         ipNote.getStyleClass().add("notice-label");
@@ -1223,10 +1486,12 @@ public class LauncherApp extends Application {
         HBox ipRow = new HBox(8, ipSpacer, ipField, copyIpBtn);
         ipRow.setAlignment(Pos.CENTER_RIGHT);
 
-        Button startBtn = new Button("▶  Start");
+        Button startBtn = new Button();
         startBtn.getStyleClass().add("play-button");
-        Button stopBtn = new Button("■  Stop");
+        setButtonIcon(startBtn, IconFactory.Icon.PLAY, "Start");
+        Button stopBtn = new Button();
         stopBtn.getStyleClass().add("pill-button");
+        setButtonIcon(stopBtn, IconFactory.Icon.STOP, "Stop");
         stopBtn.setDisable(!running);
         startBtn.setDisable(running);
 
@@ -1264,8 +1529,9 @@ public class LauncherApp extends Application {
         playVanillaBtn.setOnAction(modeEvent -> playUseDey[0] = false);
         HBox playModeRow = new HBox(6, playDeyBtn, playVanillaBtn);
 
-        Button playBtn = new Button("▶  Play on this Server");
+        Button playBtn = new Button();
         playBtn.getStyleClass().add("play-button");
+        setButtonIcon(playBtn, IconFactory.Icon.PLAY, "Play on this Server");
         playBtn.setOnAction(ev -> {
             String chosenUsername = playAsBox.getValue();
             var match = identityStore.loadIndex().accounts().stream()
@@ -1296,17 +1562,23 @@ public class LauncherApp extends Application {
             });
         });
 
-        HBox statusRow = new HBox(12, typeLabel, statusBadge);
-        statusRow.setAlignment(Pos.CENTER_LEFT);
-        HBox versionRow = new HBox(10, serverVersionBox, changeVersionBtn);
-        versionRow.setAlignment(Pos.CENTER_LEFT);
-        HBox buttonRow = new HBox(10, startBtn, stopBtn);
-        HBox playRow = new HBox(10, new Label("Play as:"), playAsBox, new Label("Version:"), clientVersionBox,
+        // Single wrapping toolbar instead of one-stack-under-the-other rows: Start/Stop,
+        // version + Change Version, and the Play-as/Version/mode/Play launch cluster all sit
+        // on one line and only wrap to a second line when the dialog is too narrow.
+        Label playAsLbl = new Label("Play as:");
+        playAsLbl.getStyleClass().add("field-label");
+        Label clientVersionLbl = new Label("Version:");
+        clientVersionLbl.getStyleClass().add("field-label");
+
+        FlowPane toolbar = new FlowPane(10, 8);
+        toolbar.setAlignment(Pos.CENTER_LEFT);
+        toolbar.getStyleClass().add("server-toolbar");
+        toolbar.setMaxWidth(Double.MAX_VALUE);
+        toolbar.getChildren().addAll(
+                typeLabel, statusBadge, startBtn, stopBtn,
+                serverVersionBox, changeVersionBtn,
+                playAsLbl, playAsBox, clientVersionLbl, clientVersionBox,
                 playModeRow, playBtn);
-        playRow.setAlignment(Pos.CENTER_LEFT);
-        for (var n : playRow.getChildren()) {
-            if (n instanceof Label l) l.getStyleClass().add("field-label");
-        }
 
         serverConsoleArea = new TextArea();
         serverConsoleArea.setEditable(false);
@@ -1361,6 +1633,22 @@ public class LauncherApp extends Application {
                     ServerDownloader downloader = new ServerDownloader(manifest);
                     Path jar = downloader.ensureServerJar(server, serverDir, javaBinary);
 
+                    // Seed server.properties with a sensible default online-mode the first time a
+                    // server runs (before the user ever opens Properties), matching the account
+                    // type they're launching with: online -> true, offline -> false. Only applied
+                    // if the key doesn't exist yet -- a user's explicit choice is never overwritten.
+                    ServerPropertiesManager seedProps = new ServerPropertiesManager(serverDir);
+                    var seedMap = seedProps.read();
+                    if (!seedMap.containsKey("online-mode")) {
+                        PlayerIdentity seedIdentity = identityStore.getActive();
+                        boolean seedOnline = seedIdentity != null && seedIdentity.accountType == AccountType.ONLINE;
+                        seedMap.putIfAbsent("online-mode", String.valueOf(seedOnline));
+                        try {
+                            seedProps.write(seedMap);
+                        } catch (java.io.IOException ignored) {
+                        }
+                    }
+
                     Platform.runLater(() -> serverConsoleArea.appendText("[DeyLauncher] Starting...\n"));
                     ServerProcessManager pm = new ServerProcessManager();
                     Process process = pm.start(server, serverDir, jar, javaBinary);
@@ -1379,8 +1667,8 @@ public class LauncherApp extends Application {
                         serverConsoleArea.appendText("[DeyLauncher] Server exited with code " + exit + "\n");
                         startBtn.setDisable(false);
                         stopBtn.setDisable(true);
-                        statusBadge.setText("○ STOPPED");
-                        statusBadge.getStyleClass().setAll("badge-offline");
+                        setBadge(statusBadge, false);
+                        publishPresenceWithServer(server, false);
                         renderServersPageContent();
                     });
                     return null;
@@ -1392,8 +1680,8 @@ public class LauncherApp extends Application {
             }));
             new Thread(task, "server-start-" + server.id).start();
             stopBtn.setDisable(false);
-            statusBadge.setText("● RUNNING");
-            statusBadge.getStyleClass().setAll("badge-online");
+            setBadge(statusBadge, true);
+            publishPresenceWithServer(server, true); // friends can now see & join this server
         });
 
         stopBtn.setOnAction(e -> {
@@ -1405,8 +1693,8 @@ public class LauncherApp extends Application {
                     Platform.runLater(() -> {
                         stopBtn.setDisable(true);
                         startBtn.setDisable(false);
-                        statusBadge.setText("○ STOPPED");
-                        statusBadge.getStyleClass().setAll("badge-offline");
+                        setBadge(statusBadge, false);
+                        publishPresenceWithServer(server, false); // server no longer joinable
                         renderServersPageContent();
                     });
                 }, "server-stop-" + server.id).start();
@@ -1415,9 +1703,23 @@ public class LauncherApp extends Application {
 
         HBox inputRow = new HBox(10, commandField, sendBtn);
 
-        box.getChildren().addAll(ipRow, ipNote, statusRow, versionRow, versionChangeNote, buttonRow,
-                sectionLabel("PLAY"), playRow, serverConsoleArea, inputRow);
-        return box;
+        // Reorganized into clear labeled sections (plus the existing color-coded server-toolbar
+        // and server-share-card cards from theme.css) so the tab reads top-to-bottom, and the
+        // whole thing is wrapped in a ScrollPane so it scrolls instead of clipping when the
+        // management dialog is too short -- the same pattern the Players/Addons tabs use.
+        box.getChildren().setAll(
+                sectionLabel("SERVER ADDRESS"),
+                ipRow, ipNote,
+                buildInternetShareSection(server),
+                sectionLabel("SERVER CONTROLS"),
+                toolbar, versionChangeNote,
+                sectionLabel("CONSOLE"),
+                serverConsoleArea, inputRow);
+
+        ScrollPane scroll = new ScrollPane(box);
+        scroll.setFitToWidth(true);
+        scroll.getStyleClass().add("settings-scroll");
+        return scroll;
     }
 
     private Node buildServerPropertiesTab(ServerInstance server) {
@@ -1430,6 +1732,10 @@ public class LauncherApp extends Application {
         Path serverDir = serverStore.serverDir(server.id);
         ServerPropertiesManager propsManager = new ServerPropertiesManager(serverDir);
         var props = propsManager.read();
+
+        // Tracks whether any control has been edited -- drives the pinned Save button's glow.
+        SimpleBooleanProperty dirty = new SimpleBooleanProperty(false);
+        Runnable markDirty = () -> dirty.set(true);
 
         // ---- Server icon drag-and-drop ----
         Label iconLabel = sectionLabel("SERVER ICON (64x64 PNG)");
@@ -1485,6 +1791,7 @@ public class LauncherApp extends Application {
         difficultyBox.getStyleClass().add("input-field");
 
         CheckBox hardcoreBox = new CheckBox("Hardcore (permadeath -- forces difficulty to Hard)");
+        hardcoreBox.setWrapText(true);
         hardcoreBox.setSelected("true".equals(props.getOrDefault("hardcore", "false")));
         difficultyBox.setDisable(hardcoreBox.isSelected());
         hardcoreBox.selectedProperty().addListener((o, a, b) -> {
@@ -1498,12 +1805,26 @@ public class LauncherApp extends Application {
         gamemodeBox.getStyleClass().add("input-field");
 
         CheckBox pvpBox = new CheckBox("PvP enabled");
+        pvpBox.setWrapText(true);
         pvpBox.setSelected(!"false".equals(props.getOrDefault("pvp", "true")));
         CheckBox onlineModeBox = new CheckBox("Online mode (requires real Microsoft accounts)");
-        onlineModeBox.setSelected(!"false".equals(props.getOrDefault("online-mode", "true")));
+        onlineModeBox.setWrapText(true);
+        // Default online-mode by the account type the owner last used: online account -> on,
+        // offline account -> off. Matches what the vanilla server expects (an offline account
+        // can't join an online-mode server anyway), and only applies before the key exists --
+        // once set, we respect whatever was saved.
+        if (props.containsKey("online-mode")) {
+            onlineModeBox.setSelected(!"false".equals(props.get("online-mode")));
+        } else {
+            PlayerIdentity activeIdentity = identityStore.getActive();
+            boolean onlineAccount = activeIdentity != null && activeIdentity.accountType == AccountType.ONLINE;
+            onlineModeBox.setSelected(onlineAccount);
+        }
         CheckBox whitelistBox = new CheckBox("Whitelist enabled");
+        whitelistBox.setWrapText(true);
         whitelistBox.setSelected("true".equals(props.getOrDefault("white-list", "false")));
         CheckBox netherBox = new CheckBox("Nether enabled");
+        netherBox.setWrapText(true);
         netherBox.setSelected(!"false".equals(props.getOrDefault("allow-nether", "true")));
         Label netherNote = new Label("Vanilla has no official server.properties toggle for The End "
                 + "specifically (only the Nether has one) -- so there's no equivalent switch here to "
@@ -1528,6 +1849,7 @@ public class LauncherApp extends Application {
 
         // ---- Resource pack ----
         CheckBox requirePackBox = new CheckBox("Require resource pack");
+        requirePackBox.setWrapText(true);
         requirePackBox.setSelected("true".equals(props.getOrDefault("require-resource-pack", "false")));
         TextField packUrlField = new TextField(props.getOrDefault("resource-pack", ""));
         packUrlField.setPromptText("Direct download URL for the .zip (must be reachable by players)");
@@ -1577,8 +1899,25 @@ public class LauncherApp extends Application {
         packHonestNote.getStyleClass().add("notice-label");
         packHonestNote.setWrapText(true);
 
-        Button saveBtn = new Button("Save Properties");
-        saveBtn.getStyleClass().addAll("settings-apply-button", "settings-apply-button-ready");
+        // ---- Dirty tracking: any edit below makes the pinned Save button glow ----
+        motdField.textProperty().addListener((o, a, b) -> markDirty.run());
+        maxPlayersField.textProperty().addListener((o, a, b) -> markDirty.run());
+        difficultyBox.valueProperty().addListener((o, a, b) -> markDirty.run());
+        gamemodeBox.valueProperty().addListener((o, a, b) -> markDirty.run());
+        hardcoreBox.selectedProperty().addListener((o, a, b) -> markDirty.run());
+        pvpBox.selectedProperty().addListener((o, a, b) -> markDirty.run());
+        onlineModeBox.selectedProperty().addListener((o, a, b) -> markDirty.run());
+        whitelistBox.selectedProperty().addListener((o, a, b) -> markDirty.run());
+        netherBox.selectedProperty().addListener((o, a, b) -> markDirty.run());
+        viewDistanceField.textProperty().addListener((o, a, b) -> markDirty.run());
+        simDistanceField.textProperty().addListener((o, a, b) -> markDirty.run());
+        spawnProtectionSlider.valueProperty().addListener((o, a, b) -> markDirty.run());
+        requirePackBox.selectedProperty().addListener((o, a, b) -> markDirty.run());
+        packUrlField.textProperty().addListener((o, a, b) -> markDirty.run());
+        packPromptField.textProperty().addListener((o, a, b) -> markDirty.run());
+
+        // ---- Save: pinned bottom bar that only glows once something changed ----
+        Button saveBtn = buildDirtyButton(dirty);
         Label savedNote = new Label();
         savedNote.getStyleClass().add("notice-label");
         saveBtn.setOnAction(e -> {
@@ -1602,25 +1941,44 @@ public class LauncherApp extends Application {
             try {
                 propsManager.write(props);
                 savedNote.setText("Saved -- takes effect next server start.");
+                dirty.set(false);
+                savedNote.getStyleClass().remove("notice-error");
             } catch (java.io.IOException ex) {
                 savedNote.setText("Couldn't save: " + ex.getMessage());
             }
         });
 
+        // ---- Layout: gamemode/difficulty side by side, toggles in a 2-column matrix ----
+        GridPane modeGrid = new GridPane();
+        modeGrid.setHgap(28);
+        modeGrid.setVgap(8);
+        modeGrid.add(sectionLabel("GAME MODE"), 0, 0);
+        modeGrid.add(gamemodeBox, 0, 1);
+        modeGrid.add(sectionLabel("DIFFICULTY"), 1, 0);
+        modeGrid.add(difficultyBox, 1, 1);
+
+        GridPane toggleMatrix = new GridPane();
+        toggleMatrix.setHgap(24);
+        toggleMatrix.setVgap(10);
+        toggleMatrix.add(pvpBox, 0, 0);
+        toggleMatrix.add(onlineModeBox, 1, 0);
+        toggleMatrix.add(whitelistBox, 0, 1);
+        toggleMatrix.add(netherBox, 1, 1);
+        toggleMatrix.add(requirePackBox, 0, 2);
+        toggleMatrix.add(hardcoreBox, 1, 2);
+
         box.getChildren().addAll(
                 iconLabel, dropZone,
                 sectionLabel("MOTD"), motdField,
                 sectionLabel("MAX PLAYERS"), maxPlayersField,
-                sectionLabel("DIFFICULTY"), difficultyBox, hardcoreBox,
-                sectionLabel("GAME MODE"), gamemodeBox,
-                pvpBox, onlineModeBox, whitelistBox, netherBox, netherNote,
+                modeGrid,
+                toggleMatrix, netherNote,
                 sectionLabel("VIEW DISTANCE (CHUNKS)"), viewDistanceField,
                 sectionLabel("SIMULATION DISTANCE (CHUNKS)"), simDistanceField,
                 spawnProtectionLabel, spawnProtectionSlider,
-                sectionLabel("RESOURCE PACK"), requirePackBox, packUrlField, packPromptField,
-                packDropZone, packSha1Label, packHonestNote,
-                saveBtn, savedNote);
-        return scroll;
+                sectionLabel("RESOURCE PACK"), packUrlField, packPromptField,
+                packDropZone, packSha1Label, packHonestNote);
+        return tabShell(scroll, saveBtn, savedNote);
     }
 
     private int parseIntSafe(String s, int fallback) {
@@ -1642,8 +2000,9 @@ public class LauncherApp extends Application {
 
         // ---- Online now (from live join/leave parsing -- only populated while the server is running) ----
         VBox onlineSection = new VBox(10);
-        Button refreshOnlineBtn = new Button("↻ Refresh");
+        Button refreshOnlineBtn = new Button("Refresh");
         refreshOnlineBtn.getStyleClass().add("pill-button");
+        Runnable[] renderOnlineHolder = new Runnable[1];
         Runnable renderOnline = () -> {
             onlineSection.getChildren().setAll(sectionLabel("ONLINE NOW"), refreshOnlineBtn);
             var pm = runningServers.get(server.id);
@@ -1658,11 +2017,37 @@ public class LauncherApp extends Application {
                 onlineSection.getChildren().add(none);
             } else {
                 for (String playerName : online) {
-                    onlineSection.getChildren().add(buildOnlinePlayerRow(playerName, playerManager));
+                    onlineSection.getChildren().add(buildOnlinePlayerRow(playerName, playerManager, renderOnlineHolder[0]));
                 }
             }
         };
-        refreshOnlineBtn.setOnAction(e -> renderOnline.run());
+        renderOnlineHolder[0] = renderOnline;
+        // Refresh doesn't just re-render -- it asks the running server for its authoritative
+        // player list (the vanilla `list` command). Its reply updates ServerProcessManager's
+        // online set via observeConsoleLine, so after a short wait the re-render shows the true
+        // current players instead of whatever join/leave lines happened to be captured.
+        refreshOnlineBtn.setOnAction(e -> {
+            var pm = runningServers.get(server.id);
+            if (pm == null || !pm.isRunning()) {
+                renderOnline.run();
+                return;
+            }
+            refreshOnlineBtn.setDisable(true);
+            try {
+                pm.sendListCommand();
+            } catch (Exception ignored) {
+            }
+            new Thread(() -> {
+                try {
+                    Thread.sleep(900);
+                } catch (InterruptedException ignored) {
+                }
+                Platform.runLater(() -> {
+                    refreshOnlineBtn.setDisable(false);
+                    renderOnline.run();
+                });
+            }, "refresh-online-" + server.id).start();
+        });
         renderOnline.run();
 
         // ---- Server managers (permission record for future remote management) ----
@@ -1695,6 +2080,9 @@ public class LauncherApp extends Application {
         TextField addManagerField = new TextField();
         addManagerField.setPromptText("DeyLauncher username");
         addManagerField.getStyleClass().add("input-field");
+        Button suggestManagerBtn = new Button("Suggest");
+        suggestManagerBtn.getStyleClass().add("pill-button");
+        suggestManagerBtn.setOnAction(e -> showOnlinePlayerSuggestions(addManagerField, server));
         Button addManagerBtn = new Button("Add");
         addManagerBtn.getStyleClass().add("pill-button");
         addManagerBtn.setOnAction(e -> {
@@ -1705,14 +2093,14 @@ public class LauncherApp extends Application {
             addManagerField.clear();
             renderManagers.run();
         });
-        HBox addManagerRow = new HBox(10, addManagerField, addManagerBtn);
+        HBox addManagerRow = new HBox(10, suggestManagerBtn, addManagerField, addManagerBtn);
         renderManagers.run();
         managersSection.getChildren().add(addManagerRow);
 
         box.getChildren().add(onlineSection);
-        box.getChildren().add(buildPlayerListSection("OPERATORS (OP)", playerManager.listOps(), playerManager, playerManager.opsFile()));
-        box.getChildren().add(buildPlayerListSection("WHITELIST", playerManager.listWhitelist(), playerManager, playerManager.whitelistFile()));
-        box.getChildren().add(buildPlayerListSection("BANNED", playerManager.listBanned(), playerManager, playerManager.bannedFile()));
+        box.getChildren().add(buildPlayerListSection("OPERATORS (OP)", playerManager.listOps(), playerManager, playerManager.opsFile(), server));
+        box.getChildren().add(buildPlayerListSection("WHITELIST", playerManager.listWhitelist(), playerManager, playerManager.whitelistFile(), server));
+        box.getChildren().add(buildPlayerListSection("BANNED", playerManager.listBanned(), playerManager, playerManager.bannedFile(), server));
         box.getChildren().add(managersSection);
         return scroll;
     }
@@ -1723,19 +2111,29 @@ public class LauncherApp extends Application {
      * NBT parser reading playerdata (reflecting last save, not truly live), which is a
      * meaningfully bigger feature than fits honestly in this pass.
      */
-    private VBox buildOnlinePlayerRow(String playerName, ServerPlayerManager playerManager) {
-        ImageView avatarView = new ImageView(faceThumbnail(null)); // no local skin data for an arbitrary server player -- honest placeholder
+    private VBox buildOnlinePlayerRow(String playerName, ServerPlayerManager playerManager, Runnable onAvatarLoaded) {
+        // Try to show a real profile picture (front-facing head) once we've resolved the player's
+        // UUID from the server's online-name list; otherwise a clean placeholder while the skin
+        // fetch runs in the background.
+        String knownUuid = playerUuidByName.get(playerName);
+        Image cached = (knownUuid != null) ? friendFaceCached(knownUuid, true) : null;
+        ImageView avatarView = new ImageView(cached != null ? cached : faceThumbnail(null));
         avatarView.setFitWidth(28);
         avatarView.setFitHeight(28);
         avatarView.setSmooth(false);
         avatarView.getStyleClass().add("account-btn-face");
+        if (cached == null) {
+            resolveOnlinePlayerAvatar(playerName, onAvatarLoaded);
+        }
 
         Label nameLabel = new Label(playerName);
         nameLabel.getStyleClass().add("mod-name");
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
-        Label expandHint = new Label("Server account info ▾");
+        Label expandHint = new Label("Server account info");
         expandHint.getStyleClass().add("notice-label");
+        expandHint.setGraphic(icon(IconFactory.Icon.CHEVRON_DOWN));
+        expandHint.setGraphicTextGap(6);
 
         HBox summaryRow = new HBox(10, avatarView, nameLabel, spacer, expandHint);
         summaryRow.setAlignment(Pos.CENTER_LEFT);
@@ -1775,16 +2173,29 @@ public class LauncherApp extends Application {
             boolean showing = detailBox.isVisible();
             detailBox.setVisible(!showing);
             detailBox.setManaged(!showing);
-            expandHint.setText(showing ? "Server account info ▾" : "Server account info ▴");
+            expandHint.setGraphic(icon(showing ? IconFactory.Icon.CHEVRON_DOWN : IconFactory.Icon.CHEVRON_UP));
         });
 
         return new VBox(6, summaryRow, detailBox);
     }
 
     private VBox buildPlayerListSection(String title, List<ServerPlayerManager.PlayerEntry> entries,
-                                         ServerPlayerManager playerManager, Path file) {
+                                         ServerPlayerManager playerManager, Path file, ServerInstance server) {
         VBox section = new VBox(10, sectionLabel(title));
         for (var entry : entries) {
+            ImageView avatar = null;
+            String uuid = entry.uuid();
+            if (uuid != null && !uuid.isBlank()) {
+                Image cachedFace = friendFaceCached(uuid, true);
+                if (cachedFace != null) {
+                    avatar = new ImageView(cachedFace);
+                    avatar.setFitWidth(28);
+                    avatar.setFitHeight(28);
+                    avatar.setSmooth(false);
+                    avatar.getStyleClass().add("account-btn-face");
+                    avatar.setUserData("has-avatar");
+                }
+            }
             Label name = new Label(entry.name());
             name.getStyleClass().add("mod-name");
             Region spacer = new Region();
@@ -1799,14 +2210,19 @@ public class LauncherApp extends Application {
                 } catch (Exception ignored) {
                 }
             });
-            HBox row = new HBox(10, name, spacer, removeBtn);
+            HBox row = new HBox(10);
             row.setAlignment(Pos.CENTER_LEFT);
             row.getStyleClass().add("mod-row");
+            if (avatar != null) row.getChildren().add(avatar);
+            row.getChildren().addAll(name, spacer, removeBtn);
             section.getChildren().add(row);
         }
         TextField addField = new TextField();
         addField.setPromptText("Player name");
         addField.getStyleClass().add("input-field");
+        Button suggestBtn = new Button("Suggest");
+        suggestBtn.getStyleClass().add("pill-button");
+        suggestBtn.setOnAction(e -> showOnlinePlayerSuggestions(addField, server));
         Button addBtn = new Button("Add");
         addBtn.getStyleClass().add("pill-button");
         addBtn.setOnAction(e -> {
@@ -1817,7 +2233,7 @@ public class LauncherApp extends Application {
             } catch (Exception ignored) {
             }
         });
-        HBox addRow = new HBox(10, addField, addBtn);
+        HBox addRow = new HBox(10, suggestBtn, addField, addBtn);
         section.getChildren().add(addRow);
         return section;
     }
@@ -1845,6 +2261,7 @@ public class LauncherApp extends Application {
         heading.getStyleClass().add("card-heading");
 
         VBox listBox = new VBox(8);
+        Runnable[] renderAddonsHolder = new Runnable[1];
         Runnable renderAddons = () -> {
             listBox.getChildren().clear();
             var addons = addonsManager.list();
@@ -1858,12 +2275,28 @@ public class LauncherApp extends Application {
                 CheckBox enabledBox = new CheckBox();
                 enabledBox.setSelected(addon.enabled());
                 enabledBox.getStyleClass().add("mod-checkbox");
-                Label nameLabel = new Label(addon.fileName().replace(".disabled", ""));
+                String baseName = addon.fileName().replace(".disabled", "");
+                Label nameLabel = new Label(baseName);
                 nameLabel.getStyleClass().add(addon.enabled() ? "mod-name" : "mod-filename");
+                // If we've already enriched this addon to a Modrinth project, show its cached icon.
+                String addonSlug = addonSlugByBase.get(baseName.toLowerCase());
+                Node iconTile = (addonSlug != null)
+                        ? modIconNode(modrinthIconPath(addonSlug), 30)
+                        : modIconNode(null, 30);
+                if (addonSlug != null) {
+                    iconTile.setCursor(javafx.scene.Cursor.HAND);
+                    final String clickSlug = addonSlug;
+                    iconTile.setOnMouseClicked(ev -> openUrl(ModrinthClient.projectPageUrl(clickSlug,
+                            ModrinthClient.projectTypeFor(server.type))));
+                    nameLabel.setCursor(javafx.scene.Cursor.HAND);
+                    nameLabel.setOnMouseClicked(ev -> openUrl(ModrinthClient.projectPageUrl(clickSlug,
+                            ModrinthClient.projectTypeFor(server.type))));
+                }
                 Region rowSpacer = new Region();
                 HBox.setHgrow(rowSpacer, Priority.ALWAYS);
-                Button deleteBtn = new Button("🗑");
+                Button deleteBtn = new Button();
                 deleteBtn.getStyleClass().add("mod-delete-button");
+                setButtonIconOnly(deleteBtn, IconFactory.Icon.TRASH);
                 enabledBox.setOnAction(e -> {
                     try {
                         addonsManager.setEnabled(addon.fileName(), enabledBox.isSelected());
@@ -1877,13 +2310,17 @@ public class LauncherApp extends Application {
                     } catch (Exception ignored) {
                     }
                 });
-                HBox row = new HBox(10, enabledBox, nameLabel, rowSpacer, deleteBtn);
+                HBox row = new HBox(10, iconTile, enabledBox, nameLabel, rowSpacer, deleteBtn);
                 row.setAlignment(Pos.CENTER_LEFT);
                 row.getStyleClass().add("mod-row");
                 if (!addon.enabled()) row.getStyleClass().add("mod-row-disabled");
                 listBox.getChildren().add(row);
             }
+            // Best-effort: attach icons (+ click-through pages) to installed addons by matching
+            // their display/file names against Modrinth, in the background so the list never blocks.
+            enrichAddonIconsAsync(addons, folderKind, listBox, server, renderAddonsHolder[0]);
         };
+        renderAddonsHolder[0] = renderAddons;
 
         VBox dropZone = new VBox(new Label("Drop " + folderKind + " .jar files here"));
         dropZone.setAlignment(Pos.CENTER);
@@ -1909,9 +2346,210 @@ public class LauncherApp extends Application {
             e.setDropCompleted(true);
         });
 
+        // ---- Search the internet (Modrinth) for a compatible build ----
+        ModrinthClient modrinth = new ModrinthClient();
+        TextField searchField = new TextField();
+        searchField.setPromptText("Search " + folderKind + "s on Modrinth (e.g. "
+                + (server.type == ServerType.PURPUR ? "better-wolves" : "sodium") + ")...");
+        searchField.getStyleClass().add("input-field");
+        HBox.setHgrow(searchField, Priority.ALWAYS);
+        Button searchBtn = new Button();
+        searchBtn.getStyleClass().add("pill-button");
+        setButtonIcon(searchBtn, IconFactory.Icon.SEARCH, "Search");
+        Label searchStatus = new Label("Search finds online builds, then Install auto-picks a "
+                + "version matching Minecraft " + server.minecraftVersion + ".");
+        searchStatus.getStyleClass().add("notice-label");
+        searchStatus.setWrapText(true);
+        VBox resultsBox = new VBox(8);
+
+        searchBtn.setOnAction(e -> {
+            String q = searchField.getText().trim();
+            if (q.isEmpty()) return;
+            resultsBox.getChildren().clear();
+            searchStatus.setText("Searching Modrinth for \"" + q + "\"...");
+            Task<java.util.List<ModrinthClient.Hit>> task = new Task<>() {
+                @Override
+                protected java.util.List<ModrinthClient.Hit> call() throws Exception {
+                    return modrinth.search(q, ModrinthClient.projectTypeFor(server.type));
+                }
+            };
+            task.setOnSucceeded(ev -> Platform.runLater(() -> {
+                var hits = task.getValue();
+                if (hits == null || hits.isEmpty()) {
+                    searchStatus.setText("No " + folderKind + "s found for \"" + q + "\".");
+                    return;
+                }
+                searchStatus.setText(hits.size() + " " + folderKind + (hits.size() == 1 ? "" : "s")
+                        + " found -- choose one to install.");
+                resultsBox.getChildren().clear();
+                for (var hit : hits) {
+                    resultsBox.getChildren().add(buildModrinthRow(hit, modrinth, addonsManager, renderAddons, server));
+                }
+            }));
+            task.setOnFailed(ev -> Platform.runLater(() ->
+                    searchStatus.setText("Search failed: " + task.getException().getMessage())));
+            new Thread(task, "modrinth-search").start();
+        });
+        searchField.setOnAction(ev -> searchBtn.fire());
+        HBox searchRow = new HBox(10, searchField, searchBtn);
+        searchRow.setAlignment(Pos.CENTER_LEFT);
+
         renderAddons.run();
-        box.getChildren().addAll(heading, dropZone, listBox);
+        box.getChildren().addAll(heading, dropZone,
+                sectionLabel("SEARCH ONLINE"), searchRow, searchStatus, resultsBox,
+                listBox);
         return scroll;
+    }
+
+    /**
+     * Background enrichment for installed server addons: for each installed jar we don't yet know a
+     * Modrinth project for, search by its base file name, cache the slug, download its icon, then
+     * re-render the list so the icon + click-through appear and the placeholder tile gets replaced.
+     */
+    private void enrichAddonIconsAsync(List<ServerAddonsManager.AddonEntry> addons, String folderKind,
+                                       VBox listBox, ServerInstance server, Runnable renderAddons) {
+        List<ServerAddonsManager.AddonEntry> pending = addons.stream()
+                .filter(a -> !addonSlugByBase.containsKey(a.fileName().replace(".disabled", "").toLowerCase()))
+                .toList();
+        if (pending.isEmpty()) return;
+        Path iconDir = gameFiles.root.resolve("mod-icons");
+        Task<Void> task = new Task<>() {
+            @Override
+            protected Void call() {
+                ModrinthClient client = new ModrinthClient();
+                String type = ModrinthClient.projectTypeFor(server.type);
+                for (var addon : pending) {
+                    String base = addon.fileName().replace(".disabled", "");
+                    String name = base;
+                    // strip a leading version-ish segment e.g. "name-1.2.3.jar" -> search is fuzzy anyway
+                    int dot = name.lastIndexOf('.');
+                    if (dot > 0) name = name.substring(0, dot);
+                    var hit = client.firstHitByName(name, type);
+                    if (hit == null || hit.slug().isBlank()) {
+                        addonSlugByBase.put(base.toLowerCase(), "");
+                        continue;
+                    }
+                    addonSlugByBase.put(base.toLowerCase(), hit.slug());
+                    try {
+                        Path icon = client.iconFor(hit.slug(), hit.iconUrl(), type, iconDir);
+                        if (icon != null) modrinthIconCache.put(hit.slug(), icon.toString());
+                    } catch (Exception ignored) {
+                    }
+                }
+                return null;
+            }
+        };
+        task.setOnSucceeded(ev -> Platform.runLater(renderAddons::run));
+        new Thread(task, "enrich-addon-icons").start();
+    }
+
+    /**
+     * Background enrichment for installed client mods (the main-launcher "Mods" dialog): search each
+     * mod's display name on Modrinth, cache the slug + icon, then re-render the rows so the icon and
+     * the click-through-to-Modrinth page appear. Client mods are always project_type "mod" on Modrinth.
+     */
+    private void enrichModIconsAsync(List<ModsManager.ModEntry> mods, Runnable refresh) {
+        List<ModsManager.ModEntry> pending = mods.stream()
+                .filter(m -> !addonSlugByBase.containsKey(m.fileName().toLowerCase()))
+                .toList();
+        if (pending.isEmpty()) return;
+        Path iconDir = gameFiles.root.resolve("mod-icons");
+        Task<Void> task = new Task<>() {
+            @Override
+            protected Void call() {
+                ModrinthClient client = new ModrinthClient();
+                for (var m : pending) {
+                    String base = m.fileName();
+                    var hit = client.firstHitByName(m.displayName(), "mod");
+                    if (hit == null || hit.slug().isBlank()) {
+                        addonSlugByBase.put(base.toLowerCase(), "");
+                        continue;
+                    }
+                    addonSlugByBase.put(base.toLowerCase(), hit.slug());
+                    try {
+                        Path icon = client.iconFor(hit.slug(), hit.iconUrl(), "mod", iconDir);
+                        if (icon != null) modrinthIconCache.put(hit.slug(), icon.toString());
+                    } catch (Exception ignored) {
+                    }
+                }
+                return null;
+            }
+        };
+        task.setOnSucceeded(ev -> Platform.runLater(refresh::run));
+        new Thread(task, "enrich-mod-icons").start();
+    }
+
+    private Node buildModrinthRow(ModrinthClient.Hit hit, ModrinthClient modrinth,
+                                  ServerAddonsManager addonsManager, Runnable renderAddons,
+                                  ServerInstance server) {
+        // Project icon (from Modrinth), click-through to the project's Modrinth page for details.
+        Node iconNode = remoteModIcon(hit.iconUrl(), 34);
+        iconNode.setCursor(javafx.scene.Cursor.HAND);
+        iconNode.setOnMouseClicked(ev -> {
+            if (ev.getClickCount() == 1) {
+                openUrl(ModrinthClient.projectPageUrl(hit.slug(), ModrinthClient.projectTypeFor(server.type)));
+            }
+        });
+        Label name = new Label(hit.name());
+        name.getStyleClass().add("mod-name");
+        Label meta = new Label("by " + hit.author() + "  ·  " + formatDownloads(hit.downloads())
+                + " downloads  ·  view on Modrinth ▸");
+        meta.getStyleClass().add("notice-label");
+        meta.setCursor(javafx.scene.Cursor.HAND);
+        meta.setOnMouseClicked(ev -> openUrl(
+                ModrinthClient.projectPageUrl(hit.slug(), ModrinthClient.projectTypeFor(server.type))));
+        VBox text = new VBox(2, name, meta);
+
+        Region spacer = new Region();
+        HBox.setHgrow(spacer, Priority.ALWAYS);
+
+        Label status = new Label();
+        status.getStyleClass().add("notice-label");
+        Button installBtn = new Button();
+        installBtn.getStyleClass().add("pill-button");
+        setButtonIcon(installBtn, IconFactory.Icon.ADD, "Install");
+        installBtn.setOnAction(e -> {
+            installBtn.setDisable(true);
+            status.setText("Looking up a Minecraft " + server.minecraftVersion + " build...");
+            Task<ModrinthClient.ProjectVersion> task = new Task<>() {
+                @Override
+                protected ModrinthClient.ProjectVersion call() throws Exception {
+                    ModrinthClient.ProjectVersion match = null;
+                    for (var v : modrinth.versions(hit.slug())) {
+                        if (v.gameVersions().contains(server.minecraftVersion)) { match = v; break; }
+                    }
+                    if (match == null) return null;
+                    modrinth.download(match, addonsManager.folder());
+                    return match;
+                }
+            };
+            task.setOnSucceeded(ev -> Platform.runLater(() -> {
+                installBtn.setDisable(false);
+                var v = task.getValue();
+                if (v == null) {
+                    status.setText("No " + server.minecraftVersion + " build of this exists yet.");
+                } else {
+                    status.setText("Installed " + v.versionNumber() + " (Minecraft " + server.minecraftVersion + ").");
+                    renderAddons.run();
+                }
+            }));
+            task.setOnFailed(ev -> Platform.runLater(() -> {
+                installBtn.setDisable(false);
+                status.setText("Install failed: " + task.getException().getMessage());
+            }));
+            new Thread(task, "modrinth-install").start();
+        });
+
+        HBox row = new HBox(10, iconNode, text, spacer, status, installBtn);
+        row.setAlignment(Pos.CENTER_LEFT);
+        row.getStyleClass().add("mod-row");
+        return row;
+    }
+
+    private String formatDownloads(int n) {
+        if (n >= 1_000_000) return String.format(java.util.Locale.US, "%.1fM", n / 1_000_000.0);
+        if (n >= 1_000) return String.format(java.util.Locale.US, "%.0fK", n / 1_000.0);
+        return String.valueOf(n);
     }
 
     private Node buildServerFilesTab(ServerInstance server) {
@@ -1956,13 +2594,17 @@ public class LauncherApp extends Application {
                         .toList();
                 for (Path entry : entries) {
                     boolean isDir = Files.isDirectory(entry);
-                    Label icon = new Label(isDir ? "📁" : "📄");
+                    Label icon = new Label();
+                    icon.setGraphic(icon(isDir ? IconFactory.Icon.FOLDER : IconFactory.Icon.FILE));
+                    icon.getStyleClass().add("icon-svg");
+                    icon.setGraphicTextGap(0);
                     Label nameLabel = new Label(entry.getFileName().toString());
                     nameLabel.getStyleClass().add(isDir ? "mod-name" : "mod-filename");
                     Region rowSpacer = new Region();
                     HBox.setHgrow(rowSpacer, Priority.ALWAYS);
-                    Button deleteBtn = new Button("🗑");
+                    Button deleteBtn = new Button();
                     deleteBtn.getStyleClass().add("mod-delete-button");
+                    setButtonIconOnly(deleteBtn, IconFactory.Icon.TRASH);
                     deleteBtn.setOnAction(e -> {
                         try {
                             if (isDir) {
@@ -2000,7 +2642,7 @@ public class LauncherApp extends Application {
         };
         renderFiles[0].run();
 
-        Button refreshBtn = new Button("↻ Refresh");
+        Button refreshBtn = new Button("Refresh");
         refreshBtn.getStyleClass().add("pill-button");
         refreshBtn.setOnAction(e -> renderFiles[0].run());
         HBox topRow = new HBox(10, currentPathLabel, refreshBtn);
@@ -2055,8 +2697,16 @@ public class LauncherApp extends Application {
         javaEnvNote.getStyleClass().add("notice-label");
         javaEnvNote.setWrapText(true);
 
-        Button saveBtn = new Button("Save Settings");
-        saveBtn.getStyleClass().addAll("settings-apply-button", "settings-apply-button-ready");
+        // ---- Dirty tracking ----
+        SimpleBooleanProperty dirty = new SimpleBooleanProperty(false);
+        Runnable markDirty = () -> dirty.set(true);
+        minRamSlider.valueProperty().addListener((o, a, b) -> markDirty.run());
+        maxRamSlider.valueProperty().addListener((o, a, b) -> markDirty.run());
+        portField.textProperty().addListener((o, a, b) -> markDirty.run());
+        javaEnvBox.valueProperty().addListener((o, a, b) -> markDirty.run());
+
+        // ---- Save: pinned bottom bar that only glows once something changed ----
+        Button saveBtn = buildDirtyButton(dirty);
         Label savedNote = new Label();
         savedNote.getStyleClass().add("notice-label");
         saveBtn.setOnAction(e -> {
@@ -2066,19 +2716,31 @@ public class LauncherApp extends Application {
             server.javaOverridePath = javaEnvBox.getValue().startsWith("Auto") ? null : javaEnvBox.getValue();
             serverStore.save(server);
             savedNote.setText("Saved -- some changes (port, RAM) take effect next server start.");
+            dirty.set(false);
         });
 
+        // Memory Min/Max side by side so the pair reads as one setting.
+        GridPane memGrid = new GridPane();
+        memGrid.setHgap(24);
+        memGrid.setVgap(8);
+        memGrid.add(minRamLabel, 0, 0);
+        memGrid.add(maxRamLabel, 1, 0);
+        memGrid.add(minRamSlider, 0, 1);
+        memGrid.add(maxRamSlider, 1, 1);
+
         box.getChildren().addAll(
-                sectionLabel("MEMORY"), minRamLabel, minRamSlider, maxRamLabel, maxRamSlider,
+                sectionLabel("MEMORY"), memGrid,
                 sectionLabel("PORT"), portField,
-                sectionLabel("JAVA ENVIRONMENT"), javaEnvBox, javaEnvNote,
-                saveBtn, savedNote);
-        return scroll;
+                sectionLabel("JAVA ENVIRONMENT"), javaEnvBox, javaEnvNote);
+        return tabShell(scroll, saveBtn, savedNote);
     }
 
     private Node buildServerPermissionsTab(ServerInstance server, Dialog<Void> dialog) {
         VBox box = new VBox(16);
         box.setPadding(new Insets(20));
+        ScrollPane scroll = new ScrollPane(box);
+        scroll.setFitToWidth(true);
+        scroll.getStyleClass().add("settings-scroll");
 
         CheckBox friendsJoinBox = new CheckBox("Allow friends to join while this server is running");
         friendsJoinBox.setSelected(server.allowFriendsJoin);
@@ -2100,20 +2762,29 @@ public class LauncherApp extends Application {
         Label multihostNote = new Label("Reserved for the planned multihosting feature -- not implemented yet.");
         multihostNote.getStyleClass().add("notice-label");
 
-        Button saveBtn = new Button("Save Permissions");
-        saveBtn.getStyleClass().addAll("settings-apply-button", "settings-apply-button-ready");
+        // ---- Dirty tracking ----
+        SimpleBooleanProperty dirty = new SimpleBooleanProperty(false);
+        Runnable markDirty = () -> dirty.set(true);
+        friendsJoinBox.selectedProperty().addListener((o, a, b) -> markDirty.run());
+        saveBox.selectedProperty().addListener((o, a, b) -> markDirty.run());
+
+        // ---- Save: pinned bottom bar that only glows once something changed ----
+        Button saveBtn = buildDirtyButton(dirty);
+        Label savedNote = new Label();
+        savedNote.getStyleClass().add("notice-label");
         saveBtn.setOnAction(e -> {
             server.allowFriendsJoin = friendsJoinBox.isSelected();
             server.allowPlayerSave = saveBox.isSelected();
             serverStore.save(server);
+            savedNote.setText("Saved -- takes effect immediately for presence, or on next save download.");
+            dirty.set(false);
         });
 
         box.getChildren().addAll(
                 sectionLabel("FRIENDS"), friendsJoinBox, friendsJoinNote,
                 sectionLabel("PLAYER SAVE"), saveBox, saveNote,
-                sectionLabel("MULTIHOSTING"), multihostBox, multihostNote,
-                saveBtn);
-        return box;
+                sectionLabel("MULTIHOSTING"), multihostBox, multihostNote);
+        return tabShell(scroll, saveBtn, savedNote);
     }
 
     /** Best-effort local LAN address for the copyable server IP box -- falls back to loopback if detection fails. */
@@ -2139,6 +2810,33 @@ public class LauncherApp extends Application {
         } catch (Exception ignored) {
         }
         return "localhost";
+    }
+
+    /**
+     * Auto-remembers the address of the server we're joining so it can be shared with friends
+     * without anyone typing it in (replacing the old purely-manual Settings entry). The address is
+     * only kept if it's actually a remote server -- joining our OWN locally-hosted server
+     * (localhost / our own LAN IP) is never advertised, since no friend could reach it.
+     */
+    private void rememberCurrentlyJoined(String target) {
+        if (target == null || target.isBlank()) return;
+        String trimmed = target.trim();
+        String host = trimmed;
+        int colon = trimmed.lastIndexOf(':');
+        if (colon > 0) host = trimmed.substring(0, colon).trim();
+        if (host.isEmpty()) return;
+        String lower = host.toLowerCase();
+        if (lower.equals("localhost") || lower.equals("127.0.0.1") || lower.equals("::1")) return;
+        try {
+            String local = localIpAddress();
+            if (local != null && local.equalsIgnoreCase(host)) return; // our own machine -- not joinable remotely
+        } catch (Exception ignored) {
+        }
+        prefs.myServerAddress = trimmed;
+        // Auto-enable sharing + publish right away so friends see "currently playing on <address>".
+        prefs.shareServerAddress = true;
+        prefs.save();
+        publishPresenceQuietly();
     }
 
     private void runFriendsAction(PlayerIdentity active, java.util.concurrent.Callable<FriendsService.FriendsView> action) {
@@ -2585,6 +3283,9 @@ public class LauncherApp extends Application {
                     }
                     rowsBox.getChildren().add(buildModRow(m, mods, refreshHolder[0], family != null));
                 }
+                // Best-effort: attach Modrinth icons (+ click-through pages) to installed mods by
+                // matching their display names, in the background so the list never blocks.
+                if (!list.isEmpty()) enrichModIconsAsync(list, refreshHolder[0]);
                 if (list.isEmpty()) {
                     Label empty = new Label(deyMode
                             ? "No mods yet -- Sodium/Embeddium and Fabric API install automatically the first time you hit Play."
@@ -2704,6 +3405,17 @@ public class LauncherApp extends Application {
         file.getStyleClass().add("mod-filename");
         VBox textBox = new VBox(2, name, file);
 
+        // Modrinth icon (+ click-through to the project page) once we've resolved this mod's slug.
+        String modSlug = addonSlugByBase.get(mod.fileName().toLowerCase());
+        Node iconTile = modIconNode(modSlug != null ? modrinthIconPath(modSlug) : null, 30);
+        if (modSlug != null) {
+            iconTile.setCursor(javafx.scene.Cursor.HAND);
+            final String clickSlug = modSlug;
+            iconTile.setOnMouseClicked(ev -> openUrl(ModrinthClient.projectPageUrl(clickSlug, "mod")));
+            name.setCursor(javafx.scene.Cursor.HAND);
+            name.setOnMouseClicked(ev -> openUrl(ModrinthClient.projectPageUrl(clickSlug, "mod")));
+        }
+
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
 
@@ -2728,7 +3440,7 @@ public class LauncherApp extends Application {
             trailing = deleteBtn;
         }
 
-        HBox row = new HBox(14, leading, textBox, spacer, trailing);
+        HBox row = new HBox(14, iconTile, leading, textBox, spacer, trailing);
         row.setAlignment(Pos.CENTER_LEFT);
         row.getStyleClass().add("mod-row");
         if (locked) row.getStyleClass().add("mod-row-locked");
@@ -2799,12 +3511,78 @@ public class LauncherApp extends Application {
                     new Alert(Alert.AlertType.WARNING, "Enter a username first.", ButtonType.OK).showAndWait();
                     return;
                 }
-                AuthSession derived = AuthSession.offline(name);
-                PlayerIdentity identity = identityStore.loadOrCreate(derived.uuid(), derived.username(), AccountType.OFFLINE);
-                identityStore.setActive(identity.uuid);
-                syncPlayCardFromActiveIdentity();
-                refreshAccountButton();
-                refreshHolder[0].run();
+                // Don't let an offline account impersonate an existing online (Microsoft) account.
+                // Same-display-name accounts on an online-mode server would otherwise collide; an
+                // offline identity also can't actually authenticate as a real Mojang account.
+                boolean nameTakenByOnline = identityStore.loadIndex().accounts().stream()
+                        .anyMatch(a -> a.accountType == AccountType.ONLINE && a.username.equalsIgnoreCase(name));
+                if (nameTakenByOnline) {
+                    new Alert(Alert.AlertType.WARNING,
+                            "\"" + name + "\" is already an online account on this launcher -- "
+                                    + "choose a different offline name to avoid colliding on servers.",
+                            ButtonType.OK).showAndWait();
+                    return;
+                }
+                // Mojang check: creating the offline account after asking Mojang whether this name
+                // already belongs to a REAL Minecraft account. If it does, refuse -- otherwise an
+                // offline identity could log onto an online-mode server with the same name as a
+                // genuine player and impersonate them. Fail-open (create anyway + tell the user) if
+                // we can't reach Mojang, so a temporary network problem never locks you out.
+                Runnable createOfflineNow = () -> {
+                    AuthSession derived = AuthSession.offline(name);
+                    PlayerIdentity identity = identityStore.loadOrCreate(derived.uuid(), derived.username(), AccountType.OFFLINE);
+                    identityStore.setActive(identity.uuid);
+                    syncPlayCardFromActiveIdentity();
+                    refreshAccountButton();
+                    refreshHolder[0].run();
+                };
+                applyBtn.setDisable(true);
+                Task<Boolean> nameCheck = new Task<>() {
+                    @Override
+                    protected Boolean call() {
+                        try {
+                            var http = java.net.http.HttpClient.newHttpClient();
+                            var req = java.net.http.HttpRequest.newBuilder(java.net.URI.create(
+                                    "https://api.mojang.com/users/profiles/minecraft/"
+                                            + java.net.URLEncoder.encode(name, java.nio.charset.StandardCharsets.UTF_8)))
+                                    .GET().build();
+                            var resp = http.send(req, java.net.http.HttpResponse.BodyHandlers.ofString());
+                            // HTTP 200 = a REAL Mojang account with this name exists; 404 = free.
+                            return resp.statusCode() == 200;
+                        } catch (Exception ex) {
+                            return null; // couldn't verify (offline / API down) -- fail open
+                        }
+                    }
+                };
+                nameCheck.setOnSucceeded(suc -> Platform.runLater(() -> {
+                    applyBtn.setDisable(false);
+                    Boolean taken = nameCheck.getValue();
+                    if (taken == null) {
+                        createOfflineNow.run();
+                        new Alert(Alert.AlertType.INFORMATION,
+                                "Couldn't verify \"" + name + "\" against Mojang (no internet?), so it "
+                                        + "was created as an offline account anyway -- but it may still "
+                                        + "be a real Minecraft account name.",
+                                ButtonType.OK).showAndWait();
+                    } else if (taken) {
+                        new Alert(Alert.AlertType.WARNING,
+                                "\"" + name + "\" is a real, existing Minecraft account name. Using it "
+                                        + "offline would impersonate that player on servers -- please "
+                                        + "choose a different name.",
+                                ButtonType.OK).showAndWait();
+                    } else {
+                        createOfflineNow.run();
+                    }
+                }));
+                nameCheck.setOnFailed(fail -> Platform.runLater(() -> {
+                    applyBtn.setDisable(false);
+                    createOfflineNow.run();
+                    new Alert(Alert.AlertType.INFORMATION,
+                            "Couldn't check \"" + name + "\" against Mojang -- created offline account "
+                                    + "anyway, but it may be a real Minecraft account name.",
+                            ButtonType.OK).showAndWait();
+                }));
+                new Thread(nameCheck, "offline-name-check").start();
             });
             HBox offlineRow = new HBox(10, offlineNameField, applyBtn);
             HBox.setHgrow(offlineNameField, Priority.ALWAYS);
@@ -3833,9 +4611,9 @@ public class LauncherApp extends Application {
         serverAddressField.setPromptText("e.g. mc.example.com:25565");
         serverAddressField.getStyleClass().add("input-field");
         serverAddressField.setDisable(!prefs.shareServerAddress);
-        Label addressNote = new Label("Enter the address yourself when you're hosting or playing on "
-                + "one -- DeyLauncher can't detect this automatically. Ignored entirely while "
-                + "invisible mode (Account tab) is on.");
+        Label addressNote = new Label("Filled in automatically with the address of the last remote server "
+                + "you joined/played on (never your own machine). Edit it above to override. Ignored "
+                + "entirely while invisible mode (Account tab) is on.");
         addressNote.getStyleClass().add("notice-label");
         addressNote.setWrapText(true);
         shareAddressBox.selectedProperty().addListener((o, a, b) -> {
@@ -3917,6 +4695,10 @@ public class LauncherApp extends Application {
         prefs.lastVersionId = versionId;
         prefs.lastDeyMode = deyMode;
         prefs.save();
+        // Whenever we join a specific server, auto-remember its address as our current server
+        // address so Friends can join us there without anyone having to type it in manually
+        // (see rememberCurrentlyJoined below). null = a normal launch, nothing to capture.
+        if (quickPlayTarget != null) rememberCurrentlyJoined(quickPlayTarget);
         // Snapshot both together -- a stale token from a *different* previously-signed-in
         // account must never get used for whichever account happens to be active now.
         String capturedOnlineToken = (activeForPlay.accountType == AccountType.ONLINE
@@ -4078,5 +4860,284 @@ public class LauncherApp extends Application {
         label.setGraphic(dot);
         label.setGraphicTextGap(6);
         return label;
+    }
+
+    /** Server running/stopped badge: an SVG-free colored dot + text, so it renders the same on
+     *  every device rather than depending on a Unicode \"●\"/\"○\" glyph being installed. */
+    private Label badgeLabel(boolean running) {
+        Label label = new Label(running ? "RUNNING" : "STOPPED");
+        label.getStyleClass().add(running ? "badge-online" : "badge-offline");
+        Circle dot = new Circle(3.6);
+        dot.getStyleClass().add(running ? "status-dot-online" : "status-dot-offline");
+        label.setGraphic(dot);
+        label.setGraphicTextGap(6);
+        return label;
+    }
+
+    /** Updates an existing badgeLabel() in place (text + dot color + pill color). */
+    private void setBadge(Label label, boolean running) {
+        label.setText(running ? "RUNNING" : "STOPPED");
+        label.getStyleClass().setAll(running ? "badge-online" : "badge-offline");
+        Node g = label.getGraphic();
+        if (g instanceof Circle c) c.getStyleClass().setAll(running ? "status-dot-online" : "status-dot-offline");
+    }
+
+    /** Sets an SVG icon as the sole button content (text empty) -- used for pure-glyph buttons
+     *  (delete, file rows) so they render identically on every device. */
+    private void setButtonIconOnly(ButtonBase button, IconFactory.Icon icon) {
+        button.setGraphic(icon(icon, 17));
+        button.setText("");
+        button.setGraphicTextGap(0);
+    }
+
+    /** Opens a URL in the user's default browser via JavaFX HostServices (same as the sign-in links). */
+    private void openUrl(String url) {
+        try {
+            getHostServices().showDocument(url);
+        } catch (Exception ignored) {
+        }
+    }
+
+    /**
+     * A square "tile" for a mod/addon icon: a styled rounded Region that shows a small default
+     * glyph when there's no image yet, and the real thumbnail once iconPath is supplied by
+     * refresh. Click-handling is added by the caller (whole row is clickable).
+     */
+    private Node modIconNode(java.nio.file.Path iconPath, double size) {
+        StackPane pane = new StackPane();
+        pane.setPrefSize(size, size);
+        pane.setMinSize(size, size);
+        pane.setMaxSize(size, size);
+        pane.getStyleClass().add("mod-icon-tile");
+        pane.getChildren().add(icon(IconFactory.Icon.PUZZLE, size * 0.5));
+        if (iconPath != null && Files.exists(iconPath)) {
+            try {
+                ImageView iv = new ImageView(new Image(iconPath.toUri().toString()));
+                iv.setFitWidth(size);
+                iv.setFitHeight(size);
+                iv.setPreserveRatio(true);
+                iv.setSmooth(false);
+                iv.getStyleClass().add("mod-icon-img");
+                pane.getChildren().add(iv);
+            } catch (Exception ignored) {
+            }
+        }
+        return pane;
+    }
+
+    /** Same tile but loading a remote image in the background; shows the glyph placeholder until it arrives. */
+    private Node remoteModIcon(String uri, double size) {
+        StackPane pane = new StackPane();
+        pane.setPrefSize(size, size);
+        pane.setMinSize(size, size);
+        pane.setMaxSize(size, size);
+        pane.getStyleClass().add("mod-icon-tile");
+        pane.getChildren().add(icon(IconFactory.Icon.PUZZLE, size * 0.5));
+        if (uri != null && !uri.isBlank()) {
+            try {
+                ImageView iv = new ImageView(new Image(uri, size, size, true, false, true));
+                iv.setFitWidth(size);
+                iv.setFitHeight(size);
+                iv.setPreserveRatio(true);
+                iv.setSmooth(false);
+                iv.getStyleClass().add("mod-icon-img");
+                pane.getChildren().add(iv);
+            } catch (Exception ignored) {
+            }
+        }
+        return pane;
+    }
+/**
+     * Resolves an online player's UUID by name via Mojang's public API, then fetches/caches their
+     * skin face (reusing the same pipeline as the Friends list). Running this after we already know
+     * the uuid just re-fetches the skin in case it changed. Calls onDone on the FX thread.
+     */
+    private void resolveOnlinePlayerAvatar(String playerName, Runnable onDone) {
+        String uuid = playerUuidByName.get(playerName);
+        if (uuid != null) {
+            fetchFriendAvatarAsync(uuid, onDone);
+            return;
+        }
+        Task<Void> task = new Task<>() {
+            @Override
+            protected Void call() {
+                try {
+                    var http = java.net.http.HttpClient.newHttpClient();
+                    var req = java.net.http.HttpRequest.newBuilder(java.net.URI.create(
+                            "https://api.mojang.com/users/profiles/minecraft/" + playerName)).GET().build();
+                    var resp = http.send(req, java.net.http.HttpResponse.BodyHandlers.ofString());
+                    if (resp.statusCode() == 200) {
+                        var json = com.google.gson.JsonParser.parseString(resp.body()).getAsJsonObject();
+                        if (json.has("id")) {
+                            String plain = json.get("id").getAsString();
+                            String dashed = plain.replaceAll(
+                                    "(.{8})(.{4})(.{4})(.{4})(.+)", "$1-$2-$3-$4-$5");
+                            playerUuidByName.put(playerName, dashed);
+                            fetchFriendAvatarAsync(dashed, onDone); // run in this same background thread
+                        }
+                    }
+                } catch (Exception ignored) {
+                    // No UUID (offline-mode server or name lookup failed) -- keep the placeholder face.
+                }
+                return null;
+            }
+        };
+        new Thread(task, "resolve-uuid-" + playerName).start();
+    }
+
+/**
+     * Shows a small themed popup under a player-name field listing who's online right now on this
+     * server; clicking one fills the field. This is the "helper that suggests the online players"
+     * for the Operators / Whitelist / Banned / Server-managers add boxes.
+     */
+    private void showOnlinePlayerSuggestions(TextField field, ServerInstance server) {
+        Popup popup = new Popup();
+        popup.setAutoHide(true);
+        VBox box = new VBox(8);
+        box.setPadding(new Insets(12));
+        box.getStyleClass().addAll("root-pane", darkMode ? "theme-dark" : "theme-light", "suggest-pop");
+        box.getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
+        box.getStylesheets().add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
+        box.setPrefWidth(Math.max(240, field.getWidth()));
+        box.setMaxHeight(280);
+
+        // 1) Players currently online on this server (live join/leave + authoritative `list`).
+        var pm = runningServers.get(server.id);
+        List<String> online = (pm != null && pm.isRunning()) ? pm.getOnlinePlayers() : List.of();
+        box.getChildren().add(sectionLabel("ONLINE PLAYERS"));
+        if (online.isEmpty()) {
+            Label none = new Label("Server isn't running, or nobody's online right now.");
+            none.getStyleClass().add("notice-label");
+            none.setWrapText(true);
+            box.getChildren().add(none);
+        } else {
+            for (String name : online) {
+                box.getChildren().add(suggestButton(field, popup, name));
+            }
+        }
+
+        // 2) Friends (their DeyLauncher usernames) -- handy for whitelisting/OP just the people
+        //    you actually play with, even if they're not on this server right now. Loaded from
+        //    the shared friends graph (with an instant local cache so the popup isn't empty).
+        PlayerIdentity active = identityStore.getActive();
+        if (friendsService != null && active != null) {
+            box.getChildren().add(sectionLabel("FRIENDS"));
+            FriendsService.FriendsView cached = friendsCache.load();
+            if (cached != null) appendSuggestedFriends(box, field, popup, cached, online);
+            else box.getChildren().add(suggestHint("Loading friends..."));
+            Task<FriendsService.FriendsView> task = new Task<>() {
+                @Override
+                protected FriendsService.FriendsView call() throws Exception {
+                    return friendsService.load(active.uuid);
+                }
+            };
+            task.setOnSucceeded(ev -> Platform.runLater(() -> {
+                FriendsService.FriendsView view = task.getValue();
+                appendSuggestedFriends(box, field, popup, view, online);
+                friendsCache.save(view);
+            }));
+            task.setOnFailed(ev -> Platform.runLater(() -> {
+                // No heading/buttons yet (cache was empty) -- say why, don't leave it guessing.
+                boolean hasFriends = box.getChildren().stream()
+                        .anyMatch(n -> "suggest-friend".equals(n.getUserData()));
+                if (!hasFriends) box.getChildren().add(suggestHint("Couldn't load friends right now."));
+            }));
+            new Thread(task, "suggest-friends").start();
+        }
+
+        popup.getContent().add(box);
+        var bounds = field.localToScreen(field.getBoundsInLocal());
+        popup.show(field, bounds.getMinX(), bounds.getMaxY() + 4);
+    }
+
+    /** One clickable suggestion button that fills the field and closes the popup. */
+    private Button suggestButton(TextField field, Popup popup, String name) {
+        Button b = new Button(name);
+        b.getStyleClass().addAll("pill-button", "suggest-item");
+        b.setMaxWidth(Double.MAX_VALUE);
+        b.setOnAction(e -> {
+            field.setText(name);
+            popup.hide();
+        });
+        return b;
+    }
+
+    private Label suggestHint(String text) {
+        Label l = new Label(text);
+        l.getStyleClass().add("notice-label");
+        l.setWrapText(true);
+        return l;
+    }
+
+    /** Replaces the FRIENDS section with buttons for every DeyLauncher friend (online ones first). */
+    private void appendSuggestedFriends(VBox box, TextField field, Popup popup,
+                                        FriendsService.FriendsView view, List<String> onlinePlayers) {
+        // Drop any previous friends sub-list (heading + buttons), kept fresh as the task refreshes.
+        box.getChildren().removeIf(n -> "suggest-friends-head".equals(n.getUserData()));
+        box.getChildren().removeIf(n -> "suggest-friend".equals(n.getUserData()));
+        Label head = sectionLabel("FRIENDS");
+        head.setUserData("suggest-friends-head");
+        box.getChildren().add(head);
+
+        List<FriendsData.FriendRef> friends = new ArrayList<>(view.friends());
+        friends.sort(java.util.Comparator.comparing((FriendsData.FriendRef f) -> {
+            FriendsData.UserEntry e = view.allUsers().get(f.uuid);
+            return e != null && "ONLINE".equals(e.status) ? 0 : 1;
+        }));
+        if (friends.isEmpty()) {
+            box.getChildren().add(suggestHint("No friends yet -- add people on the Friends page."));
+            return;
+        }
+        for (var friend : friends) {
+            FriendsData.UserEntry e = view.allUsers().get(friend.uuid);
+            boolean isOnline = e != null && "ONLINE".equals(e.status);
+            boolean alreadyListed = onlinePlayers.stream()
+                    .anyMatch(n -> n.equalsIgnoreCase(friend.username));
+            if (alreadyListed) continue; // already shown in the ONLINE PLAYERS section
+            Button b = suggestButton(field, popup,
+                    isOnline ? friend.username + "   (online)" : friend.username);
+            b.setUserData("suggest-friend");
+            box.getChildren().add(b);
+        }
+    }
+    /** Latest local icon path for a Modrinth slug (enrichment cache), or null if unknown/failed. */
+    private java.nio.file.Path modrinthIconPath(String slug) {
+        String cached = modrinthIconCache.get(slug);
+        if (cached == null || cached.isEmpty()) return null;
+        java.nio.file.Path p = Path.of(cached);
+        return Files.exists(p) ? p : null;
+    }
+
+    /** Shared SAVE/SAVE CHANGES button that glows (theme accent) only once something has actually
+     *  changed -- mirrors the Settings dialog's APPLY button, so every server tab feels consistent. */
+    private Button buildDirtyButton(SimpleBooleanProperty dirty) {
+        Button btn = new Button();
+        btn.getStyleClass().add("settings-apply-button");
+        setButtonIcon(btn, IconFactory.Icon.CHECK, "SAVE");
+        dirty.addListener((obs, oldV, newV) -> {
+            if (newV) {
+                if (!btn.getStyleClass().contains("settings-apply-button-ready"))
+                    btn.getStyleClass().add("settings-apply-button-ready");
+                setButtonIcon(btn, IconFactory.Icon.CHECK, "SAVE CHANGES");
+            } else {
+                btn.getStyleClass().remove("settings-apply-button-ready");
+                setButtonIcon(btn, IconFactory.Icon.CHECK, "SAVE");
+            }
+        });
+        return btn;
+    }
+
+    /** Wraps a tab's scrollable body in a BorderPane whose bottom edge is a pinned action bar
+     *  (the Save button + status), so the Save control never scrolls out of view and always sits
+     *  in the same spot no matter the window size. */
+    private Node tabShell(ScrollPane scroll, Node... barChildren) {
+        HBox bar = new HBox(12, barChildren);
+        bar.setAlignment(Pos.CENTER_LEFT);
+        bar.getStyleClass().add("tab-action-bar");
+        for (Node n : barChildren) if (n instanceof javafx.scene.control.Label l) HBox.setHgrow(l, Priority.ALWAYS);
+        BorderPane root = new BorderPane();
+        root.setCenter(scroll);
+        root.setBottom(bar);
+        return root;
     }
 }
