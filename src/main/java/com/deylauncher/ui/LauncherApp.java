@@ -4,6 +4,7 @@ import com.deylauncher.auth.AuthSession;
 import com.deylauncher.auth.MicrosoftAuth;
 import com.deylauncher.auth.TokenVault;
 import com.deylauncher.friends.*;
+import com.deylauncher.deycapes.DeyCapesService;
 import com.deylauncher.identity.*;
 import com.deylauncher.launch.GameFiles;
 import com.deylauncher.launch.GameLauncher;
@@ -12,6 +13,7 @@ import com.deylauncher.modloader.FabricInstaller;
 import com.deylauncher.modloader.FabricApiInstaller;
 import com.deylauncher.modloader.ForgeInstaller;
 import com.deylauncher.modloader.SodiumInstaller;
+import com.deylauncher.modloader.DeyCapesInstaller;
 import com.deylauncher.server.*;
 import com.google.gson.JsonObject;
 import com.deylauncher.version.VersionManifest;
@@ -72,6 +74,7 @@ public class LauncherApp extends Application {
     private String liveOnlineAccountUuid; // which account liveOnlineAccessToken actually belongs to
     private Label accountStatusNotice;
     private FriendsService friendsService; // null until github.properties/embedded config is set -- see GitHubConfig
+    private DeyCapesService deyCapesService; // null until github config is set -- Dey capes are a github-backed feature
     private FriendsCache friendsCache;
     private ServerStore serverStore;
     private AddedServersStore addedServersStore;
@@ -159,6 +162,20 @@ public class LauncherApp extends Application {
         this.addedServersStore = new AddedServersStore(gameFiles.root);
         GitHubConfig githubConfig = GitHubConfig.load();
         this.friendsService = githubConfig.isConfigured() ? new FriendsService(githubConfig) : null;
+        this.deyCapesService = githubConfig.isConfigured() ? new DeyCapesService(githubConfig) : null;
+
+        // Best-effort: seed the github repo's capes catalog + texture folder the first time
+        // the app opens with github configured, so Dey capes exist even on a fresh repo.
+        if (deyCapesService != null) {
+            Task<Void> seedTask = new Task<>() {
+                @Override protected Void call() throws Exception {
+                    try { deyCapesService.ensureCatalog().hashCode(); } catch (Exception ignored) {}
+                    try { deyCapesService.seedTextures(); } catch (Exception ignored) {}
+                    return null;
+                }
+            };
+            new Thread(seedTask, "dey-capes-seed").start();
+        }
 
         stage.setTitle("DeyLauncher");
         stage.getIcons().add(new Image(getClass().getResourceAsStream("/app-icon.png")));
@@ -1198,6 +1215,13 @@ public class LauncherApp extends Application {
         box.getStyleClass().add("server-share-card");
 
         Label title = sectionLabel("SHARE OVER THE INTERNET -- PLAYIT (FREE)");
+        Label stateBadge = new Label("STOPPED");
+        stateBadge.getStyleClass().add("badge-offline");
+        stateBadge.getStyleClass().add("server-share-badge");
+        Region titleSpacer = new Region();
+        HBox.setHgrow(titleSpacer, Priority.ALWAYS);
+        HBox headerRow = new HBox(10, title, titleSpacer, stateBadge);
+        headerRow.setAlignment(Pos.CENTER_LEFT);
         Label note = new Label("Expose this server to players on any network without touching a "
                 + "router: with the free playit.ggs tunnel, add a TCP tunnel to 127.0.0.1:" + server.port
                 + " in the playit dashboard, Start here, and your public address is shared automatically "
@@ -1249,6 +1273,9 @@ public class LauncherApp extends Application {
                 String pub = t.publicAddress();
                 if (pub != null && !pub.isBlank()) publicField.setText(pub);
             }
+            stateBadge.setText(on ? "LIVE" : "STOPPED");
+            stateBadge.getStyleClass().removeAll("badge-online", "badge-offline");
+            stateBadge.getStyleClass().add(on ? "badge-online" : "badge-offline");
         };
 
         startBtn.setOnAction(e -> startPlayitTunnel(server, status, publicField, renderState));
@@ -1261,7 +1288,7 @@ public class LauncherApp extends Application {
         HBox liveRow = new HBox(8, new Label("Public address:"), fieldRow);
         liveRow.setAlignment(Pos.CENTER_LEFT);
 
-        box.getChildren().addAll(title, note, controls, status, liveRow);
+        box.getChildren().addAll(headerRow, note, controls, liveRow, status);
         renderState.run();
         return box;
     }
@@ -1562,23 +1589,39 @@ public class LauncherApp extends Application {
             });
         });
 
-        // Single wrapping toolbar instead of one-stack-under-the-other rows: Start/Stop,
-        // version + Change Version, and the Play-as/Version/mode/Play launch cluster all sit
-        // on one line and only wrap to a second line when the dialog is too narrow.
+        // Server Controls reorganized into captioned groups inside one wrapping card: RUN
+        // (Start/Stop + live status), VERSION (dropdown + Change Version), and PLAY (profile,
+        // client version, mode toggle, Play button). Groups wrap to a second line only when the
+        // dialog is too narrow to fit them on one row.
         Label playAsLbl = new Label("Play as:");
         playAsLbl.getStyleClass().add("field-label");
         Label clientVersionLbl = new Label("Version:");
         clientVersionLbl.getStyleClass().add("field-label");
 
-        FlowPane toolbar = new FlowPane(10, 8);
+        Font captionFont = Font.font(null, FontWeight.BOLD, 10.5);
+        Label runCap = captionLabel("RUN", captionFont);
+        HBox runCtrls = new HBox(8, typeLabel, statusBadge, startBtn, stopBtn);
+        runCtrls.setAlignment(Pos.CENTER_LEFT);
+        runCtrls.getStyleClass().add("server-control-group");
+        Label verCap = captionLabel("VERSION", captionFont);
+        HBox verCtrls = new HBox(8, serverVersionBox, changeVersionBtn);
+        verCtrls.setAlignment(Pos.CENTER_LEFT);
+        verCtrls.getStyleClass().add("server-control-group");
+        Label playCap = captionLabel("PLAY", captionFont);
+        HBox playCtrls = new HBox(8,
+                playAsLbl, playAsBox, clientVersionLbl, clientVersionBox,
+                playModeRow, playBtn);
+        playCtrls.setAlignment(Pos.CENTER_LEFT);
+        playCtrls.getStyleClass().add("server-control-group");
+
+        FlowPane toolbar = new FlowPane(22, 12);
         toolbar.setAlignment(Pos.CENTER_LEFT);
         toolbar.getStyleClass().add("server-toolbar");
         toolbar.setMaxWidth(Double.MAX_VALUE);
         toolbar.getChildren().addAll(
-                typeLabel, statusBadge, startBtn, stopBtn,
-                serverVersionBox, changeVersionBtn,
-                playAsLbl, playAsBox, clientVersionLbl, clientVersionBox,
-                playModeRow, playBtn);
+                new VBox(5, runCap, runCtrls),
+                new VBox(5, verCap, verCtrls),
+                new VBox(5, playCap, playCtrls));
 
         serverConsoleArea = new TextArea();
         serverConsoleArea.setEditable(false);
@@ -1710,11 +1753,11 @@ public class LauncherApp extends Application {
         box.getChildren().setAll(
                 sectionLabel("SERVER ADDRESS"),
                 ipRow, ipNote,
-                buildInternetShareSection(server),
                 sectionLabel("SERVER CONTROLS"),
                 toolbar, versionChangeNote,
                 sectionLabel("CONSOLE"),
-                serverConsoleArea, inputRow);
+                serverConsoleArea, inputRow,
+                buildInternetShareSection(server));
 
         ScrollPane scroll = new ScrollPane(box);
         scroll.setFitToWidth(true);
@@ -2276,13 +2319,16 @@ public class LauncherApp extends Application {
                 enabledBox.setSelected(addon.enabled());
                 enabledBox.getStyleClass().add("mod-checkbox");
                 String baseName = addon.fileName().replace(".disabled", "");
-                Label nameLabel = new Label(baseName);
-                nameLabel.getStyleClass().add(addon.enabled() ? "mod-name" : "mod-filename");
+                Label nameLabel = new Label(addon.displayName());
+                nameLabel.getStyleClass().add("mod-name");
+                Label fileLabel = new Label(baseName + "  ·  " + (addon.sizeBytes() / 1024) + " KB");
+                fileLabel.getStyleClass().add("mod-filename");
+                VBox textBox = new VBox(2, nameLabel, fileLabel);
                 // If we've already enriched this addon to a Modrinth project, show its cached icon.
-                String addonSlug = addonSlugByBase.get(baseName.toLowerCase());
+                String addonSlug = addonSlugByBase.get(normalizeAddonBase(baseName));
                 Node iconTile = (addonSlug != null)
-                        ? modIconNode(modrinthIconPath(addonSlug), 30)
-                        : modIconNode(null, 30);
+                        ? modIconNode(modrinthIconPath(addonSlug), 44)
+                        : modIconNode(null, 44);
                 if (addonSlug != null) {
                     iconTile.setCursor(javafx.scene.Cursor.HAND);
                     final String clickSlug = addonSlug;
@@ -2294,6 +2340,14 @@ public class LauncherApp extends Application {
                 }
                 Region rowSpacer = new Region();
                 HBox.setHgrow(rowSpacer, Priority.ALWAYS);
+                // Change-version is always offered. If the addon isn't resolved to a Modrinth
+                // project yet, we resolve it lazily (search by name) at click time instead of
+                // hiding the option, so it always works even before background enrichment ran.
+                Button changeBtn = new Button("Change version");
+                changeBtn.getStyleClass().add("pill-button");
+                final String rBase = baseName;
+                final String rSlug = addonSlug;
+                changeBtn.setOnAction(ev -> changeAddonVersion(rBase, rSlug, server, addonsManager, renderAddonsHolder[0]));
                 Button deleteBtn = new Button();
                 deleteBtn.getStyleClass().add("mod-delete-button");
                 setButtonIconOnly(deleteBtn, IconFactory.Icon.TRASH);
@@ -2302,15 +2356,24 @@ public class LauncherApp extends Application {
                         addonsManager.setEnabled(addon.fileName(), enabledBox.isSelected());
                     } catch (Exception ignored) {
                     }
-                    // Re-render on next pulse so we pick up the file's new on-disk name.
+                    renderAddonsHolder[0].run();
                 });
                 deleteBtn.setOnAction(e -> {
                     try {
                         addonsManager.delete(addon.fileName());
                     } catch (Exception ignored) {
                     }
+                    renderAddonsHolder[0].run();
                 });
-                HBox row = new HBox(10, iconTile, enabledBox, nameLabel, rowSpacer, deleteBtn);
+                List<Node> rowNodes = new ArrayList<>();
+                rowNodes.add(iconTile);
+                rowNodes.add(enabledBox);
+                rowNodes.add(textBox);
+                rowNodes.add(rowSpacer);
+                if (changeBtn != null) rowNodes.add(changeBtn);
+                rowNodes.add(deleteBtn);
+                HBox row = new HBox(10);
+                row.getChildren().setAll(rowNodes);
                 row.setAlignment(Pos.CENTER_LEFT);
                 row.getStyleClass().add("mod-row");
                 if (!addon.enabled()) row.getStyleClass().add("mod-row-disabled");
@@ -2356,8 +2419,8 @@ public class LauncherApp extends Application {
         Button searchBtn = new Button();
         searchBtn.getStyleClass().add("pill-button");
         setButtonIcon(searchBtn, IconFactory.Icon.SEARCH, "Search");
-        Label searchStatus = new Label("Search finds online builds, then Install auto-picks a "
-                + "version matching Minecraft " + server.minecraftVersion + ".");
+        Label searchStatus = new Label("Search finds online builds for Minecraft " + server.minecraftVersion
+                + ". Install opens a picker listing only the versions compatible with that Minecraft version.");
         searchStatus.getStyleClass().add("notice-label");
         searchStatus.setWrapText(true);
         VBox resultsBox = new VBox(8);
@@ -2409,7 +2472,7 @@ public class LauncherApp extends Application {
     private void enrichAddonIconsAsync(List<ServerAddonsManager.AddonEntry> addons, String folderKind,
                                        VBox listBox, ServerInstance server, Runnable renderAddons) {
         List<ServerAddonsManager.AddonEntry> pending = addons.stream()
-                .filter(a -> !addonSlugByBase.containsKey(a.fileName().replace(".disabled", "").toLowerCase()))
+                .filter(a -> !addonSlugByBase.containsKey(normalizeAddonBase(a.fileName())))
                 .toList();
         if (pending.isEmpty()) return;
         Path iconDir = gameFiles.root.resolve("mod-icons");
@@ -2419,17 +2482,13 @@ public class LauncherApp extends Application {
                 ModrinthClient client = new ModrinthClient();
                 String type = ModrinthClient.projectTypeFor(server.type);
                 for (var addon : pending) {
-                    String base = addon.fileName().replace(".disabled", "");
-                    String name = base;
-                    // strip a leading version-ish segment e.g. "name-1.2.3.jar" -> search is fuzzy anyway
-                    int dot = name.lastIndexOf('.');
-                    if (dot > 0) name = name.substring(0, dot);
-                    var hit = client.firstHitByName(name, type);
+                    String key = normalizeAddonBase(addon.fileName());
+                    var hit = client.firstHitByName(key, type);
                     if (hit == null || hit.slug().isBlank()) {
-                        addonSlugByBase.put(base.toLowerCase(), "");
+                        addonSlugByBase.put(key, "");
                         continue;
                     }
-                    addonSlugByBase.put(base.toLowerCase(), hit.slug());
+                    addonSlugByBase.put(key, hit.slug());
                     try {
                         Path icon = client.iconFor(hit.slug(), hit.iconUrl(), type, iconDir);
                         if (icon != null) modrinthIconCache.put(hit.slug(), icon.toString());
@@ -2443,6 +2502,54 @@ public class LauncherApp extends Application {
         new Thread(task, "enrich-addon-icons").start();
     }
 
+    /** Strips ".disabled"/".jar" and a trailing version segment from an addon/mod file name so that
+     *  different versions of the same project resolve to one slug cache key (and one Change-version row). */
+    private static String normalizeAddonBase(String fileName) {
+        String base = fileName.replace(".disabled", "");
+        if (base.endsWith(".jar")) base = base.substring(0, base.length() - 4);
+        base = base.replaceAll("[-_]\\d+([.]\\d+)*.*$", "");
+        return base.toLowerCase().trim();
+    }
+
+    /** Lazily resolves an addon's Modrinth slug if needed, then opens the compatible-version picker.
+     *  Always available (even before background enrichment ran) and filters to the server's MC version. */
+    private void changeAddonVersion(String baseName, String slugIfKnown, ServerInstance server,
+                                    ServerAddonsManager addonsManager, Runnable renderAddons) {
+        String key = normalizeAddonBase(baseName);
+        if (slugIfKnown != null && !slugIfKnown.isBlank()) {
+            showModrinthVersionPicker(baseName.substring(0, baseName.length() - 4), slugIfKnown,
+                    ModrinthClient.projectTypeFor(server.type), server.minecraftVersion,
+                    modrinthIconPath(slugIfKnown), null,
+                    addonsManager.folder(), slugIfKnown, renderAddons);
+            return;
+        }
+        Task<String> task = new Task<>() {
+            @Override
+            protected String call() throws Exception {
+                ModrinthClient client = new ModrinthClient();
+                String searchName = baseName.endsWith(".jar") ? baseName.substring(0, baseName.length() - 4) : baseName;
+                var hit = client.firstHitByName(searchName, ModrinthClient.projectTypeFor(server.type));
+                return hit == null ? null : hit.slug();
+            }
+        };
+        task.setOnSucceeded(ev -> Platform.runLater(() -> {
+            String slug = task.getValue();
+            if (slug == null || slug.isBlank()) {
+                new Alert(Alert.AlertType.WARNING, "Couldn't find \"" + baseName.replaceFirst("(?i)\\.jar$", "")
+                        + "\" on Modrinth to list its versions.", ButtonType.OK).showAndWait();
+                return;
+            }
+            addonSlugByBase.put(key, slug);
+            renderAddons.run();
+            showModrinthVersionPicker(baseName.replaceFirst("(?i)\\.jar$", ""), slug,
+                    ModrinthClient.projectTypeFor(server.type), server.minecraftVersion,
+                    modrinthIconPath(slug), null, addonsManager.folder(), slug, renderAddons);
+        }));
+        task.setOnFailed(e -> Platform.runLater(() -> new Alert(Alert.AlertType.WARNING,
+                "Couldn't reach Modrinth: " + task.getException().getMessage(), ButtonType.OK).showAndWait()));
+        new Thread(task, "change-addon-version").start();
+    }
+
     /**
      * Background enrichment for installed client mods (the main-launcher "Mods" dialog): search each
      * mod's display name on Modrinth, cache the slug + icon, then re-render the rows so the icon and
@@ -2450,7 +2557,7 @@ public class LauncherApp extends Application {
      */
     private void enrichModIconsAsync(List<ModsManager.ModEntry> mods, Runnable refresh) {
         List<ModsManager.ModEntry> pending = mods.stream()
-                .filter(m -> !addonSlugByBase.containsKey(m.fileName().toLowerCase()))
+                .filter(m -> !addonSlugByBase.containsKey(normalizeAddonBase(m.fileName())))
                 .toList();
         if (pending.isEmpty()) return;
         Path iconDir = gameFiles.root.resolve("mod-icons");
@@ -2459,13 +2566,13 @@ public class LauncherApp extends Application {
             protected Void call() {
                 ModrinthClient client = new ModrinthClient();
                 for (var m : pending) {
-                    String base = m.fileName();
+                    String key = normalizeAddonBase(m.fileName());
                     var hit = client.firstHitByName(m.displayName(), "mod");
                     if (hit == null || hit.slug().isBlank()) {
-                        addonSlugByBase.put(base.toLowerCase(), "");
+                        addonSlugByBase.put(key, "");
                         continue;
                     }
-                    addonSlugByBase.put(base.toLowerCase(), hit.slug());
+                    addonSlugByBase.put(key, hit.slug());
                     try {
                         Path icon = client.iconFor(hit.slug(), hit.iconUrl(), "mod", iconDir);
                         if (icon != null) modrinthIconCache.put(hit.slug(), icon.toString());
@@ -2479,11 +2586,166 @@ public class LauncherApp extends Application {
         new Thread(task, "enrich-mod-icons").start();
     }
 
+    /**
+     * Shared Modrinth "pick a version" dialog used by both the server Addons tab and the client Mods
+     * dialog. It only lists the project's builds that support the given Minecraft version (newest
+     * first), lets the player choose one, then downloads its .jar into targetFolder. If replaceSlug
+     * is non-null, any previously-installed jar of the same project already sitting in targetFolder
+     * is removed so there's never two copies of the same mod/plugin.
+     */
+    private void showModrinthVersionPicker(String projectName, String slug, String projectType,
+                                           String mcVersion, java.nio.file.Path iconPath, String iconUrl,
+                                           Path targetFolder, String replaceSlug, Runnable onInstalled) {
+        Dialog<Void> d = new Dialog<>();
+        d.initOwner(stage);
+        d.initModality(Modality.WINDOW_MODAL);
+        d.setTitle("Version -- " + projectName);
+        d.getDialogPane().getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
+        d.getDialogPane().getStylesheets().add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
+        d.getDialogPane().getStyleClass().addAll("root-pane", darkMode ? "theme-dark" : "theme-light");
+        d.getDialogPane().getButtonTypes().addAll(ButtonType.CLOSE);
+        d.getDialogPane().setPrefSize(560, 460);
+        d.getDialogPane().setMinWidth(440);
+        d.getDialogPane().setMinHeight(300);
+
+        VBox box = new VBox(14);
+        box.setPadding(new Insets(20));
+        box.getStyleClass().add("mods-dialog-content");
+
+        Node icon = iconPath != null ? modIconNode(iconPath, 44)
+                : (iconUrl != null ? remoteModIcon(iconUrl, 44) : modIconNode(null, 44));
+        final String pageUrl = ModrinthClient.projectPageUrl(slug, projectType);
+        icon.setCursor(javafx.scene.Cursor.HAND);
+        icon.setOnMouseClicked(ev -> openUrl(pageUrl));
+
+        Label nameLbl = new Label(projectName);
+        nameLbl.getStyleClass().add("mod-name");
+        nameLbl.setFont(Font.font(null, FontWeight.BOLD, 17));
+        nameLbl.setCursor(javafx.scene.Cursor.HAND);
+        nameLbl.setOnMouseClicked(ev -> openUrl(pageUrl));
+
+        Label mcLbl = new Label("Compatible builds for Minecraft " + mcVersion
+                + " -- only these are listed.");
+        mcLbl.getStyleClass().add("notice-label");
+        mcLbl.setWrapText(true);
+        VBox headerText = new VBox(2, nameLbl, mcLbl);
+        HBox header = new HBox(12, icon, headerText);
+        header.setAlignment(Pos.CENTER_LEFT);
+
+        ComboBox<ModrinthClient.ProjectVersion> versionBox = new ComboBox<>();
+        versionBox.getStyleClass().add("input-field");
+        versionBox.setMaxWidth(Double.MAX_VALUE);
+        versionBox.setConverter(new javafx.util.StringConverter<>() {
+            @Override
+            public String toString(ModrinthClient.ProjectVersion v) {
+                if (v == null) return "";
+                String extra = (v.name() != null && !v.name().isBlank()
+                        && !v.name().equals(v.versionNumber())) ? "   (" + v.name() + ")" : "";
+                return v.versionNumber() + extra;
+            }
+            @Override
+            public ModrinthClient.ProjectVersion fromString(String text) { return null; }
+        });
+
+    Label status = new Label();
+        status.getStyleClass().add("notice-label");
+        status.setWrapText(true);
+
+        Button installBtn = new Button();
+        installBtn.getStyleClass().add("settings-apply-button");
+        setButtonIcon(installBtn, IconFactory.Icon.DOWNLOAD, "INSTALL");
+        HBox buttonRow = new HBox(10, installBtn);
+        buttonRow.setAlignment(Pos.CENTER_RIGHT);
+
+        Runnable load = () -> {
+            versionBox.setDisable(true);
+            installBtn.setDisable(true);
+            status.setText("Looking up compatible builds for Minecraft " + mcVersion + "...");
+            Task<List<ModrinthClient.ProjectVersion>> task = new Task<>() {
+                @Override
+                protected List<ModrinthClient.ProjectVersion> call() throws Exception {
+                    return new ModrinthClient().compatibleVersions(slug, mcVersion);
+                }
+            };
+            task.setOnSucceeded(ev -> Platform.runLater(() -> {
+                var list = task.getValue();
+                versionBox.getItems().setAll(list);
+                boolean empty = list == null || list.isEmpty();
+                if (empty) {
+                    status.setText("No " + projectName + " build supports Minecraft " + mcVersion + " yet.");
+                } else {
+                    versionBox.setValue(list.get(0));
+                    status.setText("Newest compatible build is selected first -- pick any listed version to install.");
+                }
+                versionBox.setDisable(empty);
+                installBtn.setDisable(empty);
+            }));
+            task.setOnFailed(ev -> Platform.runLater(() -> {
+                versionBox.setDisable(false);
+                installBtn.setDisable(false);
+                status.setText("Couldn't load versions: " + task.getException().getMessage());
+            }));
+            new Thread(task, "modrinth-version-picker").start();
+        };
+
+        installBtn.setOnAction(ev -> {
+            ModrinthClient.ProjectVersion chosen = versionBox.getValue();
+            if (chosen == null) return;
+            installBtn.setDisable(true);
+            status.setText("Installing " + chosen.versionNumber() + "...");
+            Task<Path> installTask = new Task<>() {
+                @Override
+                protected Path call() throws Exception {
+                    ModrinthClient client = new ModrinthClient();
+                    Path downloaded = client.download(chosen, targetFolder);
+                    if (replaceSlug != null) deleteJarsForSlug(targetFolder, replaceSlug, downloaded);
+                    return downloaded;
+                }
+            };
+            installTask.setOnSucceeded(ev2 -> Platform.runLater(() -> {
+                var p = installTask.getValue();
+                status.setText("Installed " + chosen.versionNumber()
+                        + (p == null ? "" : "  (" + p.getFileName() + ")"));
+                if (onInstalled != null) onInstalled.run();
+                installBtn.setDisable(false);
+            }));
+            installTask.setOnFailed(ev2 -> Platform.runLater(() -> {
+                status.setText("Install failed: " + installTask.getException().getMessage());
+                installBtn.setDisable(false);
+            }));
+            new Thread(installTask, "modrinth-version-install").start();
+        });
+
+        box.getChildren().addAll(header,
+                sectionLabel("PICK A VERSION"), versionBox,
+                buttonRow, status);
+        d.getDialogPane().setContent(box);
+        load.run();
+        d.showAndWait();
+    }
+
+    /** Removes any jar (or disabled .jar.disabled copy) in folder whose name starts with the
+     *  project slug -- except {@code keep}. Keeps one fresh copy when updating a project. */
+    private void deleteJarsForSlug(Path folder, String slug, Path keep) {
+        if (folder == null || !Files.isDirectory(folder)) return;
+        String prefix = slug.trim().toLowerCase() + "-";
+        try (var stream = Files.list(folder)) {
+            for (Path p : (Iterable<Path>) stream
+                    .filter(f -> f.toString().matches("(?i).*\\.jar(\\.disabled)?$"))::iterator) {
+                if (keep != null && p.equals(keep)) continue;
+                String name = p.getFileName().toString().toLowerCase();
+                if (name.startsWith(prefix)) {
+                    try { Files.deleteIfExists(p); } catch (Exception ignored) { }
+                }
+            }
+        } catch (Exception ignored) { }
+    }
+
     private Node buildModrinthRow(ModrinthClient.Hit hit, ModrinthClient modrinth,
                                   ServerAddonsManager addonsManager, Runnable renderAddons,
                                   ServerInstance server) {
         // Project icon (from Modrinth), click-through to the project's Modrinth page for details.
-        Node iconNode = remoteModIcon(hit.iconUrl(), 34);
+        Node iconNode = remoteModIcon(hit.iconUrl(), 48);
         iconNode.setCursor(javafx.scene.Cursor.HAND);
         iconNode.setOnMouseClicked(ev -> {
             if (ev.getClickCount() == 1) {
@@ -2509,35 +2771,15 @@ public class LauncherApp extends Application {
         installBtn.getStyleClass().add("pill-button");
         setButtonIcon(installBtn, IconFactory.Icon.ADD, "Install");
         installBtn.setOnAction(e -> {
-            installBtn.setDisable(true);
-            status.setText("Looking up a Minecraft " + server.minecraftVersion + " build...");
-            Task<ModrinthClient.ProjectVersion> task = new Task<>() {
-                @Override
-                protected ModrinthClient.ProjectVersion call() throws Exception {
-                    ModrinthClient.ProjectVersion match = null;
-                    for (var v : modrinth.versions(hit.slug())) {
-                        if (v.gameVersions().contains(server.minecraftVersion)) { match = v; break; }
-                    }
-                    if (match == null) return null;
-                    modrinth.download(match, addonsManager.folder());
-                    return match;
-                }
-            };
-            task.setOnSucceeded(ev -> Platform.runLater(() -> {
-                installBtn.setDisable(false);
-                var v = task.getValue();
-                if (v == null) {
-                    status.setText("No " + server.minecraftVersion + " build of this exists yet.");
-                } else {
-                    status.setText("Installed " + v.versionNumber() + " (Minecraft " + server.minecraftVersion + ").");
-                    renderAddons.run();
-                }
-            }));
-            task.setOnFailed(ev -> Platform.runLater(() -> {
-                installBtn.setDisable(false);
-                status.setText("Install failed: " + task.getException().getMessage());
-            }));
-            new Thread(task, "modrinth-install").start();
+            // Opens the shared picker listing ONLY builds for this server's Minecraft version.
+            String folderPath = addonsManager.folder() != null ? addonsManager.folder().toString() : null;
+            showModrinthVersionPicker(hit.name(), hit.slug(), ModrinthClient.projectTypeFor(server.type),
+                    server.minecraftVersion, modrinthIconPath(hit.slug()), hit.iconUrl(),
+                    addonsManager.folder(), hit.slug(), renderAddons);
+            if (folderPath == null || folderPath.isBlank()) {
+                status.setText("This server type can't install addons here.");
+                return;
+            }
         });
 
         HBox row = new HBox(10, iconNode, text, spacer, status, installBtn);
@@ -3267,6 +3509,7 @@ public class LauncherApp extends Application {
                     if (deyMode) {
                         if (fn.startsWith("sodium-") || fn.startsWith("embeddium-")) family = "perf";
                         else if (fn.startsWith("fabric-api-")) family = "fabric-api";
+                        else if (fn.startsWith("deycapes-")) family = "deycapes";
                     }
                     if (family != null) {
                         if (!lockedFamiliesShown.add(family)) {
@@ -3288,7 +3531,7 @@ public class LauncherApp extends Application {
                 if (!list.isEmpty()) enrichModIconsAsync(list, refreshHolder[0]);
                 if (list.isEmpty()) {
                     Label empty = new Label(deyMode
-                            ? "No mods yet -- Sodium/Embeddium and Fabric API install automatically the first time you hit Play."
+                            ? "No mods yet -- Sodium/Embeddium, Fabric API, and DeyCapes install automatically the first time you hit Play."
                             : "No mods yet -- drag some in above.");
                     empty.getStyleClass().add("notice-label");
                     rowsBox.getChildren().add(empty);
@@ -3311,6 +3554,7 @@ public class LauncherApp extends Application {
                     new SodiumInstaller(modLoader).ensureInstalled(mcVersion, mods.modsDir());
                     if ("Fabric".equals(modLoader)) {
                         new FabricApiInstaller().ensureInstalled(mcVersion, mods.modsDir());
+                        new DeyCapesInstaller().ensureInstalled(mcVersion, mods.modsDir());
                     }
                     return null;
                 }
@@ -3406,8 +3650,8 @@ public class LauncherApp extends Application {
         VBox textBox = new VBox(2, name, file);
 
         // Modrinth icon (+ click-through to the project page) once we've resolved this mod's slug.
-        String modSlug = addonSlugByBase.get(mod.fileName().toLowerCase());
-        Node iconTile = modIconNode(modSlug != null ? modrinthIconPath(modSlug) : null, 30);
+        String modSlug = addonSlugByBase.get(normalizeAddonBase(mod.fileName()));
+        Node iconTile = modIconNode(modSlug != null ? modrinthIconPath(modSlug) : null, 46);
         if (modSlug != null) {
             iconTile.setCursor(javafx.scene.Cursor.HAND);
             final String clickSlug = modSlug;
@@ -3425,6 +3669,20 @@ public class LauncherApp extends Application {
             badge.getStyleClass().add("mod-bundled-badge");
             trailing = badge;
         } else {
+            // Once the mod is resolved to a Modrinth project, let the player change its version too
+            // -- the picker shows only builds for the currently-selected Minecraft version.
+            Button changeBtn = null;
+            final String rowModSlug = modSlug != null ? modSlug : null;
+            if (rowModSlug != null) {
+                changeBtn = new Button("Version");
+                changeBtn.getStyleClass().add("pill-button");
+                final String cSlug = rowModSlug;
+                String mcVersion = versionBox.getValue() != null ? versionBox.getValue() : "1.21.1";
+                changeBtn.setOnAction(e -> showModrinthVersionPicker(
+                        mod.displayName(), cSlug, "mod", mcVersion,
+                        modrinthIconPath(cSlug), null,
+                        mods.modsDir(), cSlug, refresh));
+            }
             Button deleteBtn = new Button();
             deleteBtn.setGraphic(icon(IconFactory.Icon.TRASH, 17));
             deleteBtn.setGraphicTextGap(0);
@@ -3437,7 +3695,13 @@ public class LauncherApp extends Application {
                     log("Failed to delete " + mod.fileName() + ": " + ex.getMessage());
                 }
             });
-            trailing = deleteBtn;
+            List<Node> trailingNodes = new ArrayList<>();
+            if (changeBtn != null) trailingNodes.add(changeBtn);
+            trailingNodes.add(deleteBtn);
+            HBox trailingBox = new HBox(8);
+            trailingBox.getChildren().setAll(trailingNodes);
+            trailingBox.setAlignment(Pos.CENTER_LEFT);
+            trailing = trailingBox;
         }
 
         HBox row = new HBox(14, iconTile, leading, textBox, spacer, trailing);
@@ -3706,10 +3970,17 @@ public class LauncherApp extends Application {
         capesBox.setPrefColumns(2);
         capesBox.setPrefTileWidth(112);
         capesBox.setPrefTileHeight(132);
+        // Dey capes (DeyLauncher/DeyCapes, github-backed) shown under their own section --
+        // they render only inside the DeyCapes mod, never to real Mojang capes.
+        TilePane deyCapesBox = new TilePane(10, 10);
+        deyCapesBox.setPrefColumns(2);
+        deyCapesBox.setPrefTileWidth(112);
+        deyCapesBox.setPrefTileHeight(132);
 
         ScrollPane leftScroll = new ScrollPane(new VBox(20,
                 sectionLabel("SKIN PROFILES"), profilesBox,
-                sectionLabel("CAPES"), capesBox));
+                sectionLabel("CAPES"), capesBox,
+                sectionLabel("DEY CAPES"), deyCapesBox));
         leftScroll.setFitToWidth(true);
         leftScroll.setFitToHeight(false);
         leftScroll.setVbarPolicy(ScrollPane.ScrollBarPolicy.ALWAYS);
@@ -3766,7 +4037,7 @@ public class LauncherApp extends Application {
         right.getChildren().addAll(previewHost, modelRow, actionRow, applyCapeBtn, capeLimitNote);
 
         Runnable[] refresh = new Runnable[1];
-        refresh[0] = () -> refreshSkinsTab(profilesBox, capesBox, dialog, refresh, classicBtn, slimBtn, applyCapeBtn);
+        refresh[0] = () -> refreshSkinsTab(profilesBox, capesBox, deyCapesBox, dialog, refresh, classicBtn, slimBtn, applyCapeBtn);
         refresh[0].run();
         applyCapeBtn.setOnAction(e -> onApplyCape(applyCapeBtn, refresh));
 
@@ -3790,10 +4061,11 @@ public class LauncherApp extends Application {
     }
 
     /** Rebuilds skin profile rows, cape rows, and the 3D preview from current disk/account state. */
-    private void refreshSkinsTab(TilePane profilesBox, TilePane capesBox, Dialog<Void> dialog, Runnable[] refresh,
+    private void refreshSkinsTab(TilePane profilesBox, TilePane capesBox, TilePane deyCapesBox, Dialog<Void> dialog, Runnable[] refresh,
                                   RadioButton classicBtn, RadioButton slimBtn, Button applyCapeBtn) {
         profilesBox.getChildren().clear();
         capesBox.getChildren().clear();
+        deyCapesBox.getChildren().clear();
         PlayerIdentity active = identityStore.getActive();
 
         if (active == null) {
@@ -3804,6 +4076,10 @@ public class LauncherApp extends Application {
             skinPreview.update(defaultSteveImage(), SkinModel.CLASSIC, null);
             capeDirty = false;
             updateCapeApplyButton(applyCapeBtn);
+            Label deyNone = new Label("Set up an account to manage Dey capes.");
+            deyNone.getStyleClass().add("notice-label");
+            deyNone.setWrapText(true);
+            deyCapesBox.getChildren().add(deyNone);
             return;
         }
         (active.skinModel == SkinModel.SLIM ? slimBtn : classicBtn).setSelected(true);
@@ -3907,6 +4183,9 @@ public class LauncherApp extends Application {
             new Thread(task, "cape-fetch").start();
         }
 
+        // ---- Dey capes: github-backed, owned-only, rendered by the DeyCapes mod ----
+        refreshDeyCapes(deyCapesBox, active, applyCapeBtn, refresh);
+
         // ---- 3D preview ----
         java.nio.file.Path skinPath = identityStore.skinFile(active.uuid);
         Image skinImage = (active.skinSource != SkinSource.DEFAULT && java.nio.file.Files.exists(skinPath))
@@ -3916,6 +4195,71 @@ public class LauncherApp extends Application {
 
     private Image skinImage(java.nio.file.Path path) {
         return java.nio.file.Files.exists(path) ? new Image(path.toUri().toString(), false) : defaultSteveImage();
+    }
+
+    /** A locally-loaded Dey cape candidate ready to render as a library tile. */
+    private record DeyCapeRow(String id, String name, Image image) {}
+
+    /** Populates the DEY CAPES section: only capes the active player owns, per the github ownership file. */
+    private void refreshDeyCapes(TilePane deyCapesBox, PlayerIdentity active, Button applyCapeBtn, Runnable[] refresh) {
+        if (deyCapesService == null || !deyCapesService.configured()) {
+            Label note = new Label("Dey capes need GitHub set up (see GITHUB_SETUP.md in the repo root).");
+            note.getStyleClass().add("notice-label");
+            note.setWrapText(true);
+            deyCapesBox.getChildren().add(note);
+            return;
+        }
+        String onlineUuid = (active.accountType == AccountType.ONLINE) ? active.uuid : null;
+        String offlineUuid = DeyCapesService.offlineUuid(active.username);
+        Label loading = new Label("Loading your Dey capes...");
+        loading.getStyleClass().add("notice-label");
+        deyCapesBox.getChildren().add(loading);
+
+        Task<List<DeyCapeRow>> task = new Task<>() {
+            @Override
+            protected List<DeyCapeRow> call() throws Exception {
+                List<DeyCapesService.DeyCape> all = deyCapesService.allCapes();
+                List<String> owned = deyCapesService.ownedCapeIds(active.username, onlineUuid, offlineUuid);
+                List<DeyCapeRow> rows = new ArrayList<>();
+                for (var c : all) {
+                    if (!owned.contains(c.id())) continue;
+                    Image img = null;
+                    try {
+                        img = new Image(deyCapesService.readCapeTexture(c.texturePath()));
+                    } catch (Exception ignored) {
+                    }
+                    rows.add(new DeyCapeRow("dey:" + c.id(), c.name(), capeFrontImage(img)));
+                }
+                return rows;
+            }
+        };
+        task.setOnSucceeded(e -> {
+            deyCapesBox.getChildren().clear();
+            var rows = task.getValue();
+            if (rows.isEmpty()) {
+                Label none = new Label("This account doesn't own any Dey capes yet.\n"
+                        + "They're granted via the GitHub capes-owned.json file.");
+                none.getStyleClass().add("notice-label");
+                none.setWrapText(true);
+                deyCapesBox.getChildren().add(none);
+                return;
+            }
+            for (var row : rows) {
+                boolean selected = row.id.equals(selectedCapeId);
+                Button tile = skinTile(row.name, row.image, selected);
+                tile.getStyleClass().add("cape-tile");
+                tile.setOnAction(ev -> chooseDeyCape(row.id, row.image, applyCapeBtn, refresh));
+                deyCapesBox.getChildren().add(tile);
+            }
+        });
+        task.setOnFailed(e -> {
+            deyCapesBox.getChildren().clear();
+            Label err = new Label("Couldn't load Dey capes: " + task.getException().getMessage());
+            err.getStyleClass().add("notice-label");
+            err.setWrapText(true);
+            deyCapesBox.getChildren().add(err);
+        });
+        new Thread(task, "dey-capes-fetch").start();
     }
 
     /** Minecraft's cape front panel is the 10x16 rectangle after the one-pixel side strip. */
@@ -3959,6 +4303,14 @@ public class LauncherApp extends Application {
         refresh[0].run();
     }
 
+    private void chooseDeyCape(String deyCapeId, Image image, Button applyCapeBtn, Runnable[] refresh) {
+        selectedCapeId = deyCapeId;
+        selectedCapeImage = image;
+        capeDirty = !java.util.Objects.equals(selectedCapeId, equippedCapeId);
+        updateCapeApplyButton(applyCapeBtn);
+        refresh[0].run();
+    }
+
     private void chooseNoCape(Button applyCapeBtn, Runnable[] refresh) {
         selectedCapeId = null;
         selectedCapeImage = null;
@@ -3990,13 +4342,54 @@ public class LauncherApp extends Application {
     /** Commits the staged cape selection with one request, avoiding rate-limit spam. */
     private void onApplyCape(Button applyCapeBtn, Runnable[] refresh) {
         if (!capeDirty) return;
-        String targetCapeId = selectedCapeId;
-        String tokenSnapshot = liveOnlineAccessToken;
+        final String targetCapeId = selectedCapeId;
+        final PlayerIdentity active = identityStore.getActive();
+
+        // Dey capes (id "dey:<slug>") are DeyLauncher/DeyCapes-only -- applied by writing the
+        // equipped cape to the shared github file, never by touching the player's real Mojang account.
+        final boolean isDeyCape = targetCapeId != null && targetCapeId.startsWith("dey:");
+        // "No cape" while a Dey cape was equipped clears the github assignment instead of sending
+        // a pointless (and failing, for offline accounts) Mojang unequip request.
+        final boolean clearDeyCape = targetCapeId == null && equippedCapeId != null
+                && equippedCapeId.startsWith("dey:");
+
+        if (isDeyCape || clearDeyCape) {
+            Task<MinecraftSkinService.SkinChangeResult> task = new Task<>() {
+                @Override protected MinecraftSkinService.SkinChangeResult call() {
+                    try {
+                        String slug = targetCapeId == null ? null : targetCapeId.substring("dey:".length());
+                        boolean online = active != null && active.accountType == AccountType.ONLINE;
+                        String onlineUuid = online ? active.uuid : null;
+                        deyCapesService.equipCape(active.username, slug, online, onlineUuid);
+                        return new MinecraftSkinService.SkinChangeResult(true, "Dey cape updated.");
+                    } catch (Exception ex) {
+                        return new MinecraftSkinService.SkinChangeResult(false, "Couldn't update Dey cape: " + ex.getMessage());
+                    }
+                }
+            };
+            task.setOnSucceeded(e -> {
+                var result = task.getValue();
+                if (result.success()) {
+                    equippedCapeId = targetCapeId;
+                    capeDirty = false;
+                    updateCapeApplyButton(applyCapeBtn);
+                    refresh[0].run();
+                } else {
+                    new Alert(Alert.AlertType.WARNING, result.message() + " Your selection is still ready to Apply.", ButtonType.OK).showAndWait();
+                }
+            });
+            task.setOnFailed(e -> new Alert(Alert.AlertType.WARNING,
+                    "Couldn't update the Dey cape. Your current cape is unchanged.", ButtonType.OK).showAndWait());
+            new Thread(task, "cape-apply-dey").start();
+            return;
+        }
+
+        String mojangToken = liveOnlineAccessToken;
         Task<MinecraftSkinService.SkinChangeResult> task = new Task<>() {
             @Override protected MinecraftSkinService.SkinChangeResult call() {
                 return targetCapeId == null
-                        ? new MinecraftSkinService().unequipCape(tokenSnapshot)
-                        : new MinecraftSkinService().equipCape(tokenSnapshot, targetCapeId);
+                        ? new MinecraftSkinService().unequipCape(mojangToken)
+                        : new MinecraftSkinService().equipCape(mojangToken, targetCapeId);
             }
         };
         task.setOnSucceeded(e -> {
@@ -4641,6 +5034,14 @@ public class LauncherApp extends Application {
         return l;
     }
 
+    /** Small uppercase caption above a control group (RUN / VERSION / PLAY) in the Console tab. */
+    private Label captionLabel(String text, Font font) {
+        Label l = new Label(text.toUpperCase());
+        l.setFont(font);
+        l.getStyleClass().add("server-caption");
+        return l;
+    }
+
     private int parseIntOr(String s, int fallback) {
         try {
             return Integer.parseInt(s.trim());
@@ -4772,6 +5173,28 @@ public class LauncherApp extends Application {
                         + (modLoader.equals("Vanilla") ? "" : "-" + modLoader.toLowerCase()));
                 java.nio.file.Files.createDirectories(gameDir);
 
+                // DeyCapes mod integration: hand the github repo credentials to the installed mod so
+                // it can fetch the capes.json map + cape textures for the private repo at runtime.
+                // Only for DEY builds (the only ones that bundle DeyCapes). Best-effort.
+                if (deyMode && modLoader.equals("Fabric") && deyCapesService != null && !"Vanilla".equals(modLoader)) {
+                    try {
+                        var cfgDir = gameDir.resolve("config").resolve("deycapes");
+                        java.nio.file.Files.createDirectories(cfgDir);
+                        var cfg = new java.util.Properties();
+                        cfg.setProperty("owner", deyCapesService.gitConfig().owner());
+                        cfg.setProperty("repo", deyCapesService.gitConfig().repo());
+                        cfg.setProperty("token", deyCapesService.gitConfig().token());
+                        cfg.setProperty("capesPath", deyCapesService.gitConfig().capesPath());
+                        cfg.setProperty("capesOwnedPath", deyCapesService.gitConfig().ownershipPath());
+                        cfg.setProperty("capesDir", deyCapesService.gitConfig().capesDir());
+                        try (var out = java.nio.file.Files.newOutputStream(cfgDir.resolve("github.properties"))) {
+                            cfg.store(out, "DeyCapes - read by the DeyCapes mod to fetch capes from the DeyLauncher repo");
+                        }
+                    } catch (Exception cfgEx) {
+                        Platform.runLater(() -> log("Couldn't write DeyCapes config (continuing without remote capes): " + cfgEx.getMessage()));
+                    }
+                }
+
                 if (modLoader.equals("Fabric") && deyMode) {
                     updateMessage("Making sure Sodium is installed...");
                     try {
@@ -4796,6 +5219,19 @@ public class LauncherApp extends Application {
                     } catch (Exception apiEx) {
                         String msg = apiEx.getMessage();
                         Platform.runLater(() -> log("Couldn't auto-install Fabric API (continuing without it): " + msg));
+                    }
+                }
+                if (modLoader.equals("Fabric") && deyMode) {
+                    updateMessage("Making sure DeyCapes is installed...");
+                    try {
+                        String installed = new DeyCapesInstaller().ensureInstalled(entry.id(), gameDir.resolve("mods"));
+                        if (installed != null) {
+                            String finalName = installed;
+                            Platform.runLater(() -> log("Installed " + finalName));
+                        }
+                    } catch (Exception capesEx) {
+                        String msg = capesEx.getMessage();
+                        Platform.runLater(() -> log("Couldn't auto-install DeyCapes (continuing without it): " + msg));
                     }
                 }
 

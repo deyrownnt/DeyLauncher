@@ -104,7 +104,9 @@ public class ModrinthClient {
         return out;
     }
 
-    /** All published versions of a project, newest first (as Modrinth returns them). */
+    /**
+     * All published versions of a project, newest first (as Modrinth returns them).
+     */
     public List<ProjectVersion> versions(String slug) throws Exception {
         // Modrinth renamed this route from `/project/{id}/versions` (plural) to
         // `/project/{id}/version` (singular); the old plural path now returns HTTP 404, which
@@ -129,6 +131,21 @@ public class ModrinthClient {
                 }
             }
             out.add(new ProjectVersion(str(o, "id"), str(o, "name"), str(o, "version_number"), gv, files));
+        }
+        return out;
+    }
+
+    /**
+     * Only the project versions that explicitly support the given Minecraft version, newest first
+     * (the order Modrinth itself returns them). Used by the version picker so a player sees exactly
+     * the builds that will run on the Minecraft version currently selected in the launcher -- e.g.
+     * for Minecraft 1.21.7 only Sodium builds tagged with 1.21.7 show up.
+     */
+    public List<ProjectVersion> compatibleVersions(String slug, String mcVersion) throws Exception {
+        List<ProjectVersion> all = versions(slug);
+        List<ProjectVersion> out = new ArrayList<>();
+        for (var v : all) {
+            if (v.gameVersions().contains(mcVersion)) out.add(v);
         }
         return out;
     }
