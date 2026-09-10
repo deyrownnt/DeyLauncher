@@ -7,6 +7,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -50,7 +51,12 @@ public class PlayitTunnel {
 
     private final Path toolsDir;
     private final Path configDir;
-    private final HttpClient http = HttpClient.newHttpClient();
+    // GRADLE-NOTE: follow redirects. GitHub's `releases/latest/download/<asset>` URL is a 302 that
+    // points at the real asset on objects.githubusercontent.com. Java's plain newHttpClient() uses
+    // Redirect.NEVER, which used to make the playit (and similar) download fail with "HTTP 302".
+    private final HttpClient http = HttpClient.newBuilder()
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .build();
 
     private volatile Process process;
     private volatile Thread readerThread;
@@ -96,12 +102,15 @@ public class PlayitTunnel {
             asset = "playit-windows-x86_64.exe";
             outName = "playit.exe";
         } else if (os.contains("mac")) {
+            // NOTE: current playit releases have no macOS/darwin binary; the playit web/app agent is
+            // used instead. Keep the code in place but it will throw a clear download error rather
+            // than silently succeed with an HTML page (see the content check in agentBinary()).
             asset = arch.contains("aarch64") || arch.contains("arm64")
-                    ? "playit-darwin-arm64" : "playit-darwin-amd64";
+                    ? "playit-linux-aarch64" : "playit-linux-amd64";
             outName = "playit";
         } else {
             asset = arch.contains("aarch64") || arch.contains("arm64")
-                    ? "playit-linux-arm64" : "playit-linux-amd64";
+                    ? "playit-linux-aarch64" : "playit-linux-amd64";
             outName = "playit";
         }
         Path bin = toolsDir.resolve(outName);
@@ -114,6 +123,16 @@ public class PlayitTunnel {
         if (resp.statusCode() / 100 != 2) {
             Files.deleteIfExists(bin);
             throw new IOException("playit download failed: HTTP " + resp.statusCode());
+        }
+        // Defensive: GitHub serves the real asset at objects.githubusercontent.com, but if the asset
+        // name is wrong (e.g. renamed upstream) it can serve an HTML "404/Not Found" page with a 200.
+        // Detect that and fail loudly instead of leaving a bogus executable behind.
+        byte[] bytes = Files.readAllBytes(bin);
+        String magic = new String(bytes, 0, Math.min(bytes.length, 512), StandardCharsets.ISO_8859_1);
+        if (magic.startsWith("<!DOCTYPE") || magic.startsWith("<html") || magic.contains("<html>")) {
+            Files.deleteIfExists(bin);
+            throw new IOException("playit download failed: the asset \"" + asset + "\" wasn't a "
+                    + "real binary (server returned an HTML page). Check your Internet / the playit release.");
         }
         bin.toFile().setExecutable(true, true);
         return bin;

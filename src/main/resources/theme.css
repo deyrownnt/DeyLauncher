@@ -238,6 +238,14 @@
     -fx-border-color: #2a2b30; -fx-border-radius: 12;
 }
 
+/* Group captions (RUN / VERSION / PLAY) + the light control pill around each group's controls. */
+.theme-dark .server-caption { -fx-text-fill: #6b6c72; -fx-font-size: 10.5px; -fx-font-weight: bold; -fx-padding: 0 2; }
+.theme-dark .server-control-group {
+    -fx-background-color: #0d0d0f; -fx-background-radius: 8; -fx-padding: 6 10;
+    -fx-border-color: #2a2b30; -fx-border-radius: 8;
+}
+.theme-dark .server-share-badge { -fx-font-size: 11px; }
+
 /* Pinned bottom bar on server tabs holding the dirty-aware SAVE button -- never scrolls away. */
 .theme-dark .tab-action-bar {
     -fx-background-color: #17181b;
@@ -525,11 +533,19 @@
 .theme-light .main-split { -fx-background-color: #f6f6f7; }
 .theme-light .main-split > .split-pane-divider { -fx-background-color: #e2e2e4; }
 
-/* Console-tab toolbar: Start/Stop + version + Play cluster on one wrapping line. */
+/* Console-tab toolbar: Developer/Start + version + Play cluster on one wrapping line. */
 .theme-light .server-toolbar {
     -fx-background-color: #f0f0f1; -fx-background-radius: 12; -fx-padding: 10 14;
     -fx-border-color: #e2e2e4; -fx-border-radius: 12;
 }
+
+/* Small captions (RUN / VERSION / PLAY) + the light control pill inside each group. */
+.theme-light .server-caption { -fx-text-fill: #9a9ba3; -fx-font-size: 10.5px; -fx-font-weight: bold; -fx-padding: 1 2; }
+.theme-light .server-control-group {
+    -fx-background-color: #f6f6f7; -fx-background-radius: 8; -fx-padding: 6 10;
+    -fx-border-color: #e2e2e4; -fx-border-radius: 8;
+}
+.theme-light .server-share-badge { -fx-font-size: 11px; }
 
 /* Pinned bottom bar on server tabs holding the dirty-aware SAVE button -- never scrolls away. */
 .theme-light .tab-action-bar {

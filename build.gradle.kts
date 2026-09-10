@@ -26,6 +26,8 @@ javafx {
 dependencies {
     // JSON parsing (version manifest, MS/Xbox/Minecraft API responses, GitHub API responses)
     implementation("com.google.code.gson:gson:2.11.0")
+    // WebP image support for Modrinth icons (TwelveMonkeys ImageIO)
+    implementation("com.twelvemonkeys.imageio:imageio-webp:3.12.0")
     // HTTP client is java.net.http (built into Java 17), no extra dependency needed
     testImplementation(platform("org.junit:junit-bom:5.10.2"))
     testImplementation("org.junit.jupiter:junit-jupiter")
