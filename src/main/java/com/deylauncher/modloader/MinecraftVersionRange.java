@@ -10,10 +10,24 @@ public final class MinecraftVersionRange {
 
     private MinecraftVersionRange() {}
 
+    /**
+     * Modrinth / Fabric dependency strings sometimes wrap the constraint in square or curly brackets
+     * (e.g. {@code "[0.9.x]"}, {@code "[1.19.4 - 1.21]"}). Strip those so the rest of the parser sees
+     * the bare range -- Fabric's own loader writes them this way in {@code fabric.mod.json}.
+     */
+    private static String normalize(String r) {
+        r = r.trim();
+        while (r.length() >= 2 && ((r.startsWith("[") && r.endsWith("]"))
+                || (r.startsWith("{") && r.endsWith("}")))) {
+            r = r.substring(1, r.length() - 1).trim();
+        }
+        return r;
+    }
+
     /** True if {@code version} satisfies {@code range}. A blank / unknown range always matches. */
     public static boolean matches(String range, String version) {
         if (range == null) return true;
-        range = range.trim();
+        range = normalize(range);
         if (range.isBlank()) return true;
         // Modrinth/others sometimes use "(-∞,∞)" or "*" to mean unlimited.
         if (range.equals("*") || range.equals("(-∞,∞)") || range.contains("∞")) return true;

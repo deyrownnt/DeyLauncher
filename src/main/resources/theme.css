@@ -702,6 +702,11 @@
     -fx-fill: #888888;
 }
 
+/* Globe icon shown next to where a friend is playing (Friends Playing Now). */
+.server-icon {
+    -fx-fill: #ff7a1f;
+}
+
 /* ---- Borderless Mods window (custom undecorated stage) ---- */
 .mods-win-root {
     -fx-padding: 0;

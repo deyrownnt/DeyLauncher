@@ -82,6 +82,21 @@ class MinecraftVersionRangeTest {
     }
 
     @Test
+    void bracketWrappedRanges() {
+        // Fabric's loader writes dependency ranges bracket-wrapped, e.g. iris depends sodium "[0.9.x]".
+        assertTrue(MinecraftVersionRange.matches("[0.9.x]", "0.9.2"));
+        assertTrue(MinecraftVersionRange.matches("[0.9.x]", "0.9.0"));
+        assertFalse(MinecraftVersionRange.matches("[0.9.x]", "0.8.9"));
+
+        assertTrue(MinecraftVersionRange.matches("[1.19.4 - 1.21]", "1.20"));
+        assertFalse(MinecraftVersionRange.matches("[1.19.4 - 1.21]", "1.19.3"));
+        assertFalse(MinecraftVersionRange.matches("[1.19.4 - 1.21]", "1.21.5"));
+
+        assertTrue(MinecraftVersionRange.matches("{>=1.18.2}", "1.19"));
+        assertFalse(MinecraftVersionRange.matches("{>=1.21.2}", "1.21.1"));
+    }
+
+    @Test
     void tildeCompatibleRelease() {
         // ~1.21.1 => >=1.21.1 <1.21.2
         assertTrue(MinecraftVersionRange.matches("~1.21.1", "1.21.1"));
