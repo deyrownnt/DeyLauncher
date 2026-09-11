@@ -33,7 +33,8 @@ public final class IconFactory {
         FILE,
         STOP,
         SEARCH,
-        ADD
+        ADD,
+        SERVER
     }
 
     public static Node create(Icon icon, double size) {
@@ -67,6 +68,7 @@ public final class IconFactory {
             case STOP -> "M6 6h12v12h-12z";
             case SEARCH -> "M15.5 15.5a3.5 3.5 0 1 1-7-7a3.5 3.5 0 0 0-7-7 3.5 3.5 0 1 0 7 7z";
             case ADD -> "M5 11h14v2h-14zM11 5v14h2v-14z";
+            case SERVER -> "M21 12a9 9 0 1 0-18 0a9 9 0 0 1 18 0zM7.5 12h9M12 3v18";
         };
     }
 }

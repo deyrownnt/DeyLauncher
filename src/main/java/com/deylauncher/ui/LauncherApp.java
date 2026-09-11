@@ -16,6 +16,7 @@ import com.deylauncher.modloader.ForgeInstaller;
 import com.deylauncher.modloader.SodiumInstaller;
 import com.deylauncher.modloader.IrisInstaller;
 import com.deylauncher.modloader.DeyCapesInstaller;
+import com.deylauncher.modloader.ModPairResolver;
 import com.deylauncher.modloader.ModsUtil;
 import com.deylauncher.server.*;
 import com.google.gson.JsonObject;
@@ -91,6 +92,18 @@ public class LauncherApp extends Application {
     private final java.util.Map<String, String> modrinthIconCache = new java.util.HashMap<>(); // slug -> icon path ("" = known-none)
     // Online-player UUID lookup: player name (as parsed from console) -> UUID (for avatars).
     private final java.util.Map<String, String> playerUuidByName = new java.util.HashMap<>();
+
+    // Presence staleness: a friend who shows status=ONLINE but hasn't heartbeated within this long
+    // is treated as OFFLINE (their launcher force-closed / crashed, so their heartbeat stopped).
+    // Keep it a little over 2x the presence heartbeat period (see presenceHeartbeat()).
+    private static final long PRESENCE_STALE_MS = 120_000L;
+    private static final long PRESENCE_HEARTBEAT_MS = 60_000L;
+    private static final String PRESENCE_GRACEFUL_MARKER = "presence-graceful.txt";
+    private volatile boolean appRunning = true;
+
+    // Dots currently being wave-pulsed (see WavePulse) -- unregistered when the containing page
+    // re-renders so the animation engine never animates detached nodes.
+    private final java.util.Set<Node> wavePulseDots = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     // Main-page account button (face + name + online/offline dot) -- see buildAccountButton()/refreshAccountButton()
     private Button accountBtn;
@@ -215,6 +228,8 @@ public class LauncherApp extends Application {
         stage.setMinHeight(560);
         stage.centerOnScreen();
         stage.setOnCloseRequest(e -> {
+            appRunning = false;
+            WavePulse.instance().stop(); // stop the online-dot wave animation with the window
             if (prefs.rememberWindowSize) {
                 prefs.startWidth = stage.getWidth();
                 prefs.startHeight = stage.getHeight();
@@ -230,6 +245,49 @@ public class LauncherApp extends Application {
         refreshAccountButton();
         restoreOnlineSessionAsync();
         publishPresenceQuietly();
+        startPresenceTasks();
+    }
+
+    /**
+     * Kicks off the presence housekeeping: (1) if the previous run didn't cleanly exit (the
+     * graceful-exit marker is missing because of a crash / force-kill), clear our stale ONLINE
+     * presence so friends immediately see us go offline; (2) write THIS run's marker (deleted on
+     * clean close); (3) start a periodic presence heartbeat so a future force-close is detected by
+     * friends via staleness (lastSeen stops updating -> effectivelyOffline). All best-effort.
+     */
+    private void startPresenceTasks() {
+        if (friendsService == null) return;
+        Path marker = presenceMarkerFile();
+        if (Files.exists(marker)) {
+            // Previous run never closed cleanly -- clear our stale ONLINE presence in the background.
+            new Thread(() -> {
+                try {
+                    publishOfflineFromIdentity();
+                } catch (Exception ignored) {
+                }
+            }, "presence-crash-clear").start();
+        }
+        try {
+            Files.createDirectories(marker.getParent());
+            Files.writeString(marker, String.valueOf(System.currentTimeMillis()));
+        } catch (Exception ignored) {
+        }
+        Thread heartbeat = new Thread(() -> {
+            while (appRunning) {
+                try {
+                    Thread.sleep(PRESENCE_HEARTBEAT_MS);
+                } catch (InterruptedException ignored) {
+                    return;
+                }
+                if (appRunning) publishPresenceQuietly();
+            }
+        }, "presence-heartbeat");
+        heartbeat.setDaemon(true);
+        heartbeat.start();
+    }
+
+    private Path presenceMarkerFile() {
+        return Path.of(System.getProperty("user.home"), ".deylauncher", PRESENCE_GRACEFUL_MARKER);
     }
 
     /**
@@ -291,16 +349,30 @@ public class LauncherApp extends Application {
         new Thread(task, "presence-publish").start();
     }
 
-    /** Best-effort "I'm closing" mark -- won't catch a hard crash, only a normal window close. */
+    /**
+     * Best-effort "I'm closing" mark -- won't catch a hard crash / force-kill (that case is caught
+     * next launch via the missing graceful-exit marker + presence staleness, see startPresenceTasks).
+     * Also deletes THIS run's graceful marker so the next startup knows the previous run exited cleanly.
+     */
     private void publishOfflineOnExit() {
         if (friendsService == null) return;
-        PlayerIdentity active = identityStore.getActive();
-        if (active == null) return;
         try {
-            friendsService.publishPresence(active.uuid, active.username, "OFFLINE", null);
+            publishOfflineFromIdentity();
         } catch (Exception ignored) {
             // Nothing useful to do here -- the window is already closing.
         }
+        try {
+            Files.deleteIfExists(presenceMarkerFile());
+        } catch (Exception ignored) {
+        }
+    }
+
+    /** Publishes OFFLINE presence for the active account, or no-ops (throws safely) when none/friends off. */
+    private void publishOfflineFromIdentity() throws Exception {
+        if (friendsService == null) return;
+        PlayerIdentity active = identityStore.getActive();
+        if (active == null) return;
+        friendsService.publishPresence(active.uuid, active.username, "OFFLINE", null);
     }
 
     /**
@@ -510,6 +582,7 @@ public class LauncherApp extends Application {
 
     private void renderFriendsPageContent(PlayerIdentity active, FriendsService.FriendsView view) {
         friendsPageContent.getChildren().clear();
+        clearWavePulseDots(); // stop animating the previous page's dots before we rebuild
 
         Label heading = new Label("Friends");
         heading.getStyleClass().add("card-heading");
@@ -601,25 +674,30 @@ public class LauncherApp extends Application {
         } else {
             for (var friend : view.friends()) {
                 var entry = view.allUsers().get(friend.uuid);
-                boolean online = entry != null && "ONLINE".equals(entry.status);
+                boolean online = effectivelyOnline(entry);
                 String address = entry != null ? entry.serverAddress : null;
 
                 Region dot = new Region();
                 dot.getStyleClass().addAll("account-status-dot", online ? "dot-online" : "dot-offline");
+                if (online) {
+                    WavePulse.instance().register(dot);
+                    wavePulseDots.add(dot);
+                }
 
                 ImageView avatarView = new ImageView();
                 avatarView.setFitWidth(28);
                 avatarView.setFitHeight(28);
                 avatarView.setSmooth(false); // keep skin pixels crisp, not blurred
                 avatarView.getStyleClass().add("account-btn-face");
-                Image cachedAvatar = friendFaceCached(friend.uuid, online);
+                Image cachedAvatar = friendFaceCached(friend.uuid);
                 if (cachedAvatar != null) {
                     avatarView.setImage(cachedAvatar);
                 } else {
-                    avatarView.setImage(faceThumbnail(null)); // placeholder while an online friend's real skin fetches
-                    if (online) {
-                        fetchFriendAvatarAsync(friend.uuid, () -> renderFriendsPageContent(active, view));
-                    }
+                    avatarView.setImage(faceThumbnail(null)); // placeholder while a friend's real Mojang face fetches
+                    // Fetch a real face for EVERY friend (online or offline): if the name/uuid belongs
+                    // to a real Minecraft account, Mojang's public endpoint hands back their skin. A
+                    // purely-local DeyLauncher account just fails cleanly and keeps the placeholder.
+                    fetchFriendAvatarAsync(friend.uuid, () -> renderFriendsPageContent(active, view));
                 }
 
                 Label name = new Label(friend.username);
@@ -655,14 +733,61 @@ public class LauncherApp extends Application {
     }
 
     /**
-     * Returns a cached, cropped face for a friend if we already have one, else null (caller
-     * shows a placeholder and, for online friends, kicks off fetchFriendAvatarAsync). Offline
-     * friends never get a real fetch attempt -- DeyLauncher has no access to another player's
-     * local custom skin (no sync layer exists yet, see DEYLAUNCHER_SKIN_PROTOCOL.md), so they
-     * always get the same clean default face rather than ever showing broken/whole-skin data.
+     * A friend is only truly ONLINE if they say so AND heartbeat within the staleness window.
+     * If they force-closed/crashed their launcher, their heartbeat stopped and status goes stale,
+     * so they show as OFFLINE (white dot) -- see PRESENCE_STALE_MS.
      */
-    private Image friendFaceCached(String uuid, boolean online) {
-        if (!online) return faceThumbnail(null);
+    private boolean effectivelyOnline(FriendsData.UserEntry entry) {
+        return entry != null && "ONLINE".equals(entry.status)
+                && (System.currentTimeMillis() - entry.lastSeen) < PRESENCE_STALE_MS;
+    }
+
+    /** Unregisters every dot this page is wave-pulsing (called before a re-render). */
+    private void clearWavePulseDots() {
+        for (Node n : wavePulseDots) WavePulse.instance().unregister(n);
+        wavePulseDots.clear();
+    }
+
+    /**
+     * Turns a raw "host:port" server address into a friendly display for friends: if it matches one
+     * of MY added/external servers (or a locally-hosted server), show that server's name, else fall
+     * back to the bare address. Used with the SERVER icon so friends recognise where you're playing.
+     */
+    private String resolveServerDisplay(String address) {
+        if (address == null || address.isBlank()) return address;
+        String a = address.trim();
+        String host = a;
+        int colon = a.lastIndexOf(':');
+        if (colon > 0) host = a.substring(0, colon).trim();
+        for (var srv : addedServersStore.list()) {
+            if (matchesAddress(srv.address(), a)) return srv.name();
+        }
+        for (var srv : serverStore.listAll()) {
+            if (matchesAddress("localhost:" + srv.port, a) || matchesAddress(localIpAddress() + ":" + srv.port, a)) {
+                return srv.name;
+            }
+        }
+        return a;
+    }
+
+    private boolean matchesAddress(String candidate, String address) {
+        if (candidate == null || address == null) return false;
+        String c = candidate.trim();
+        String a = address.trim();
+        if (c.equalsIgnoreCase(a)) return true;
+        String ch = c.contains(":") ? c.substring(0, c.lastIndexOf(':')).toLowerCase() : c.toLowerCase();
+        String ah = a.contains(":") ? a.substring(0, a.lastIndexOf(':')).toLowerCase() : a.toLowerCase();
+        return ch.equals(ah); // same host, default port implied
+    }
+
+    /**
+     * Returns a cached, cropped face for a friend if we already have one, else null (the caller
+     * shows a placeholder and kicks off fetchFriendAvatarAsync). Works for ONLINE and OFFLINE
+     * friends alike -- a friend whose name maps to a real Minecraft account shows their Mojang
+     * face either way. Local-only DeyLauncher accounts never resolve on Mojang, so they simply
+     * keep the clean default face (a failed fetch is cached as absent, not as a broken image).
+     */
+    private Image friendFaceCached(String uuid) {
         java.nio.file.Path cache = gameFiles.root.resolve("friend-avatars").resolve(uuid + ".png");
         if (java.nio.file.Files.exists(cache)) {
             try {
@@ -675,9 +800,10 @@ public class LauncherApp extends Application {
     }
 
     /**
-     * Looks up an online friend's real skin via Mojang's public session-profile endpoint (no
-     * auth needed -- this is standard public player data) and caches the PNG locally, then
-     * re-renders so the placeholder swaps for the real face. Never touched for offline friends.
+     * Looks up a friend's real skin via Mojang's public session-profile endpoint (no auth needed --
+     * this is standard public player data) and caches the PNG locally, then re-renders so the
+     * placeholder swaps for the real face. Called for both online and offline friends; a uuid that
+     * isn't a real Minecraft account just never caches and keeps the placeholder.
      */
     private void fetchFriendAvatarAsync(String uuid, Runnable onDone) {
         Task<Void> task = new Task<>() {
@@ -860,13 +986,14 @@ public class LauncherApp extends Application {
     }
 
     private void renderFriendsPlayingNow(FriendsService.FriendsView view) {
-        // Remove any previously-rendered "playing now" rows before re-adding (identified by user data marker).
+        // Remove any previously-rendered "playing now" rows + stop their pulse before re-adding.
         serversPageContent.getChildren().removeIf(n -> "friends-playing-now-row".equals(n.getUserData()));
+        clearWavePulseDots();
         if (view == null) return;
 
         var playing = view.friends().stream()
                 .map(f -> java.util.Map.entry(f, view.allUsers().get(f.uuid)))
-                .filter(e -> e.getValue() != null && "ONLINE".equals(e.getValue().status)
+                .filter(e -> effectivelyOnline(e.getValue())
                         && e.getValue().serverAddress != null && !e.getValue().serverAddress.isBlank())
                 .toList();
 
@@ -880,17 +1007,32 @@ public class LauncherApp extends Application {
         for (var e : playing) {
             var friend = e.getKey();
             var entry = e.getValue();
+            String display = resolveServerDisplay(entry.serverAddress);
 
             ImageView avatarView = new ImageView();
             avatarView.setFitWidth(28);
             avatarView.setFitHeight(28);
             avatarView.setSmooth(false);
             avatarView.getStyleClass().add("account-btn-face");
-            Image cached = friendFaceCached(friend.uuid, true);
+            Image cached = friendFaceCached(friend.uuid);
             avatarView.setImage(cached != null ? cached : faceThumbnail(null));
             if (cached == null) fetchFriendAvatarAsync(friend.uuid, () -> renderServersPageContent());
 
-            Label name = new Label(friend.username + "  ·  " + entry.serverAddress);
+            // Friend's online indicator -- wave-pulsed like the Friends-list dots.
+            Region dot = new Region();
+            dot.getStyleClass().addAll("account-status-dot", "dot-online");
+            WavePulse.instance().register(dot);
+            wavePulseDots.add(dot);
+
+            // Server icon + friendly server name so friends recognise where they'd be joining.
+            Node serverIcon = icon(IconFactory.Icon.SERVER, 15);
+            serverIcon.getStyleClass().add("server-icon");
+            Label serverLabel = new Label(display);
+            serverLabel.getStyleClass().add("notice-label");
+            HBox serverBox = new HBox(7, serverIcon, serverLabel);
+            serverBox.setAlignment(Pos.CENTER_LEFT);
+
+            Label name = new Label(friend.username);
             name.getStyleClass().add("mod-name");
 
             Region spacer = new Region();
@@ -904,7 +1046,7 @@ public class LauncherApp extends Application {
                 onPlay(entry.serverAddress);
             });
 
-            HBox row = new HBox(10, avatarView, name, spacer, joinBtn);
+            HBox row = new HBox(10, avatarView, dot, name, serverBox, spacer, joinBtn);
             row.setAlignment(Pos.CENTER_LEFT);
             row.getStyleClass().add("mod-row");
             row.setUserData("friends-playing-now-row");
@@ -2163,7 +2305,7 @@ public class LauncherApp extends Application {
         // UUID from the server's online-name list; otherwise a clean placeholder while the skin
         // fetch runs in the background.
         String knownUuid = playerUuidByName.get(playerName);
-        Image cached = (knownUuid != null) ? friendFaceCached(knownUuid, true) : null;
+        Image cached = (knownUuid != null) ? friendFaceCached(knownUuid) : null;
         ImageView avatarView = new ImageView(cached != null ? cached : faceThumbnail(null));
         avatarView.setFitWidth(28);
         avatarView.setFitHeight(28);
@@ -2233,7 +2375,7 @@ public class LauncherApp extends Application {
             ImageView avatar = null;
             String uuid = entry.uuid();
             if (uuid != null && !uuid.isBlank()) {
-                Image cachedFace = friendFaceCached(uuid, true);
+                Image cachedFace = friendFaceCached(uuid);
                 if (cachedFace != null) {
                     avatar = new ImageView(cachedFace);
                     avatar.setFitWidth(28);
@@ -3457,17 +3599,6 @@ public class LauncherApp extends Application {
         return files.root.resolve("instances").resolve(versionId + suffix);
     }
 
-    /**
-     * Sodium↔Iris conflict disarming: true when an active performance mod (Sodium on Fabric,
-     * Embeddium on Forge) is present in this instance's mods folder. Iris is only meaningful on
-     * top of one of those backends, so when none is present for the selected Minecraft version we
-     * must not leave an active Iris jar (see {@link IrisInstaller#disableActive}).
-     */
-    private boolean sodiumBackendPresent(Path modsDir) {
-        return ModsUtil.firstFamilyJar(modsDir, "sodium-") != null
-                || ModsUtil.firstFamilyJar(modsDir, "embeddium-") != null;
-    }
-
     private void openModsDialog() {
         ModsManager mods = new ModsManager(currentInstanceDir());
         String windowTitle = "Mods -- " + versionBox.getValue() + " (" + modLoaderBox.getValue() + ")";
@@ -3571,25 +3702,13 @@ public class LauncherApp extends Application {
 
         // Best-effort: try to have the bundled mods ready by the time the dialog opens too, not
         // just on Play, so the list already reflects reality instead of only updating after a
-        // launch. Performance mod: Sodium on Fabric, Embeddium on Forge. Fabric API: Fabric only.
+        // launch. Sodium/Iris are resolved as a compatible pair (see ModPairResolver) rather than
+        // "newest of each", which is what crashes the DEY 26.2 build. Fabric API: Fabric only.
         if (deyMode && mcVersion != null && !mcVersion.isBlank()) {
             Task<Void> installTask = new Task<>() {
                 @Override
                 protected Void call() throws Exception {
-                    new SodiumInstaller(modLoader).ensureInstalled(mcVersion, mods.modsDir());
-                    if ("Fabric".equals(modLoader)) {
-                        // Sodium↔Iris conflict disarming: Iris needs Sodium as its runtime backend.
-                        // If the performance mod can't run for this version (no compatible build), do
-                        // not leave active Iris jars around either -- that pair is what crashed on DEY
-                        // 26.2. Disabling (never deleting) keeps the game loadable without shaders.
-                        if (sodiumBackendPresent(mods.modsDir())) {
-                            new IrisInstaller().ensureInstalled(mcVersion, mods.modsDir());
-                        } else {
-                            new IrisInstaller().disableActive(mods.modsDir());
-                        }
-                        new FabricApiInstaller().ensureInstalled(mcVersion, mods.modsDir());
-                        new DeyCapesInstaller().ensureInstalled(mcVersion, mods.modsDir());
-                    }
+                    new ModPairResolver().ensureDeyMods(modLoader, mcVersion, mods.modsDir());
                     return null;
                 }
             };
@@ -5469,28 +5588,19 @@ public class LauncherApp extends Application {
         grid.add(sectionLabel("FRIENDS"), 0, row++, 2, 1);
         CheckBox shareAddressBox = new CheckBox("Share my current server address with friends");
         shareAddressBox.setSelected(prefs.shareServerAddress);
-        TextField serverAddressField = new TextField(prefs.myServerAddress);
-        serverAddressField.setPromptText("e.g. mc.example.com:25565");
-        serverAddressField.getStyleClass().add("input-field");
-        serverAddressField.setDisable(!prefs.shareServerAddress);
-        Label addressNote = new Label("Filled in automatically with the address of the last remote server "
-                + "you joined/played on (never your own machine). Edit it above to override. Ignored "
-                + "entirely while invisible mode (Account tab) is on.");
+        Label addressNote = new Label("Turned on, the address you're playing on is published to friends "
+                + "automatically -- there's nothing to type. It fills itself with the last server you "
+                + "joined (any external server such as mc.example.com:25565, or your own DEY server's "
+                + "tunnel address). Ignored entirely while invisible mode (Account tab) is on.");
         addressNote.getStyleClass().add("notice-label");
         addressNote.setWrapText(true);
         shareAddressBox.selectedProperty().addListener((o, a, b) -> {
             markDirty.run();
             prefs.shareServerAddress = b;
-            serverAddressField.setDisable(!b);
             prefs.save();
-        });
-        serverAddressField.textProperty().addListener((o, a, b) -> {
-            markDirty.run();
-            prefs.myServerAddress = b;
-            prefs.save();
+            publishPresenceQuietly(); // publish (or clear) my shared address right away
         });
         grid.add(shareAddressBox, 0, row++, 2, 1);
-        grid.add(serverAddressField, 0, row++, 2, 1);
         grid.add(addressNote, 0, row++, 2, 1);
 
         return grid;
@@ -5664,63 +5774,20 @@ public class LauncherApp extends Application {
                     }
                 }
 
-                if (modLoader.equals("Fabric") && deyMode) {
-                    updateMessage("Making sure Sodium is installed...");
+                if (deyMode) {
+                    // All four bundled mods in one coordinated pass: Sodium/Iris are resolved as a
+                    // COMPATIBLE pair (never "the newest of each" independently -- that is the DEY 26.2
+                    // crash), Fabric API is newest, DeyCapes stays the local bundled jar. See ModPairResolver.
+                    updateMessage("Making sure bundled mods are installed (auto-pairing Sodium/Iris)...");
                     try {
-                        String installed = new SodiumInstaller(modLoader).ensureInstalled(entry.id(), gameDir.resolve("mods"));
-                        if (installed != null) {
-                            String finalName = installed;
-                            Platform.runLater(() -> log("Installed " + finalName));
+                        String summary = new ModPairResolver().ensureDeyMods(modLoader, entry.id(), gameDir.resolve("mods"));
+                        if (summary != null) {
+                            String done = summary;
+                            Platform.runLater(() -> log("Bundled mods ready: " + done));
                         }
-                    } catch (Exception sodiumEx) {
-                        String msg = sodiumEx.getMessage();
-                        Platform.runLater(() -> log("Couldn't auto-install the performance mod (continuing without it): " + msg));
-                    }
-                }
-                if (modLoader.equals("Fabric") && deyMode) {
-                    updateMessage("Making sure Iris (shaders) is installed...");
-                    try {
-                        // Sodium↔Iris conflict disarming: Iris needs Sodium as its runtime backend.
-                        // If no performance-mod jar can run for this version, disable (never delete)
-                        // any active Iris instead of pushing the pair that crashed on DEY 26.2.
-                        if (sodiumBackendPresent(gameDir.resolve("mods"))) {
-                            String installed = new IrisInstaller().ensureInstalled(entry.id(), gameDir.resolve("mods"));
-                            if (installed != null) {
-                                String finalName = installed;
-                                Platform.runLater(() -> log("Installed " + finalName));
-                            }
-                        } else {
-                            new IrisInstaller().disableActive(gameDir.resolve("mods"));
-                        }
-                    } catch (Exception irisEx) {
-                        String msg = irisEx.getMessage();
-                        Platform.runLater(() -> log("Couldn't auto-install Iris (continuing without shaders): " + msg));
-                    }
-                }
-                if (modLoader.equals("Fabric") && deyMode) {
-                    updateMessage("Making sure Fabric API is installed...");
-                    try {
-                        String installed = new FabricApiInstaller().ensureInstalled(entry.id(), gameDir.resolve("mods"));
-                        if (installed != null) {
-                            String finalName = installed;
-                            Platform.runLater(() -> log("Installed " + finalName));
-                        }
-                    } catch (Exception apiEx) {
-                        String msg = apiEx.getMessage();
-                        Platform.runLater(() -> log("Couldn't auto-install Fabric API (continuing without it): " + msg));
-                    }
-                }
-                if (modLoader.equals("Fabric") && deyMode) {
-                    updateMessage("Making sure DeyCapes is installed...");
-                    try {
-                        String installed = new DeyCapesInstaller().ensureInstalled(entry.id(), gameDir.resolve("mods"));
-                        if (installed != null) {
-                            String finalName = installed;
-                            Platform.runLater(() -> log("Installed " + finalName));
-                        }
-                    } catch (Exception capesEx) {
-                        String msg = capesEx.getMessage();
-                        Platform.runLater(() -> log("Couldn't auto-install DeyCapes (continuing without it): " + msg));
+                    } catch (Exception modEx) {
+                        String msg = modEx.getMessage();
+                        Platform.runLater(() -> log("Couldn't fully auto-install bundled mods (continuing): " + msg));
                     }
                 }
 
@@ -6126,7 +6193,7 @@ public class LauncherApp extends Application {
         List<FriendsData.FriendRef> friends = new ArrayList<>(view.friends());
         friends.sort(java.util.Comparator.comparing((FriendsData.FriendRef f) -> {
             FriendsData.UserEntry e = view.allUsers().get(f.uuid);
-            return e != null && "ONLINE".equals(e.status) ? 0 : 1;
+            return effectivelyOnline(e) ? 0 : 1;
         }));
         if (friends.isEmpty()) {
             box.getChildren().add(suggestHint("No friends yet -- add people on the Friends page."));
@@ -6134,7 +6201,7 @@ public class LauncherApp extends Application {
         }
         for (var friend : friends) {
             FriendsData.UserEntry e = view.allUsers().get(friend.uuid);
-            boolean isOnline = e != null && "ONLINE".equals(e.status);
+            boolean isOnline = effectivelyOnline(e);
             boolean alreadyListed = onlinePlayers.stream()
                     .anyMatch(n -> n.equalsIgnoreCase(friend.username));
             if (alreadyListed) continue; // already shown in the ONLINE PLAYERS section

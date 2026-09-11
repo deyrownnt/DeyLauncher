@@ -78,7 +78,52 @@ public class IrisInstaller {
             if (!disabled.isEmpty()) return "DISABLED:" + String.join(",", disabled);
             return null;
         }
+        return installBest(best, modsDir);
+    }
 
+    /**
+     * Like {@link #ensureInstalled}, but installs a SPECIFIC resolved build (by its Modrinth version
+     * number) instead of picking "the newest" itself. Used by the coordinated {@link ModPairResolver}
+     * so the installed Iris always matches the resolved Sodium version chosen for the same target --
+     * never a pair the loader would reject with a HARD_DEP/NEG_HARD_DEP. Falls back to the newest
+     * compatible build if the exact version isn't found; disables any active Iris if none exists.
+     */
+    public String ensureVersion(String mcVersion, Path modsDir, String targetVersion) throws Exception {
+        String listUrl = "https://api.modrinth.com/v2/project/" + PROJECT_SLUG + "/version";
+        HttpRequest req = HttpRequest.newBuilder(URI.create(listUrl))
+                .header("User-Agent", "DeyLauncher/0.1 (+" + PROJECT_SLUG + "-auto-install)")
+                .GET().build();
+        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) {
+            throw new IllegalStateException("Modrinth request failed: HTTP " + resp.statusCode());
+        }
+        JsonArray versions = JsonParser.parseString(resp.body()).getAsJsonArray();
+
+        JsonObject best = findSpecific(versions, mcVersion, targetVersion);
+        if (best == null) best = findBestCompatible(versions, mcVersion); // fall back to newest
+        if (best == null) {
+            java.util.List<String> disabled = ModsUtil.disableActiveFamily(modsDir, familyPrefix());
+            if (!disabled.isEmpty()) return "DISABLED:" + String.join(",", disabled);
+            return null;
+        }
+        return installBest(best, modsDir);
+    }
+
+    /** Finds the version whose {@code version_number} equals {@code targetVersion}, for this MC version (Fabric). */
+    private JsonObject findSpecific(JsonArray versions, String mcVersion, String targetVersion) {
+        if (targetVersion == null || targetVersion.isBlank()) return null;
+        for (var el : versions) {
+            JsonObject v = el.getAsJsonObject();
+            String num = v.has("version_number") ? v.get("version_number").getAsString() : "";
+            if (!num.equals(targetVersion)) continue;
+            if (!supportsLoader(v, "fabric") || !supportsVersion(v, mcVersion)) continue;
+            if (v.has("files") && !v.getAsJsonArray("files").isEmpty()) return v;
+        }
+        return null;
+    }
+
+    /** Shared tail of both install paths: download (or re-enable) the chosen build and drop stale jars. */
+    private String installBest(JsonObject best, Path modsDir) throws Exception {
         JsonObject file = primaryFile(best.getAsJsonArray("files"));
         String fileName = file.get("filename").getAsString();
         String prefix = familyPrefix();
