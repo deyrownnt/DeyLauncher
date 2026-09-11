@@ -32,8 +32,43 @@ public class FriendsData {
         public long lastSeen;
         /** Only set (and only trusted) if the user opted in via Settings > "Share my server address with friends". */
         public String serverAddress;
+        /** Friendly name of the server currently being shared (published alongside serverAddress so
+         *  friends see where you're playing without us having to look the address up). */
+        public String currentServerName;
+        /** Optional image URL for the server currently being shared (many self-hosted servers have
+         *  no hosted icon, in which case this stays null and the profile shows a generated tile). */
+        public String currentServerIconUrl;
+        /** Socials the user chose to publish on their friend profile, edited in Account settings. */
+        public List<Social> socials = new ArrayList<>();
+        /** Servers this user owns in DeyLauncher (name + how to reach them), published for their profile. */
+        public List<ServerInfo> servers = new ArrayList<>();
         public List<FriendRef> friends = new ArrayList<>();
         public List<OutgoingRequest> outgoingRequests = new ArrayList<>();
+    }
+
+    /** One social handle/link shown on a friend's profile. {@code type} is a display label such as
+     *  "Discord", "YouTube", "Twitch", "X/Twitter", "Email", "Website" or "Other"; {@code value} is
+     *  the handle/URL/address. Only ever published if the user added it in Account settings. */
+    public static class Social {
+        public String type;
+        public String value;
+        public Social() {}
+        public Social(String type, String value) { this.type = type; this.value = value; }
+    }
+
+    /** A server a user owns in DeyLauncher, shown on their friend profile. {@code name} is the local
+     *  server name and {@code port} how it's reachable; {@code iconUrl} is optional (few self-hosted
+     *  servers have a hosted icon). */
+    public static class ServerInfo {
+        public String name;
+        public int port;
+        public String iconUrl;
+        public ServerInfo() {}
+        public ServerInfo(String name, int port, String iconUrl) {
+            this.name = name;
+            this.port = port;
+            this.iconUrl = iconUrl;
+        }
     }
 
     public static class FriendRef {
