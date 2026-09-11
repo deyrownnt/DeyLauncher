@@ -23,6 +23,7 @@ import com.google.gson.JsonObject;
 import com.deylauncher.version.VersionManifest;
 import javafx.application.Application;
 import javafx.application.Platform;
+import javafx.animation.*;
 import javafx.concurrent.Task;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
@@ -30,13 +31,16 @@ import javafx.scene.Node;
 import javafx.scene.Scene;
 import javafx.scene.control.*;
 import javafx.scene.control.ButtonBase;
+import javafx.scene.effect.*;
 import javafx.scene.image.Image;
 import javafx.scene.image.ImageView;
 import javafx.scene.layout.*;
 import javafx.scene.paint.Color;
 import javafx.scene.shape.Circle;
+import javafx.scene.shape.Rectangle;
 import javafx.scene.text.Font;
 import javafx.scene.text.FontWeight;
+import javafx.util.Duration;
 import javafx.scene.input.TransferMode;
 import javafx.beans.property.SimpleBooleanProperty;
 import javafx.stage.FileChooser;
@@ -82,6 +86,7 @@ public class LauncherApp extends Application {
     private FriendsService friendsService; // null until github.properties/embedded config is set -- see GitHubConfig
     private DeyCapesService deyCapesService; // null until github config is set -- Dey capes are a github-backed feature
     private FriendsCache friendsCache;
+    private FriendNotesStore friendNotes; // per-friend personal notes, saved only on this PC
     private ServerStore serverStore;
     private AddedServersStore addedServersStore;
     private final java.util.Map<String, ServerProcessManager> runningServers = new java.util.HashMap<>(); // serverId -> process manager, for whatever's live this session
@@ -182,6 +187,7 @@ public class LauncherApp extends Application {
         this.settings = new GameLauncher.LaunchSettings(prefs.ramMinMb, prefs.ramMaxMb,
                 prefs.gameWidth, prefs.gameHeight, prefs.fullscreen, prefs.softwareOpenGl);
         this.friendsCache = new FriendsCache(gameFiles.root);
+        this.friendNotes = new FriendNotesStore(gameFiles.root);
         this.serverStore = new ServerStore(gameFiles.root);
         this.addedServersStore = new AddedServersStore(gameFiles.root);
         GitHubConfig githubConfig = GitHubConfig.load();
@@ -284,6 +290,11 @@ public class LauncherApp extends Application {
         }, "presence-heartbeat");
         heartbeat.setDaemon(true);
         heartbeat.start();
+
+        // One-shot: publish the servers you own so your friend profile's "Servers they own" is
+        // populated. Runs once per launch (the "owned servers" write is heavier than presence).
+        PlayerIdentity ownedActive = identityStore.getActive();
+        if (ownedActive != null) publishOwnedServers(ownedActive);
     }
 
     private Path presenceMarkerFile() {
@@ -340,7 +351,8 @@ public class LauncherApp extends Application {
             @Override
             protected Void call() {
                 try {
-                    friendsService.publishPresence(active.uuid, active.username, status, address);
+                    friendsService.publishPresence(active.uuid, active.username, status, address,
+                            running ? server.name : null, null);
                 } catch (Exception ignored) {
                 }
                 return null;
@@ -519,6 +531,10 @@ public class LauncherApp extends Application {
     // ---- Friends page (real nav destination, not a dialog) -- single shared friends.json via FriendsService ----
     private VBox friendsPageContent;
     private ScrollPane friendsPageScroll;
+    private boolean friendsShellBuilt;      // once the static heading/input is attached we never rebuild it
+    private VBox friendsIncomingBox;        // list containers rebuilt in place on each refresh
+    private VBox friendsOutgoingBox;
+    private VBox friendsFriendsBox;
 
     private javafx.scene.Node buildFriendsPage() {
         if (friendsPageScroll == null) {
@@ -685,8 +701,8 @@ public class LauncherApp extends Application {
                 }
 
                 ImageView avatarView = new ImageView();
-                avatarView.setFitWidth(28);
-                avatarView.setFitHeight(28);
+                avatarView.setFitWidth(30);
+                avatarView.setFitHeight(30);
                 avatarView.setSmooth(false); // keep skin pixels crisp, not blurred
                 avatarView.getStyleClass().add("account-btn-face");
                 Image cachedAvatar = friendFaceCached(friend.uuid);
@@ -694,14 +710,23 @@ public class LauncherApp extends Application {
                     avatarView.setImage(cachedAvatar);
                 } else {
                     avatarView.setImage(faceThumbnail(null)); // placeholder while a friend's real Mojang face fetches
-                    // Fetch a real face for EVERY friend (online or offline): if the name/uuid belongs
-                    // to a real Minecraft account, Mojang's public endpoint hands back their skin. A
-                    // purely-local DeyLauncher account just fails cleanly and keeps the placeholder.
-                    fetchFriendAvatarAsync(friend.uuid, () -> renderFriendsPageContent(active, view));
+                    // Clicking a friend's profile picture opens their detailed friend profile.
+                    // When the real face finishes downloading, update ONLY this ImageView -- never
+                    // rebuild the page (rebuilding every friend's face repeatedly was what made the
+                    // page flicker and steal focus from the username field).
+                    fetchFriendAvatarAsync(friend.uuid, () -> {
+                        javafx.scene.image.Image fetched = friendFaceCached(friend.uuid);
+                        if (fetched != null) avatarView.setImage(fetched);
+                    });
                 }
+                avatarView.setCursor(javafx.scene.Cursor.HAND);
+                avatarView.setOnMouseClicked(ev -> openFriendProfile(friend.uuid, friend.username));
+                Tooltip.install(avatarView, new Tooltip("Open " + friend.username + "'s profile"));
 
                 Label name = new Label(friend.username);
                 name.getStyleClass().add("mod-name");
+                name.setCursor(javafx.scene.Cursor.HAND);
+                name.setOnMouseClicked(ev -> openFriendProfile(friend.uuid, friend.username));
 
                 Region spacer = new Region();
                 HBox.setHgrow(spacer, Priority.ALWAYS);
@@ -846,6 +871,317 @@ public class LauncherApp extends Application {
         };
         task.setOnSucceeded(e -> Platform.runLater(onDone));
         new Thread(task, "friend-avatar-fetch").start();
+    }
+
+// ---- Friend Profile popup (opens when you click a friend's profile picture) ----
+    private void openFriendProfile(String friendUuid, String friendUsername) {
+        PlayerIdentity active = identityStore.getActive();
+        if (active == null) return;
+        FriendsService.FriendsView view = friendsCache.load();
+        FriendsData.UserEntry entry = (view != null) ? view.allUsers().get(friendUuid) : null;
+        boolean online = effectivelyOnline(entry);
+
+        VBox content = buildFriendProfileBody(active, friendUuid, friendUsername, entry, view, online);
+        Stage win = buildBorderlessStage("Friend Profile", content, stage,
+                Modality.WINDOW_MODAL, 420, 520, 540, 660);
+        win.show();
+    }
+
+    private VBox buildFriendProfileBody(PlayerIdentity me, String friendUuid, String friendUsername,
+                                        FriendsData.UserEntry entry, FriendsService.FriendsView view,
+                                        boolean online) {
+        VBox root = new VBox(16);
+        root.setPadding(new Insets(22));
+
+        // Header: big avatar with the online/offline dot pinned to its bottom-right.
+        Image face = friendFaceCached(friendUuid);
+        ImageView bigAv = new ImageView(face != null ? face : faceThumbnail(null));
+        bigAv.setFitWidth(72);
+        bigAv.setFitHeight(72);
+        bigAv.setSmooth(false);
+        bigAv.getStyleClass().add("account-btn-face");
+        if (face == null) {
+            fetchFriendAvatarAsync(friendUuid, () -> {
+                Image fetched = friendFaceCached(friendUuid);
+                if (fetched != null) bigAv.setImage(fetched);
+            });
+        }
+        Region dot = new Region();
+        dot.getStyleClass().addAll("account-status-dot", online ? "dot-online" : "dot-offline");
+        dot.setMinSize(18, 18);
+        dot.setMaxSize(18, 18);
+        if (online) {
+            WavePulse.instance().register(dot);
+            wavePulseDots.add(dot);
+        }
+        StackPane avatarWrap = new StackPane(bigAv);
+        StackPane.setAlignment(dot, Pos.BOTTOM_RIGHT);
+        avatarWrap.getChildren().add(dot);
+
+        Label nameLbl = new Label(friendUsername);
+        nameLbl.getStyleClass().add("card-heading");
+        Label statusLbl = new Label(online ? "Online" : "Offline");
+        statusLbl.getStyleClass().add(online ? "badge-online" : "badge-offline");
+        HBox nameRow = new HBox(10, nameLbl, statusLbl);
+        nameRow.setAlignment(Pos.CENTER_LEFT);
+        HBox header = new HBox(14, avatarWrap, nameRow);
+        header.setAlignment(Pos.CENTER_LEFT);
+        root.getChildren().add(header);
+
+        // Now playing / Join card.
+        root.getChildren().add(buildNowPlayingSection(entry, online));
+
+        // Mutual friends & reciprocal servers.
+        java.util.List<String> mutualFriends = mutualFriendNames(me.uuid, entry, view);
+        java.util.List<String> mutualServers = mutualServerNames(entry, myServerNameSet());
+        Label mutualStats = new Label("Mutual friends: " + mutualFriends.size()
+                + "   ·   Mutual servers: " + mutualServers.size());
+        mutualStats.getStyleClass().add("notice-label");
+        root.getChildren().addAll(sectionLabel("MUTUAL WITH THEM"), mutualStats);
+        if (!mutualFriends.isEmpty()) {
+            Label l = new Label("Shared friends: " + String.join(", ", new java.util.TreeSet<>(mutualFriends)));
+            l.getStyleClass().add("notice-label");
+            l.setWrapText(true);
+            root.getChildren().add(l);
+        }
+        if (!mutualServers.isEmpty()) {
+            Label l = new Label("Shared servers: " + String.join(", ", new java.util.TreeSet<>(mutualServers)));
+            l.getStyleClass().add("notice-label");
+            l.setWrapText(true);
+            root.getChildren().add(l);
+        }
+
+        // Socials.
+        root.getChildren().add(sectionLabel("SOCIALS"));
+        root.getChildren().add(entry != null && entry.socials != null && !entry.socials.isEmpty()
+                ? socialsList(entry.socials)
+                : noticeText("They haven't shared any socials yet."));
+
+        // Servers they own.
+        root.getChildren().add(sectionLabel("SERVERS THEY OWN"));
+        root.getChildren().add(entry != null && entry.servers != null && !entry.servers.isEmpty()
+                ? ownedServersList(entry.servers)
+                : noticeText("They don't currently list any servers they own."));
+
+        // Personal notes -- saved only on your PC, never uploaded.
+        root.getChildren().add(sectionLabel("YOUR NOTES"));
+        TextArea notesArea = new TextArea(friendNotes.noteFor(friendUuid));
+        notesArea.setPrefRowCount(4);
+        notesArea.setWrapText(true);
+        notesArea.getStyleClass().add("input-field");
+        Button notesSave = new Button("Save Notes");
+        notesSave.getStyleClass().add("pill-button");
+        Label notesSaved = new Label("");
+        notesSaved.getStyleClass().add("notice-label");
+        notesSave.setOnAction(e -> notesSaved.setText(friendNotes.save(friendUuid, notesArea.getText())
+                ? "Saved locally." : "Couldn't save -- check disk permissions."));
+        HBox notesRow = new HBox(10, notesSave, notesSaved);
+        notesRow.setAlignment(Pos.CENTER_LEFT);
+        root.getChildren().addAll(notesArea, notesRow);
+        return root;
+    }
+    private Node buildNowPlayingSection(FriendsData.UserEntry entry, boolean online) {
+        VBox box = new VBox(10);
+        box.getStyleClass().add("profile-now-section");
+        String address = (online && entry != null) ? entry.serverAddress : null;
+        if (address == null || address.isBlank()) {
+            return noticeText("Not playing on a shared server right now.");
+        }
+        String displayName = (entry.currentServerName != null && !entry.currentServerName.isBlank())
+                ? entry.currentServerName : resolveServerDisplay(address);
+        Node tile = serverTile(displayName, entry.currentServerIconUrl, 40);
+        Label placeLabel = new Label("Currently playing");
+        placeLabel.getStyleClass().add("notice-label");
+        Label srvName = new Label(displayName);
+        srvName.getStyleClass().add("mod-name");
+        srvName.setWrapText(true);
+        VBox info = new VBox(4, placeLabel, srvName);
+        HBox left = new HBox(10, tile, info);
+        left.setAlignment(Pos.CENTER_LEFT);
+        Button join = glowingJoinButton(address);
+        Region spacer = new Region();
+        HBox.setHgrow(spacer, Priority.ALWAYS);
+        HBox row = new HBox(10, left, spacer, join);
+        row.setAlignment(Pos.CENTER_LEFT);
+        box.getChildren().add(row);
+        return box;
+    }
+
+    private java.util.List<String> mutualFriendNames(String myUuid, FriendsData.UserEntry entry, FriendsService.FriendsView view) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        if (entry == null || view == null) return out;
+        FriendsData.UserEntry me = view.allUsers().get(myUuid);
+        if (me == null) return out;
+        java.util.Set<String> theirFriends = new java.util.HashSet<>();
+        for (var f : entry.friends) theirFriends.add(f.username.toLowerCase());
+        for (var f : me.friends) {
+            if (theirFriends.contains(f.username.toLowerCase())) out.add(f.username);
+        }
+        return out;
+    }
+
+    private java.util.List<String> mutualServerNames(FriendsData.UserEntry entry, java.util.Set<String> myServerNames) {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        if (entry == null || entry.servers == null) return out;
+        for (var srv : entry.servers) {
+            if (srv.name != null && myServerNames.contains(srv.name.toLowerCase())) out.add(srv.name);
+        }
+        return out;
+    }
+
+    private java.util.Set<String> myServerNameSet() {
+        java.util.Set<String> names = new java.util.HashSet<>();
+        for (var srv : addedServersStore.list()) if (srv.name() != null) names.add(srv.name().toLowerCase());
+        for (var srv : serverStore.listAll()) if (srv.name != null) names.add(srv.name.toLowerCase());
+        return names;
+    }
+
+    /** Publishes the currently-owned servers (from this install) to the friend profile, in the
+     *  background. Name + port; no icon since self-hosted servers have no hosted image. */
+    private void publishOwnedServers(PlayerIdentity active) {
+        if (friendsService == null) return;
+        java.util.List<FriendsData.ServerInfo> owned = new java.util.ArrayList<>();
+        for (var srv : serverStore.listAll()) {
+            if (srv.name != null && !srv.name.isBlank()) owned.add(new FriendsData.ServerInfo(srv.name, srv.port, null));
+        }
+        Task<Void> task = new Task<>() {
+            @Override protected Void call() throws Exception {
+                friendsService.updateOwnedServers(active.uuid, active.username, owned);
+                return null;
+            }
+        };
+        new Thread(task, "owned-servers-publish").start();
+    }
+
+    private Label noticeText(String text) {
+        Label l = new Label(text);
+        l.getStyleClass().add("notice-label");
+        l.setWrapText(true);
+        return l;
+    }
+
+    private Node socialsList(java.util.List<FriendsData.Social> socials) {
+        VBox box = new VBox(6);
+        for (var s : socials) {
+            String value = s.value;
+            Button b = new Button((s.type != null ? s.type + ": " : "") + (value != null ? value : ""));
+            b.getStyleClass().add("pill-button");
+            b.setMaxWidth(Double.MAX_VALUE);
+            b.setAlignment(Pos.CENTER_LEFT);
+            b.setCursor(javafx.scene.Cursor.HAND);
+            b.setOnAction(e -> openExternal(value));
+            box.getChildren().add(b);
+        }
+        return box;
+    }
+
+    private Node ownedServersList(java.util.List<FriendsData.ServerInfo> servers) {
+        VBox box = new VBox(6);
+        for (var srv : servers) {
+            HBox row = new HBox(10, serverTile(srv.name, srv.iconUrl, 32));
+            row.setAlignment(Pos.CENTER_LEFT);
+            Label name = new Label(srv.name != null ? srv.name : "Unnamed server");
+            name.getStyleClass().add("mod-name");
+            row.getChildren().add(name);
+            if (srv.port > 0) {
+                Label port = new Label(":" + srv.port);
+                port.getStyleClass().add("notice-label");
+                row.getChildren().add(port);
+            }
+            Region spacer = new Region();
+            HBox.setHgrow(spacer, Priority.ALWAYS);
+            row.getChildren().add(spacer);
+            box.getChildren().add(row);
+        }
+        return box;
+    }
+
+    private Node serverTile(String name, String iconUrl, double size) {
+        StackPane tile = new StackPane();
+        tile.setMinSize(size, size);
+        tile.setMaxSize(size, size);
+        String initials = "";
+        if (name != null && !name.isBlank()) {
+            String t = name.trim();
+            initials = t.substring(0, 1).toUpperCase();
+            int sp = t.indexOf(' ');
+            if (sp > 0 && sp + 1 < t.length()) initials += t.charAt(sp + 1);
+        }
+        double hue = (Math.abs((name == null ? "" : name).hashCode()) % 360);
+        Circle bg = new Circle(size / 2.0, Color.hsb(hue, 0.45, 0.40));
+        Label inits = new Label(initials);
+        inits.setTextFill(javafx.scene.paint.Color.WHITE);
+        inits.setFont(Font.font(Font.getDefault().getFamily(), FontWeight.BOLD, size * 0.38));
+        tile.getChildren().addAll(bg, inits);
+
+        if (iconUrl != null && !iconUrl.isBlank()) {
+            long id = Math.abs((name == null ? "" : name).hashCode());
+            ImageView iv = new ImageView();
+            iv.setFitWidth(size);
+            iv.setFitHeight(size);
+            iv.setSmooth(true);
+            Circle clip = new Circle(size / 2.0);
+            iv.setClip(clip);
+            iv.setUserData(Boolean.TRUE);
+            tile.getChildren().add(iv);
+            final ImageView ref = iv;
+            Task<java.nio.file.Path> fetch = new Task<>() {
+                @Override protected java.nio.file.Path call() {
+                    try {
+                        java.nio.file.Path cache = gameFiles.root.resolve("server-icons")
+                                .resolve("srv" + id + ".png");
+                        java.nio.file.Files.createDirectories(cache.getParent());
+                        var h = java.net.http.HttpClient.newHttpClient();
+                        var req = java.net.http.HttpRequest.newBuilder(java.net.URI.create(iconUrl)).GET().build();
+                        var resp = h.send(req, java.net.http.HttpResponse.BodyHandlers.ofFile(cache));
+                        return resp.statusCode() == 200 ? cache : null;
+                    } catch (Exception ignored) { return null; }
+                }
+            };
+            fetch.setOnSucceeded(ev -> {
+                java.nio.file.Path cached = fetch.getValue();
+                if (cached != null && Boolean.TRUE.equals(ref.getUserData())) {
+                    ref.setImage(new Image(cached.toUri().toString()));
+                }
+            });
+            new Thread(fetch, "profile-server-icon").start();
+        }
+        return tile;
+    }
+
+    /** A "Join Server" button that pulses a green glow while the profile is open. */
+    private Button glowingJoinButton(String address) {
+        Button b = new Button("Join Server");
+        b.getStyleClass().add("pill-button");
+        setButtonIcon(b, IconFactory.Icon.PLAY, "Join");
+        DropShadow glow = new DropShadow();
+        glow.setColor(javafx.scene.paint.Color.rgb(120, 255, 150, 0.95));
+        glow.setRadius(14);
+        b.setEffect(glow);
+        Timeline tl = new Timeline(
+                new KeyFrame(Duration.ZERO, new KeyValue(glow.radiusProperty(), 8)),
+                new KeyFrame(Duration.seconds(0.9), new KeyValue(glow.radiusProperty(), 22)));
+        tl.setAutoReverse(true);
+        tl.setCycleCount(Animation.INDEFINITE);
+        tl.play();
+        b.setOnAction(e -> {
+            selectNavTab(navHomeBtn);
+            onPlay(address);
+        });
+        return b;
+    }
+
+    /** Opens a social link / email / website in the OS browser. Safe no-op if it isn't a link. */
+    private void openExternal(String value) {
+        if (value == null || value.isBlank()) return;
+        String v = value.trim();
+        if (!v.startsWith("http://") && !v.startsWith("https://") && !v.startsWith("mailto:")) {
+            v = "https://" + v;
+        }
+        try {
+            getHostServices().showDocument(v);
+        } catch (Exception ignored) {
+        }
     }
 
     // ---- Servers page: Your Servers / Added Servers / Friends Playing Now ----
@@ -1016,7 +1352,10 @@ public class LauncherApp extends Application {
             avatarView.getStyleClass().add("account-btn-face");
             Image cached = friendFaceCached(friend.uuid);
             avatarView.setImage(cached != null ? cached : faceThumbnail(null));
-            if (cached == null) fetchFriendAvatarAsync(friend.uuid, () -> renderServersPageContent());
+            if (cached == null) fetchFriendAvatarAsync(friend.uuid, () -> {
+                Image fetched = friendFaceCached(friend.uuid);
+                if (fetched != null) avatarView.setImage(fetched); // update only this avatar, no page rebuild
+            });
 
             // Friend's online indicator -- wave-pulsed like the Friends-list dots.
             Region dot = new Region();
@@ -4478,6 +4817,12 @@ public class LauncherApp extends Application {
             });
             content.getChildren().add(invisibleBox);
 
+            // ---- Friend-profile socials (published so friends can see them on your profile) ----
+            if (friendsService != null) {
+                content.getChildren().add(sectionLabel("FRIEND PROFILE"));
+                content.getChildren().add(buildSocialsEditor(active));
+            }
+
             Button logoutBtn = new Button();
             setButtonIcon(logoutBtn, IconFactory.Icon.LOGOUT, "Log Out");
             logoutBtn.getStyleClass().addAll("pill-button", "logout-button");
@@ -4530,6 +4875,84 @@ public class LauncherApp extends Application {
             }
         }
         return content;
+    }
+
+    /** Editor for the socials shown on your friend profile. Changes are published to friends.json. */
+    private Node buildSocialsEditor(PlayerIdentity active) {
+        VBox box = new VBox(10);
+        FriendsService.FriendsView cached = friendsCache.load();
+        FriendsData.UserEntry me = (cached != null) ? cached.allUsers().get(active.uuid) : null;
+        java.util.List<FriendsData.Social> working = new java.util.ArrayList<>();
+        if (me != null && me.socials != null) working.addAll(me.socials);
+
+        ComboBox<String> typeBox = new ComboBox<>();
+        typeBox.getItems().addAll("Discord", "YouTube", "Twitch", "X/Twitter", "Email", "Website", "Other");
+        typeBox.getSelectionModel().selectFirst();
+        typeBox.getStyleClass().add("input-field");
+        TextField valueField = new TextField();
+        valueField.setPromptText("handle / link (e.g. @user or https://...)");
+        valueField.getStyleClass().add("input-field");
+        HBox.setHgrow(valueField, Priority.ALWAYS);
+        Button addBtn = new Button("Add");
+        addBtn.getStyleClass().add("pill-button");
+
+        VBox rows = new VBox(6);
+        final Runnable[] refreshRows = new Runnable[1];
+        refreshRows[0] = () -> {
+            rows.getChildren().clear();
+            for (int i = 0; i < working.size(); i++) {
+                FriendsData.Social s = working.get(i);
+                Label lbl = new Label((s.type != null ? s.type : "") + ": " + (s.value != null ? s.value : ""));
+                lbl.getStyleClass().add("mod-name");
+                Button rm = new Button("Remove");
+                rm.getStyleClass().add("pill-button");
+                int idx = i;
+                rm.setOnAction(ev -> { working.remove(idx); refreshRows[0].run(); });
+                Region sp = new Region();
+                HBox.setHgrow(sp, Priority.ALWAYS);
+                HBox r = new HBox(10, lbl, sp, rm);
+                r.setAlignment(Pos.CENTER_LEFT);
+                rows.getChildren().add(r);
+            }
+        };
+        refreshRows[0].run();
+        addBtn.setOnAction(e -> {
+            String v = valueField.getText().trim();
+            if (v.isEmpty()) return;
+            working.add(new FriendsData.Social(typeBox.getSelectionModel().getSelectedItem(), v));
+            valueField.clear();
+            refreshRows[0].run();
+        });
+
+        Button saveBtn = new Button("Save to Profile");
+        saveBtn.getStyleClass().add("pill-button");
+        Label status = new Label("");
+        status.getStyleClass().add("notice-label");
+        saveBtn.setOnAction(e -> {
+            java.util.List<FriendsData.Social> snapshot = new java.util.ArrayList<>(working);
+            saveBtn.setDisable(true);
+            Task<Void> task = new Task<>() {
+                @Override protected Void call() throws Exception {
+                    friendsService.updateSocials(active.uuid, active.username, snapshot);
+                    publishOwnedServers(active); // also refresh your owned servers on each profile save
+                    return null;
+                }
+            };
+            task.setOnSucceeded(ev -> {
+                saveBtn.setDisable(false);
+                status.setText("Saved -- visible to friends on your profile.");
+            });
+            task.setOnFailed(ev -> {
+                saveBtn.setDisable(false);
+                status.setText("Couldn't save: " + task.getException().getMessage());
+            });
+            new Thread(task, "socials-save").start();
+        });
+
+        HBox addRow = new HBox(8, typeBox, valueField, addBtn);
+        HBox.setHgrow(valueField, Priority.ALWAYS);
+        box.getChildren().addAll(addRow, rows, new HBox(10, saveBtn, status));
+        return box;
     }
 
     // ==================== SKINS TAB ====================

@@ -46,15 +46,46 @@ public class FriendsService {
         return new FriendsView(friends, incoming, outgoing, data.users);
     }
 
-    /** Registers/updates the caller's own entry and publishes current presence in the same write. */
-    public void publishPresence(String myUuid, String myUsername, String status, String serverAddress) throws Exception {
+    /** Registers/updates the caller's own entry and publishes current presence in the same write.
+     *  {@code serverName}/{@code serverIconUrl} describe the server currently being shared (so friends
+     *  see where you're playing by name), or null for the generic manual-address case. */
+    public void publishPresence(String myUuid, String myUsername, String status, String serverAddress,
+                                String serverName, String serverIconUrl) throws Exception {
         repo.sync("presence update", data -> {
             var me = data.getOrCreate(myUuid, myUsername);
             me.status = status;
             me.lastSeen = System.currentTimeMillis();
             me.serverAddress = serverAddress; // null clears it -- e.g. sharing turned off in Settings
+            me.currentServerName = serverName;
+            me.currentServerIconUrl = serverIconUrl;
             return data;
         });
+    }
+
+    /** Convenience overload that clears the current-server details (used by the manual-address path). */
+    public void publishPresence(String myUuid, String myUsername, String status, String serverAddress) throws Exception {
+        publishPresence(myUuid, myUsername, status, serverAddress, null, null);
+    }
+
+    /** Publishes the socials shown on the user's friend profile (edited in Account settings). */
+    public FriendsView updateSocials(String myUuid, String myUsername, java.util.List<FriendsData.Social> socials) throws Exception {
+        FriendsData result = repo.sync("profile socials", data -> {
+            var me = data.getOrCreate(myUuid, myUsername);
+            me.socials = socials;
+            return data;
+        });
+        return buildView(result, myUuid);
+    }
+
+    /** Publishes the servers the user owns in DeyLauncher, shown on their friend profile. */
+    public FriendsView updateOwnedServers(String myUuid, String myUsername,
+                                          java.util.List<FriendsData.ServerInfo> servers) throws Exception {
+        FriendsData result = repo.sync("owned servers", data -> {
+            var me = data.getOrCreate(myUuid, myUsername);
+            me.servers = servers;
+            return data;
+        });
+        return buildView(result, myUuid);
     }
 
     /** Works even if targetUsername has never used DeyLauncher -- see FriendsData's class doc. */

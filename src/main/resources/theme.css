@@ -795,3 +795,18 @@
     -fx-cursor: hand;
 }
 .theme-light .fix-button:hover { -fx-background-color: #e8690f; }
+
+/* Friend profile "currently playing" card. */
+.profile-now-section {
+    -fx-background-radius: 12;
+    -fx-border-radius: 12;
+    -fx-padding: 14;
+}
+.theme-dark .profile-now-section {
+    -fx-background-color: #1c1d21;
+    -fx-border-color: #2a2b30;
+}
+.theme-light .profile-now-section {
+    -fx-background-color: #f4f5f7;
+    -fx-border-color: #dfe1e5;
+}
