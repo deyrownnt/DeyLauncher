@@ -16,9 +16,15 @@ import java.util.*;
 public class GameLauncher {
 
     /** Everything the RAM/resolution/fullscreen settings screen controls. */
-    public record LaunchSettings(int ramMinMb, int ramMaxMb, int width, int height, boolean fullscreen) {
+    public record LaunchSettings(int ramMinMb, int ramMaxMb, int width, int height, boolean fullscreen,
+                                 boolean softwareOpenGl) {
         public static LaunchSettings defaults() {
-            return new LaunchSettings(1024, 4096, 854, 480, false);
+            return new LaunchSettings(1024, 4096, 854, 480, false, false);
+        }
+
+        /** Convenience: older callers that only set the classic five fields keep software OpenGL off. */
+        public LaunchSettings(int ramMinMb, int ramMaxMb, int width, int height, boolean fullscreen) {
+            this(ramMinMb, ramMaxMb, width, height, fullscreen, false);
         }
     }
 
@@ -76,11 +82,50 @@ public class GameLauncher {
             command.add("--fullscreen");
         }
 
+        // Software-OpenGL compatibility mode (Settings > Game): on Linux machines whose GPU driver
+        // can't expose OpenGL 3.3 (classic symptom: "GLXBadFBConfig" / "Driver does not support
+        // OpenGL 3.3"), launching through `/usr/bin/env LIBGL_ALWAYS_SOFTWARE=1 ...` makes Mesa render
+        // in software on the CPU, which does provide OpenGL 3.3 -- so Minecraft gets a window without
+        // needing a working GPU driver, a display reconfig, or any admin rights. Off by default so
+        // healthy machines keep GPU acceleration.
+        command = applySoftwareGl(command, settings.softwareOpenGl(), System.getProperty("os.name", ""));
+
         ProcessBuilder pb = new ProcessBuilder(command);
         pb.directory(gameDirectory.toFile());
         pb.redirectErrorStream(true); // merge stderr into stdout so callers only read one stream
         return pb.start();
     }
+
+    /**
+     * Testable: when {@code softwareGL} is on AND we're on Linux, prepend Mesa's software-OpenGL env
+     * assignments (through the standard {@code /usr/bin/env}) so the child Minecraft process renders
+     * on the CPU with OpenGL 3.3 -- no GPU driver or admin required. Returns the command unchanged on
+     * Windows/macOS (where the LXGL/GLX workaround is meaningless) and when the toggle is off.
+     *
+     * <p>On a GLVND system (virtually every modern NVIDIA + mesa distro) {@code LIBGL_ALWAYS_SOFTWARE=1}
+     * alone is silently IGNORED -- the GLVND dispatcher keeps resolving to the proprietary libGLX_nvidia
+     * vendor, which fails to create a GL 3.3 context on a broken/mismatched display, and the game aborts
+     * with "Driver does not support OpenGL 3.3" + exit 134. Forcing {@code __GLX_VENDOR_LIBRARY_NAME=mesa}
+     * (plus {@code GALLIUM_DRIVER=llvmpipe}/{@code MESA_LOADER_DRIVER_OVERRIDE=llvmpipe} as belt-and-braces)
+     * is what actually switches GLVND onto Mesa's software llvmpipe renderer, which always provides a
+     * GL 4.x context. This is why the fix must set the vendor, not just ALWAYS_SOFTWARE.
+     */
+    static List<String> applySoftwareGl(List<String> command, boolean softwareGL, String osName) {
+        if (!softwareGL) return command;
+        String os = osName == null ? "" : osName.toLowerCase();
+        if (!os.contains("linux")) return command;
+        List<String> out = new ArrayList<>(command.size() + 5);
+        out.add("/usr/bin/env");
+        // Force Mesa's llvmpipe (software) through the GLVND dispatcher -- ALWAYS_SOFTWARE alone is
+        // ignored when the default GLX vendor is NVIDIA's proprietary driver.
+        out.add("LIBGL_ALWAYS_SOFTWARE=1");
+        out.add("__GLX_VENDOR_LIBRARY_NAME=mesa");
+        out.add("GALLIUM_DRIVER=llvmpipe");
+        out.add("MESA_LOADER_DRIVER_OVERRIDE=llvmpipe");
+        out.addAll(command);
+        return out;
+    }
+
 
     private Map<String, String> buildPlaceholders(GameFiles.PreparedVersion version, AuthSession session,
                                                     Path gameDirectory, LaunchSettings settings) {

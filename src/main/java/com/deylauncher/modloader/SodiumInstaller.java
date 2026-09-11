@@ -41,20 +41,26 @@ public class SodiumInstaller {
     /** True if a matching performance-mod jar is already present in this instance's mods folder. */
     public boolean isInstalled(Path modsDir) throws Exception {
         if (!Files.isDirectory(modsDir)) return false;
-        String prefix = projectSlug + "-";
+        String prefix = familyPrefix();
         try (var stream = Files.list(modsDir)) {
             return stream.anyMatch(p -> p.getFileName().toString().toLowerCase().startsWith(prefix));
         }
     }
 
+    private String familyPrefix() {
+        return projectSlug.toLowerCase() + "-";
+    }
+
     /**
-     * Downloads the build matching mcVersion+loader into modsDir, unless one is already there.
-     * Returns the installed file's name, or null if it's already installed or Modrinth has no
-     * matching build for this Minecraft version yet.
+     * Ensures the build matching mcVersion+loader is installed into modsDir and is the ONE that runs.
+     * Only EXACTLY matching Minecraft versions are considered (a build for "1.19" is NOT reused for
+     * "1.19.3"), and stable releases are preferred over pre-releases. A stale/wrong-version jar of this
+     * family is replaced (updated or downgraded) with the compatible build -- never simply deleted. If
+     * Modrinth has no build for this EXACT version, any existing active jar of this family is moved to
+     * mods-disabled (disabled, NOT deleted) so the game still loads. Returns the installed file name,
+     * a "DISABLED:<names>" marker, or null if nothing changed.
      */
     public String ensureInstalled(String mcVersion, Path modsDir) throws Exception {
-        if (isInstalled(modsDir)) return null;
-
         String listUrl = "https://api.modrinth.com/v2/project/" + projectSlug + "/version";
         HttpRequest req = HttpRequest.newBuilder(URI.create(listUrl))
                 .header("User-Agent", "DeyLauncher/0.1 (+" + projectSlug + "-auto-install)")
@@ -65,33 +71,75 @@ public class SodiumInstaller {
         }
         JsonArray versions = JsonParser.parseString(resp.body()).getAsJsonArray();
 
+        JsonObject best = findBestCompatible(versions, mcVersion);
+        if (best == null) {
+            // No build supports this EXACT Minecraft version. Never delete a bundled mod to "fix"
+            // it -- disable (move to mods-disabled) any active jar of this family so the game still
+            // loads without the incompatible mod, while the jar stays on disk.
+            java.util.List<String> disabled = ModsUtil.disableActiveFamily(modsDir, familyPrefix());
+            if (!disabled.isEmpty()) return "DISABLED:" + String.join(",", disabled);
+            return null;
+        }
+
+        JsonObject file = primaryFile(best.getAsJsonArray("files"));
+        String fileName = file.get("filename").getAsString();
+        String prefix = familyPrefix();
+        Files.createDirectories(modsDir);
+
+        Path active = ModsUtil.firstFamilyJar(modsDir, prefix);
+        if (active != null && active.getFileName().toString().equalsIgnoreCase(fileName)) {
+            return null; // the exact matching build is already installed
+        }
+
+        // Prefer re-enabling an exact copy already sitting in mods-disabled to re-downloading it.
+        Path disabledCopy = ModsUtil.disabledDirFor(modsDir).resolve(fileName);
+        if (Files.exists(disabledCopy) && ModsUtil.reenableDisabled(modsDir, disabledCopy)) {
+            ModsUtil.removeFamilyJarsExcept(modsDir, prefix, fileName);
+            return fileName;
+        }
+
+        Path dest = modsDir.resolve(fileName);
+        Path tmp = modsDir.resolve(fileName + ".part");
+        HttpResponse<Path> fileResp = http.send(
+                HttpRequest.newBuilder(URI.create(file.get("url").getAsString())).GET().build(),
+                HttpResponse.BodyHandlers.ofFile(tmp));
+        if (fileResp.statusCode() != 200) {
+            Files.deleteIfExists(tmp);
+            throw new IllegalStateException(projectSlug + " download failed: HTTP " + fileResp.statusCode());
+        }
+        Files.move(tmp, dest, StandardCopyOption.REPLACE_EXISTING);
+
+        // Replace: drop any other (stale / wrong-version) jar of the family -- an update/downgrade,
+        // not a bare delete.
+        ModsUtil.removeFamilyJarsExcept(modsDir, prefix, fileName);
+        return fileName;
+    }
+
+    /** Newest EXACT-matching build, preferring stable releases over pre-releases. */
+    private JsonObject findBestCompatible(JsonArray versions, String mcVersion) {
+        JsonObject newest = null, newestStable = null;
         for (var el : versions) {
             JsonObject v = el.getAsJsonObject();
             if (!supportsLoader(v) || !supportsVersion(v, mcVersion)) continue;
-
             JsonArray files = v.getAsJsonArray("files");
-            if (files.isEmpty()) continue;
-            JsonObject file = primaryFile(files);
-
-            String fileUrl = file.get("url").getAsString();
-            String fileName = file.get("filename").getAsString();
-
-            Files.createDirectories(modsDir);
-            Path tmp = modsDir.resolve(fileName + ".part");
-            HttpResponse<Path> fileResp = http.send(
-                    HttpRequest.newBuilder(URI.create(fileUrl)).GET().build(),
-                    HttpResponse.BodyHandlers.ofFile(tmp));
-            if (fileResp.statusCode() != 200) {
-                Files.deleteIfExists(tmp);
-                throw new IllegalStateException(projectSlug + " download failed: HTTP " + fileResp.statusCode());
+            if (files == null || files.isEmpty()) continue;
+            if (newest == null) newest = v;
+            if (!isPreRelease(v)) {
+                if (newestStable == null) newestStable = v;
             }
-            Files.move(tmp, modsDir.resolve(fileName), StandardCopyOption.REPLACE_EXISTING);
-            return fileName;
         }
-        return null; // no matching build published for this Minecraft version yet
+        return newestStable != null ? newestStable : newest;
+    }
+
+    /** True when a version number looks like an alpha/beta/pre/snapshot/dev build. */
+    private boolean isPreRelease(JsonObject v) {
+        String num = v.has("version_number") ? v.get("version_number").getAsString().toLowerCase() : "";
+        return num.contains("alpha") || num.contains("beta") || num.contains("pre")
+                || num.contains("snapshot") || num.contains("dev") || num.contains("nightly");
     }
 
     private boolean supportsLoader(JsonObject version) {
+        if (!version.has("loaders")) return false;
         for (var l : version.getAsJsonArray("loaders")) {
             if (l.getAsString().equalsIgnoreCase(loaderName)) return true;
         }
@@ -99,6 +147,7 @@ public class SodiumInstaller {
     }
 
     private boolean supportsVersion(JsonObject version, String mcVersion) {
+        if (!version.has("game_versions")) return false;
         for (var gv : version.getAsJsonArray("game_versions")) {
             if (gv.getAsString().equals(mcVersion)) return true;
         }

@@ -50,12 +50,13 @@ jobs:
           jpackage \
             --type app-image \
             --input build/jpackage-input \
+            --module-path build/jpackage-fx \
+            --add-modules java.se,jdk.crypto.ec,jdk.unsupported,javafx.controls,javafx.graphics \
             --main-jar DeyLauncher-0.1.0.jar \
             --main-class com.deylauncher.ui.LauncherApp \
             --name DeyLauncher \
             --icon src/main/resources/app-icon.png \
             --dest dist \
-            --java-options "--module-path \$APPDIR --add-modules javafx.controls,javafx.graphics" \
             --java-options "--enable-native-access=javafx.graphics"
 
       - name: Create Linux archive
@@ -113,12 +114,13 @@ jobs:
           jpackage `
             --type app-image `
             --input build/jpackage-input `
+            --module-path build/jpackage-fx `
+            --add-modules java.se,jdk.crypto.ec,jdk.unsupported,javafx.controls,javafx.graphics `
             --main-jar DeyLauncher-0.1.0.jar `
             --main-class com.deylauncher.ui.LauncherApp `
             --name DeyLauncher `
             --icon src/main/resources/app-icon.ico `
             --dest dist `
-            --java-options '--module-path $APPDIR --add-modules javafx.controls,javafx.graphics' `
             --java-options '--enable-native-access=javafx.graphics'
 
       - name: Create Windows archive

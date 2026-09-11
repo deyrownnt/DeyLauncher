@@ -96,6 +96,7 @@
 .theme-dark .card-heading { -fx-text-fill: #f5f5f6; -fx-font-size: 28px; -fx-font-weight: bold; }
 .theme-dark .field-label { -fx-text-fill: #9a9ba3; -fx-font-size: 13px; -fx-font-weight: bold; }
 .theme-dark .notice-label { -fx-text-fill: #9a9ba3; -fx-font-size: 13.5px; -fx-wrap-text: true; }
+.theme-dark .settings-hint-label { -fx-text-fill: #82858c; -fx-font-size: 12px; -fx-wrap-text: true; }
 
 .theme-dark .input-field, .theme-dark .text-field, .theme-dark .combo-box, .theme-dark .text-area {
     -fx-background-color: #202126; -fx-text-fill: #f5f5f6; -fx-prompt-text-fill: #6b6c72;
@@ -402,6 +403,7 @@
 .theme-light .card-heading { -fx-text-fill: #17181b; -fx-font-size: 28px; -fx-font-weight: bold; }
 .theme-light .field-label { -fx-text-fill: #6b6c72; -fx-font-size: 13px; -fx-font-weight: bold; }
 .theme-light .notice-label { -fx-text-fill: #6b6c72; -fx-font-size: 13.5px; -fx-wrap-text: true; }
+.theme-light .settings-hint-label { -fx-text-fill: #76797f; -fx-font-size: 12px; -fx-wrap-text: true; }
 
 .theme-light .input-field, .theme-light .text-field, .theme-light .combo-box, .theme-light .text-area {
     -fx-background-color: #f0f0f1; -fx-text-fill: #17181b; -fx-prompt-text-fill: #9a9ba3;
@@ -700,3 +702,91 @@
     -fx-fill: #888888;
 }
 
+/* ---- Borderless Mods window (custom undecorated stage) ---- */
+.mods-win-root {
+    -fx-padding: 0;
+    -fx-border-color: #2a2b30;
+    -fx-border-width: 1;
+}
+.theme-dark .mods-win-header {
+    -fx-background-color: #17181b;
+    -fx-padding: 10 16;
+    -fx-cursor: move;
+}
+.theme-dark .mods-win-title {
+    -fx-text-fill: #f5f5f6;
+    -fx-font-size: 15px;
+    -fx-font-weight: bold;
+}
+.theme-dark .mods-win-close {
+    -fx-background-color: transparent;
+    -fx-text-fill: #9a9ba3;
+    -fx-background-radius: 50%;
+    -fx-font-size: 16px;
+    -fx-cursor: hand;
+    -fx-min-width: 28;
+    -fx-min-height: 28;
+    -fx-padding: 0;
+}
+.theme-dark .mods-win-close:hover {
+    -fx-background-color: rgba(232,105,15,0.18);
+    -fx-text-fill: #ff7a1f;
+}
+.theme-light .mods-win-header {
+    -fx-background-color: #ffffff;
+    -fx-padding: 10 16;
+    -fx-cursor: move;
+    -fx-border-color: #e2e2e4;
+    -fx-border-width: 0 0 1 0;
+}
+.theme-light .mods-win-title {
+    -fx-text-fill: #17181b;
+    -fx-font-size: 15px;
+    -fx-font-weight: bold;
+}
+.theme-light .mods-win-close {
+    -fx-background-color: transparent;
+    -fx-text-fill: #6b6c72;
+    -fx-background-radius: 50%;
+    -fx-font-size: 16px;
+    -fx-cursor: hand;
+    -fx-min-width: 28;
+    -fx-min-height: 28;
+    -fx-padding: 0;
+}
+.theme-light .mods-win-close:hover {
+    -fx-background-color: rgba(232,105,15,0.12);
+    -fx-text-fill: #e8690f;
+}
+
+/* Highlight the whole Mods window while drag-dropping a jar anywhere inside it. */
+.theme-dark .mods-dialog-content.drop-zone-active {
+    -fx-background-color: rgba(255,122,31,0.08);
+    -fx-border-color: #ff7a1f;
+    -fx-border-style: dashed;
+    -fx-border-radius: 10;
+}
+.theme-light .mods-dialog-content.drop-zone-active {
+    -fx-background-color: rgba(255,122,31,0.06);
+    -fx-border-color: #ff7a1f;
+    -fx-border-style: dashed;
+    -fx-border-radius: 10;
+}
+
+/* Fix Mods button -- only visible when incompatible mods are detected. */
+.theme-dark .fix-button {
+    -fx-background-color: #ff7a1f;
+    -fx-text-fill: #0d0d0f;
+    -fx-font-weight: bold;
+    -fx-background-radius: 20;
+    -fx-cursor: hand;
+}
+.theme-dark .fix-button:hover { -fx-background-color: #e8690f; }
+.theme-light .fix-button {
+    -fx-background-color: #ff7a1f;
+    -fx-text-fill: #ffffff;
+    -fx-font-weight: bold;
+    -fx-background-radius: 20;
+    -fx-cursor: hand;
+}
+.theme-light .fix-button:hover { -fx-background-color: #e8690f; }

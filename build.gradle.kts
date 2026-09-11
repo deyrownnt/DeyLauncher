@@ -31,6 +31,9 @@ dependencies {
     // HTTP client is java.net.http (built into Java 17), no extra dependency needed
     testImplementation(platform("org.junit:junit-bom:5.10.2"))
     testImplementation("org.junit.jupiter:junit-jupiter")
+    // JUnit Platform launcher makes Gradle's test executor able to actually RUN the tests
+    // (junit-bom + junit-jupiter bring the API/engine but not the gradle-side launcher).
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
 application {
@@ -95,12 +98,34 @@ tasks.register("printClasspath") {
     }
 }
 tasks.register<Sync>("prepareJpackage") {
-    dependsOn(tasks.shadowJar)
+    dependsOn(tasks.shadowJar, "prepareJpackageFx")
 
+    // The jpackage `--input` gets ONLY the fat shadow jar. That fat jar already bundles every
+    // compile dependency (gson, the TwelveMonkeys imageio-* modules, JavaFX classes). Shipping
+    // the individual modular jars alongside it as well caused a split-package module clash --
+    // the packaged app failed at JVM boot with:
+    //   ResolutionException: Modules DeyLauncher and com.twelvemonkeys.imageio.metadata export
+    //   package com.twelvemonkeys.imageio.metadata.xmp to module com.twelvemonkeys.imageio.core
+    // (introduced by adding imageio-webp; this is exactly the packaging regression the launcher
+    //  hit in the CapesUpdate release).
     from(tasks.shadowJar)
-    from(configurations.runtimeClasspath)
 
     into(layout.buildDirectory.dir("jpackage-input"))
+}
+
+// JavaFX only needs to be available as build-time MODULES (passed to `jpackage --module-path`
+// alongside `--add-modules javafx.controls,javafx.graphics`) so jlink embeds JavaFX's native
+// platform code into the bundled runtime. These modular jars are NOT shipped into the app-image
+// classpath (the fat jar holds the JavaFX classes themselves), so they never sit next to the fat
+// jar and can't conflict with it.
+tasks.register<Sync>("prepareJpackageFx") {
+    dependsOn(tasks.shadowJar)
+
+    from(configurations.runtimeClasspath) {
+        include("javafx-*.jar")
+    }
+
+    into(layout.buildDirectory.dir("jpackage-fx"))
 }
 
 tasks.named("distZip") {

@@ -9,11 +9,14 @@ import com.deylauncher.identity.*;
 import com.deylauncher.launch.GameFiles;
 import com.deylauncher.launch.GameLauncher;
 import com.deylauncher.launch.JavaRuntimeManager;
+import com.deylauncher.launch.LaunchDiagnostics;
 import com.deylauncher.modloader.FabricInstaller;
 import com.deylauncher.modloader.FabricApiInstaller;
 import com.deylauncher.modloader.ForgeInstaller;
 import com.deylauncher.modloader.SodiumInstaller;
+import com.deylauncher.modloader.IrisInstaller;
 import com.deylauncher.modloader.DeyCapesInstaller;
+import com.deylauncher.modloader.ModsUtil;
 import com.deylauncher.server.*;
 import com.google.gson.JsonObject;
 import com.deylauncher.version.VersionManifest;
@@ -45,8 +48,10 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Deque;
 import java.util.List;
 
 /**
@@ -102,6 +107,12 @@ public class LauncherApp extends Application {
     private StackPane pageHost;
     private Node mainPageRoot;
 
+    // ---- Shared "secondary" borderless windows (Settings / Server Management / Change Version) ----
+    // All open like the Mods window (borderless + themed + draggable + resizable). Each opens on
+    // its own over the launcher -- opening one does NOT reopen the others. Re-opening one that's
+    // already open just focuses it instead of spawning a duplicate.
+    private final java.util.LinkedHashMap<String, javafx.stage.Stage> shellWindows = new java.util.LinkedHashMap<>();
+
     // ---- Main page: VANILLA / DEY mode toggle + version-filter tiles ----
     /** How a tile narrows the full version list down to what shows in the Version dropdown. */
     private enum FilterKind { ALL, MIN_MAJOR, FAMILY }
@@ -156,7 +167,7 @@ public class LauncherApp extends Application {
         this.darkMode = prefs.darkMode;
         this.identityStore = new IdentityStore(gameFiles.root);
         this.settings = new GameLauncher.LaunchSettings(prefs.ramMinMb, prefs.ramMaxMb,
-                prefs.gameWidth, prefs.gameHeight, prefs.fullscreen);
+                prefs.gameWidth, prefs.gameHeight, prefs.fullscreen, prefs.softwareOpenGl);
         this.friendsCache = new FriendsCache(gameFiles.root);
         this.serverStore = new ServerStore(gameFiles.root);
         this.addedServersStore = new AddedServersStore(gameFiles.root);
@@ -1177,17 +1188,6 @@ public class LauncherApp extends Application {
     private TextArea serverConsoleArea;
 
     private void openServerManagementDialog(ServerInstance server) {
-        Dialog<Void> dialog = new Dialog<>();
-        dialog.setTitle(server.name);
-        dialog.getDialogPane().getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
-        dialog.getDialogPane().getStylesheets().add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
-        dialog.getDialogPane().getStyleClass().addAll("root-pane", darkMode ? "theme-dark" : "theme-light");
-        dialog.getDialogPane().getButtonTypes().addAll(ButtonType.CLOSE);
-        dialog.setResizable(true);
-        dialog.getDialogPane().setPrefSize(880, 680);
-        dialog.getDialogPane().setMinWidth(620);
-        dialog.getDialogPane().setMinHeight(480);
-
         TabPane tabs = new TabPane();
         tabs.getStyleClass().add("account-skin-tabs");
         tabs.setTabClosingPolicy(TabPane.TabClosingPolicy.UNAVAILABLE);
@@ -1198,10 +1198,14 @@ public class LauncherApp extends Application {
                 new Tab("Addons", buildServerAddonsTab(server)),
                 new Tab("Files", buildServerFilesTab(server)),
                 new Tab("Settings", buildServerSettingsTab(server)),
-                new Tab("Permissions", buildServerPermissionsTab(server, dialog))
+                new Tab("Permissions", buildServerPermissionsTab(server))
         );
-        dialog.getDialogPane().setContent(tabs);
-        dialog.showAndWait();
+        // Borderless (Mods-style) window, sized larger so all the console/properties/players/etc.
+        // tabs have room to breathe (proportional to the display, like the Mods window).
+        javafx.geometry.Rectangle2D vb = javafx.stage.Screen.getPrimary().getVisualBounds();
+        double w = Math.max(960, Math.min(1560, vb.getWidth() * 0.85));
+        double h = Math.max(700, Math.min(1040, vb.getHeight() * 0.88));
+        openShellWindow("server-" + server.id, server.name, tabs, 700, 540, w, h);
     }
 
 /**
@@ -2327,8 +2331,8 @@ public class LauncherApp extends Application {
                 // If we've already enriched this addon to a Modrinth project, show its cached icon.
                 String addonSlug = addonSlugByBase.get(normalizeAddonBase(baseName));
                 Node iconTile = (addonSlug != null)
-                        ? modIconNode(modrinthIconPath(addonSlug), 44)
-                        : modIconNode(null, 44);
+                        ? modIconNode(modrinthIconPath(addonSlug), 52)
+                        : modIconNode(null, 52);
                 if (addonSlug != null) {
                     iconTile.setCursor(javafx.scene.Cursor.HAND);
                     final String clickSlug = addonSlug;
@@ -2381,7 +2385,7 @@ public class LauncherApp extends Application {
             }
             // Best-effort: attach icons (+ click-through pages) to installed addons by matching
             // their display/file names against Modrinth, in the background so the list never blocks.
-            enrichAddonIconsAsync(addons, folderKind, listBox, server, renderAddonsHolder[0]);
+            enrichAddonIconsAsync(addonsManager, addons, folderKind, listBox, server, renderAddonsHolder[0]);
         };
         renderAddonsHolder[0] = renderAddons;
 
@@ -2469,7 +2473,8 @@ public class LauncherApp extends Application {
      * Modrinth project for, search by its base file name, cache the slug, download its icon, then
      * re-render the list so the icon + click-through appear and the placeholder tile gets replaced.
      */
-    private void enrichAddonIconsAsync(List<ServerAddonsManager.AddonEntry> addons, String folderKind,
+    private void enrichAddonIconsAsync(ServerAddonsManager addonsManager,
+                                       List<ServerAddonsManager.AddonEntry> addons, String folderKind,
                                        VBox listBox, ServerInstance server, Runnable renderAddons) {
         List<ServerAddonsManager.AddonEntry> pending = addons.stream()
                 .filter(a -> !addonSlugByBase.containsKey(normalizeAddonBase(a.fileName())))
@@ -2483,7 +2488,8 @@ public class LauncherApp extends Application {
                 String type = ModrinthClient.projectTypeFor(server.type);
                 for (var addon : pending) {
                     String key = normalizeAddonBase(addon.fileName());
-                    var hit = client.firstHitByName(key, type);
+                    var hit = client.firstHitBySlugOrName(addonsManager.addonSlug(addon.fileName()),
+                            addon.displayName(), type);
                     if (hit == null || hit.slug().isBlank()) {
                         addonSlugByBase.put(key, "");
                         continue;
@@ -2555,7 +2561,7 @@ public class LauncherApp extends Application {
      * mod's display name on Modrinth, cache the slug + icon, then re-render the rows so the icon and
      * the click-through-to-Modrinth page appear. Client mods are always project_type "mod" on Modrinth.
      */
-    private void enrichModIconsAsync(List<ModsManager.ModEntry> mods, Runnable refresh) {
+    private void enrichModIconsAsync(ModsManager modsManager, List<ModsManager.ModEntry> mods, Runnable refresh) {
         List<ModsManager.ModEntry> pending = mods.stream()
                 .filter(m -> !addonSlugByBase.containsKey(normalizeAddonBase(m.fileName())))
                 .toList();
@@ -2567,7 +2573,8 @@ public class LauncherApp extends Application {
                 ModrinthClient client = new ModrinthClient();
                 for (var m : pending) {
                     String key = normalizeAddonBase(m.fileName());
-                    var hit = client.firstHitByName(m.displayName(), "mod");
+                    var hit = client.firstHitBySlugOrName(modsManager.modSlug(m.fileName()),
+                            m.displayName(), "mod");
                     if (hit == null || hit.slug().isBlank()) {
                         addonSlugByBase.put(key, "");
                         continue;
@@ -2596,24 +2603,12 @@ public class LauncherApp extends Application {
     private void showModrinthVersionPicker(String projectName, String slug, String projectType,
                                            String mcVersion, java.nio.file.Path iconPath, String iconUrl,
                                            Path targetFolder, String replaceSlug, Runnable onInstalled) {
-        Dialog<Void> d = new Dialog<>();
-        d.initOwner(stage);
-        d.initModality(Modality.WINDOW_MODAL);
-        d.setTitle("Version -- " + projectName);
-        d.getDialogPane().getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
-        d.getDialogPane().getStylesheets().add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
-        d.getDialogPane().getStyleClass().addAll("root-pane", darkMode ? "theme-dark" : "theme-light");
-        d.getDialogPane().getButtonTypes().addAll(ButtonType.CLOSE);
-        d.getDialogPane().setPrefSize(560, 460);
-        d.getDialogPane().setMinWidth(440);
-        d.getDialogPane().setMinHeight(300);
-
         VBox box = new VBox(14);
         box.setPadding(new Insets(20));
         box.getStyleClass().add("mods-dialog-content");
 
-        Node icon = iconPath != null ? modIconNode(iconPath, 44)
-                : (iconUrl != null ? remoteModIcon(iconUrl, 44) : modIconNode(null, 44));
+        Node icon = iconPath != null ? modIconNode(iconPath, 56)
+                : (iconUrl != null ? remoteModIcon(iconUrl, 56) : modIconNode(null, 56));
         final String pageUrl = ModrinthClient.projectPageUrl(slug, projectType);
         icon.setCursor(javafx.scene.Cursor.HAND);
         icon.setOnMouseClicked(ev -> openUrl(pageUrl));
@@ -2719,9 +2714,14 @@ public class LauncherApp extends Application {
         box.getChildren().addAll(header,
                 sectionLabel("PICK A VERSION"), versionBox,
                 buttonRow, status);
-        d.getDialogPane().setContent(box);
+        // Owned by whichever window invoked it (the Mods window when changing a client mod), modal
+        // so it reliably overlays that window -- but still borderless, styled like the Mods window.
+        javafx.stage.Window owner = javafx.stage.Window.getWindows().stream()
+                .filter(javafx.stage.Window::isFocused).findFirst().orElse(stage);
+        Stage pick = buildBorderlessStage("Version -- " + projectName, box, owner,
+                Modality.WINDOW_MODAL, 440, 300, 560, 460);
         load.run();
-        d.showAndWait();
+        pick.showAndWait();
     }
 
     /** Removes any jar (or disabled .jar.disabled copy) in folder whose name starts with the
@@ -2977,7 +2977,7 @@ public class LauncherApp extends Application {
         return tabShell(scroll, saveBtn, savedNote);
     }
 
-    private Node buildServerPermissionsTab(ServerInstance server, Dialog<Void> dialog) {
+    private Node buildServerPermissionsTab(ServerInstance server) {
         VBox box = new VBox(16);
         box.setPadding(new Insets(20));
         ScrollPane scroll = new ScrollPane(box);
@@ -3302,7 +3302,7 @@ public class LauncherApp extends Application {
             modLoaderBox.setDisable(false);
             mainDescriptionLabel.setText(
                     "DEY builds run a curated set of performance and quality-of-life mods -- "
-                            + "Sodium + Fabric API install automatically, no setup needed.");
+                            + "Sodium + Iris (shaders) + Fabric API install automatically, no setup needed.");
         } else {
             modLoaderBox.getItems().addAll("Vanilla", "Fabric", "Forge");
             modLoaderBox.setValue("Vanilla");
@@ -3457,22 +3457,22 @@ public class LauncherApp extends Application {
         return files.root.resolve("instances").resolve(versionId + suffix);
     }
 
+    /**
+     * Sodium↔Iris conflict disarming: true when an active performance mod (Sodium on Fabric,
+     * Embeddium on Forge) is present in this instance's mods folder. Iris is only meaningful on
+     * top of one of those backends, so when none is present for the selected Minecraft version we
+     * must not leave an active Iris jar (see {@link IrisInstaller#disableActive}).
+     */
+    private boolean sodiumBackendPresent(Path modsDir) {
+        return ModsUtil.firstFamilyJar(modsDir, "sodium-") != null
+                || ModsUtil.firstFamilyJar(modsDir, "embeddium-") != null;
+    }
+
     private void openModsDialog() {
         ModsManager mods = new ModsManager(currentInstanceDir());
-
-        Dialog<Void> dialog = new Dialog<>();
-        dialog.initOwner(stage);
-        dialog.initModality(Modality.WINDOW_MODAL);
-        dialog.setTitle("Mods -- " + versionBox.getValue() + " (" + modLoaderBox.getValue() + ")");
-        dialog.getDialogPane().getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
-        dialog.getDialogPane().getStylesheets().add(
-                DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
-        dialog.getDialogPane().getStyleClass().addAll("root-pane", darkMode ? "theme-dark" : "theme-light");
-        dialog.getDialogPane().getButtonTypes().addAll(ButtonType.CLOSE);
-        dialog.setResizable(true);
-        dialog.getDialogPane().setPrefSize(560, 520);
-        dialog.getDialogPane().setMinWidth(420);
-        dialog.getDialogPane().setMinHeight(360);
+        String windowTitle = "Mods -- " + versionBox.getValue() + " (" + modLoaderBox.getValue() + ")";
+        String mcVersion = versionBox.getValue();
+        String modLoader = modLoaderBox.getValue();
 
         VBox rowsBox = new VBox(10);
         ScrollPane scroll = new ScrollPane(rowsBox);
@@ -3481,7 +3481,7 @@ public class LauncherApp extends Application {
         VBox.setVgrow(scroll, Priority.ALWAYS);
 
         Label dropZone = new Label(
-            "Drag & drop mod .jar files here, or use Add Mods below"
+            "Drag & drop mod .jar files anywhere in this window, or use Add Mods below"
         );
         dropZone.setGraphic(icon(IconFactory.Icon.DOWNLOAD, 20));
         dropZone.setGraphicTextGap(8);
@@ -3491,6 +3491,29 @@ public class LauncherApp extends Application {
 
         Button addBtn = new Button("+  Add Mods");
         addBtn.getStyleClass().add("pill-button");
+        addBtn.setMaxWidth(Double.MAX_VALUE);
+
+        // Shown only when at least one installed (non-bundled) mod is incompatible with the
+        // currently selected Minecraft version -- see refreshFixStatus(). Clicking it converts the
+        // mods to a version that works on this MC version, or removes them if none exists on Modrinth.
+        Button fixBtn = new Button();
+        setButtonIcon(fixBtn, IconFactory.Icon.TOOLS, "Fix Mods");
+        fixBtn.getStyleClass().addAll("pill-button", "fix-button");
+        fixBtn.setMaxWidth(Double.MAX_VALUE);
+        fixBtn.setVisible(false);
+        fixBtn.setManaged(false);
+
+        HBox buttonRow = new HBox(10, addBtn, fixBtn);
+        HBox.setHgrow(addBtn, Priority.ALWAYS);
+        HBox.setHgrow(fixBtn, Priority.ALWAYS);
+        buttonRow.setAlignment(Pos.CENTER);
+
+        Label fixStatus = new Label();
+        fixStatus.getStyleClass().add("notice-label");
+        fixStatus.setWrapText(true);
+        fixStatus.setMaxWidth(Double.MAX_VALUE);
+        fixStatus.setVisible(false);
+        fixStatus.setManaged(false);
 
         Runnable[] refreshHolder = new Runnable[1];
         Runnable refresh = () -> {
@@ -3508,6 +3531,7 @@ public class LauncherApp extends Application {
                     String family = null;
                     if (deyMode) {
                         if (fn.startsWith("sodium-") || fn.startsWith("embeddium-")) family = "perf";
+                        else if (fn.startsWith("iris-")) family = "iris";
                         else if (fn.startsWith("fabric-api-")) family = "fabric-api";
                         else if (fn.startsWith("deycapes-")) family = "deycapes";
                     }
@@ -3528,14 +3552,17 @@ public class LauncherApp extends Application {
                 }
                 // Best-effort: attach Modrinth icons (+ click-through pages) to installed mods by
                 // matching their display names, in the background so the list never blocks.
-                if (!list.isEmpty()) enrichModIconsAsync(list, refreshHolder[0]);
+                if (!list.isEmpty()) enrichModIconsAsync(mods, list, refreshHolder[0]);
                 if (list.isEmpty()) {
                     Label empty = new Label(deyMode
-                            ? "No mods yet -- Sodium/Embeddium, Fabric API, and DeyCapes install automatically the first time you hit Play."
+                            ? "No mods yet -- Sodium, Iris, Fabric API, and DeyCapes install automatically the first time you hit Play."
                             : "No mods yet -- drag some in above.");
                     empty.getStyleClass().add("notice-label");
                     rowsBox.getChildren().add(empty);
                 }
+                // Reveal/hide the Fix button based on whether any installed mod is incompatible
+                // with the currently selected Minecraft version. Runs in the background.
+                refreshFixStatus(mods, list, fixBtn, fixStatus, mcVersion);
             } catch (Exception ex) {
                 log("Failed to list mods: " + ex.getMessage());
             }
@@ -3545,14 +3572,21 @@ public class LauncherApp extends Application {
         // Best-effort: try to have the bundled mods ready by the time the dialog opens too, not
         // just on Play, so the list already reflects reality instead of only updating after a
         // launch. Performance mod: Sodium on Fabric, Embeddium on Forge. Fabric API: Fabric only.
-        if (deyMode && versionBox.getValue() != null) {
-            String mcVersion = versionBox.getValue();
-            String modLoader = modLoaderBox.getValue();
+        if (deyMode && mcVersion != null && !mcVersion.isBlank()) {
             Task<Void> installTask = new Task<>() {
                 @Override
                 protected Void call() throws Exception {
                     new SodiumInstaller(modLoader).ensureInstalled(mcVersion, mods.modsDir());
                     if ("Fabric".equals(modLoader)) {
+                        // Sodium↔Iris conflict disarming: Iris needs Sodium as its runtime backend.
+                        // If the performance mod can't run for this version (no compatible build), do
+                        // not leave active Iris jars around either -- that pair is what crashed on DEY
+                        // 26.2. Disabling (never deleting) keeps the game loadable without shaders.
+                        if (sodiumBackendPresent(mods.modsDir())) {
+                            new IrisInstaller().ensureInstalled(mcVersion, mods.modsDir());
+                        } else {
+                            new IrisInstaller().disableActive(mods.modsDir());
+                        }
                         new FabricApiInstaller().ensureInstalled(mcVersion, mods.modsDir());
                         new DeyCapesInstaller().ensureInstalled(mcVersion, mods.modsDir());
                     }
@@ -3560,7 +3594,7 @@ public class LauncherApp extends Application {
                 }
             };
             installTask.setOnSucceeded(e -> refresh.run());
-            installTask.setOnFailed(e -> { /* silent here -- onPlay() reports failures to the log */ });
+            installTask.setOnFailed(e -> refresh.run());
             new Thread(installTask, "dey-mod-installer").start();
         }
 
@@ -3568,7 +3602,7 @@ public class LauncherApp extends Application {
             FileChooser chooser = new FileChooser();
             chooser.setTitle("Select mod jars");
             chooser.getExtensionFilters().add(new FileChooser.ExtensionFilter("Mod jars", "*.jar"));
-            List<java.io.File> picked = chooser.showOpenMultipleDialog(dialog.getOwner());
+            List<java.io.File> picked = chooser.showOpenMultipleDialog(modsWindowOwner.get());
             if (picked != null) {
                 for (var f : picked) {
                     try {
@@ -3581,18 +3615,45 @@ public class LauncherApp extends Application {
             }
         });
 
-        dropZone.setOnDragOver(e -> {
+        fixBtn.setOnAction(e -> runFixIncompatibleMods(mods, fixBtn, fixStatus, refresh, mcVersion));
+
+        VBox content = new VBox(12, dropZone, fixStatus, scroll, buttonRow);
+        content.setPadding(new Insets(20));
+        content.getStyleClass().add("mods-dialog-content");
+        VBox.setVgrow(scroll, Priority.ALWAYS);
+
+        // Drag & drop works across the ENTIRE window, not just the drop-zone label.
+        installModsDropTarget(content, mods, refresh);
+        installModsDropTarget(rowsBox, mods, refresh);
+        installModsDropTarget(scroll, mods, refresh);
+
+        // Borderless, resizable Mods window sized proportionally to the display.
+        Stage win = buildModsWindowStage(windowTitle, content);
+        modsWindowOwner.set(win);
+        refresh.run();
+        win.showAndWait();
+    }
+/** Lives only for the (blocking) openModsDialog() call, so the file chooser can center on it. */
+    private final java.util.concurrent.atomic.AtomicReference<javafx.stage.Window> modsWindowOwner =
+            new java.util.concurrent.atomic.AtomicReference<>();
+
+    /**
+     * Attaches the "import mod .jar files" drag & drop behaviour to an arbitrary node, so dropping a
+     * jar anywhere in the Mods window adds it, instead of only working inside the small drop-zone label.
+     */
+    private void installModsDropTarget(Node node, ModsManager mods, Runnable refresh) {
+        node.setOnDragOver(e -> {
             if (e.getDragboard().hasFiles()) e.acceptTransferModes(TransferMode.COPY);
             e.consume();
         });
-        dropZone.setOnDragEntered(e -> dropZone.getStyleClass().add("drop-zone-active"));
-        dropZone.setOnDragExited(e -> dropZone.getStyleClass().remove("drop-zone-active"));
-        dropZone.setOnDragDropped(e -> {
+        node.setOnDragEntered(e -> node.getStyleClass().add("drop-zone-active"));
+        node.setOnDragExited(e -> node.getStyleClass().remove("drop-zone-active"));
+        node.setOnDragDropped(e -> {
             var db = e.getDragboard();
             boolean success = false;
             if (db.hasFiles()) {
                 for (var f : db.getFiles()) {
-                    if (f.getName().endsWith(".jar")) {
+                    if (f.getName().toLowerCase().endsWith(".jar")) {
                         try {
                             mods.addMod(f.toPath());
                             success = true;
@@ -3604,18 +3665,417 @@ public class LauncherApp extends Application {
             }
             e.setDropCompleted(success);
             e.consume();
+            if (success) refresh.run();
+        });
+    }
+
+    /** True if a file belongs to one of the auto-bundled DEY mod families. Bundled mods can be
+     *  updated/downgraded but NEVER deleted, so they're always excluded from the Fix logic. */
+    private boolean isBundledFamily(String fileName) {
+        String fn = fileName.toLowerCase();
+        return fn.startsWith("sodium-") || fn.startsWith("embeddium-")
+                || fn.startsWith("iris-") || fn.startsWith("fabric-api-") || fn.startsWith("deycapes-");
+    }
+
+    /** Hides the Fix controls (used whenever a scan finds nothing incompatible). Must run on the FX thread. */
+    private void hideFixControls(Button fixBtn, Label fixStatus) {
+        fixBtn.setVisible(false);
+        fixBtn.setManaged(false);
+        fixStatus.setVisible(false);
+        fixStatus.setManaged(false);
+    }
+/**
+     * Scans installed mods (skipping bundled ones) in the background and reveals the Fix button if at
+     * least one is incompatible with the currently selected Minecraft version. Never touches the UI
+     * from the worker thread -- only flips the button via Platform.runLater.
+     */
+    private void refreshFixStatus(ModsManager mods, List<ModsManager.ModEntry> list,
+                                  Button fixBtn, Label fixStatus, String mcVersion) {
+        java.util.List<ModsManager.ModEntry> candidates = list.stream()
+                .filter(m -> !isBundledFamily(m.fileName()))
+                .toList();
+        if (candidates.isEmpty() || mcVersion == null || mcVersion.isBlank()) {
+            hideFixControls(fixBtn, fixStatus);
+            return;
+        }
+        Task<Boolean> task = new Task<>() {
+            @Override
+            protected Boolean call() {
+                ModrinthClient client = new ModrinthClient();
+                for (var m : candidates) {
+                    String slug = resolveModSlug(client, mods, m);
+                    if (slug == null) continue; // can't identify the project -> leave untouched
+                    try {
+                        var compatible = client.compatibleVersionsLenient(slug, mcVersion);
+                        if (compatible.isEmpty()) return true; // no build for this MC version -> incompatible
+                        boolean installedMatches = compatible.stream()
+                                .anyMatch(v -> ModrinthClient.versionFileMatches(v, m.fileName()));
+                        if (!installedMatches) return true; // a compatible version exists but installed build is stale/wrong
+                    } catch (Exception ignored) {
+                        // Couldn't reach Modrinth for this one -- keep checking the rest.
+                    }
+                }
+                return false;
+            }
+        };
+        task.setOnSucceeded(e -> Platform.runLater(() -> {
+            boolean fix = Boolean.TRUE.equals(task.getValue());
+            fixBtn.setVisible(fix);
+            fixBtn.setManaged(fix);
+            fixStatus.setVisible(fix);
+            fixStatus.setManaged(fix);
+            if (fix) {
+                fixStatus.setText("Some installed mods aren't compatible with Minecraft " + mcVersion
+                        + ". Click Fix Mods to convert them to a working version (or remove them if "
+                        + "no compatible version exists).");
+            }
+        }));
+        task.setOnFailed(e -> Platform.runLater(() -> hideFixControls(fixBtn, fixStatus)));
+        new Thread(task, "mod-compat-scan").start();
+    }
+
+    /** Resolves an installed mod to its Modrinth slug: metadata id first, display-name search as a fallback. */
+    private String resolveModSlug(ModrinthClient client, ModsManager mods, ModsManager.ModEntry m) {
+        String key = normalizeAddonBase(m.fileName());
+        String cached = addonSlugByBase.get(key);
+        if (cached != null && !cached.isBlank()) return cached;
+        var hit = client.firstHitBySlugOrName(mods.modSlug(m.fileName()), m.displayName(), "mod");
+        if (hit == null || hit.slug().isBlank()) return null;
+        addonSlugByBase.put(key, hit.slug());
+        return hit.slug();
+    }
+/**
+     * The Fix action: for each installed NON-bundled mod that is incompatible with the current MC
+     * version, download the newest compatible build from Modrinth and replace the installed jar; if
+     * the project has no build for this MC version at all, remove the mod. Bundled DEY mods are never
+     * touched here (they're repaired by their own installers). Runs in the background and re-renders +
+     * summarizes on completion.
+     */
+    private void runFixIncompatibleMods(ModsManager mods, Button fixBtn, Label fixStatus,
+                                        Runnable refresh, String mcVersion) {
+        if (mcVersion == null || mcVersion.isBlank()) return;
+        fixBtn.setDisable(true);
+        fixStatus.setText("Checking each installed mod against Minecraft " + mcVersion + "...");
+        fixStatus.setVisible(true);
+        fixStatus.setManaged(true);
+        Task<String> task = new Task<>() {
+            @Override
+            protected String call() {
+                ModrinthClient client = new ModrinthClient();
+                StringBuilder detail = new StringBuilder();
+                int fixed = 0, removed = 0, skipped = 0;
+                try {
+                    for (var m : mods.list()) {
+                        if (isBundledFamily(m.fileName())) { skipped++; continue; } // bundled mods: never delete
+                        String slug = resolveModSlug(client, mods, m);
+                        if (slug == null) { skipped++; continue; }
+                        var compatible = client.compatibleVersionsLenient(slug, mcVersion);
+                        if (compatible.isEmpty()) {
+                            // No version of this mod supports the current MC version on Modrinth -> remove it.
+                            try {
+                                mods.delete(m.fileName());
+                                removed++;
+                                detail.append("  • Removed ").append(m.fileName())
+                                        .append(" -- no version supports ").append(mcVersion).append(".\n");
+                            } catch (Exception ex) {
+                                skipped++;
+                            }
+                            continue;
+                        }
+                        boolean installedMatches = compatible.stream()
+                                .anyMatch(v -> ModrinthClient.versionFileMatches(v, m.fileName()));
+                        if (installedMatches) continue; // already a compatible build
+                        ModrinthClient.ProjectVersion target = compatible.get(0); // newest compatible
+                        try {
+                            Path downloaded = client.download(target, mods.modsDir());
+                            try { deleteJarsForSlug(mods.modsDir(), slug, downloaded); } catch (Exception ignored) {}
+                            // "Converted" means the replacement replaces it one-for-one: remove the
+                            // original (incompatible) jar too, so only the new, compatible version
+                            // remains -- never leave both versions of the same mod installed.
+                            try {
+                                if (!downloaded.getFileName().toString().equals(m.fileName())) {
+                                    mods.delete(m.fileName());
+                                }
+                            } catch (Exception ignored) {}
+                            fixed++;
+                            detail.append("  • Converted ").append(m.displayName()).append(" to version ")
+                                    .append(target.versionNumber()).append(" (").append(mcVersion).append(").\n");
+                        } catch (Exception ex) {
+                            skipped++;
+                        }
+                    }
+                } catch (Exception ex) {
+                    return "ERROR\n" + ex.getMessage();
+                }
+                return "FIXED " + fixed + "\nREMOVED " + removed + "\n" + detail;
+            }
+        };
+        task.setOnSucceeded(ev -> Platform.runLater(() -> {
+            fixBtn.setDisable(false);
+            hideFixControls(fixBtn, fixStatus);
+            String result = task.getValue();
             refresh.run();
+            if (result != null && !result.startsWith("ERROR")) log(result.replace('\n', ' '));
+            new Alert(Alert.AlertType.INFORMATION, formatFixResult(result), ButtonType.OK).showAndWait();
+        }));
+        task.setOnFailed(ev -> Platform.runLater(() -> {
+            fixBtn.setDisable(false);
+            hideFixControls(fixBtn, fixStatus);
+            refresh.run();
+        }));
+        new Thread(task, "mod-compat-fix").start();
+    }
+
+    /** Turns the raw Fix task result into a short, human-friendly summary for the finishing alert. */
+    private String formatFixResult(String result) {
+        if (result == null) return "Nothing to fix -- all installed mods are already compatible with the current Minecraft version.";
+        if (result.startsWith("ERROR")) {
+            return "Couldn't fix your mods (please check the launcher log):\n" + result.substring(6);
+        }
+        int fixed = 0, removed = 0;
+        StringBuilder bullets = new StringBuilder();
+        for (String line : result.split("\n")) {
+            if (line.startsWith("FIXED ")) fixed = parseIntOr(line.substring(6).trim(), 0);
+            else if (line.startsWith("REMOVED ")) removed = parseIntOr(line.substring(8).trim(), 0);
+            else if (line.startsWith("  •")) bullets.append(line).append('\n');
+        }
+        StringBuilder sb = new StringBuilder();
+        if (fixed == 0 && removed == 0) {
+            sb.append("All installed mods are already compatible -- nothing to fix.");
+        } else {
+            sb.append("Done. Converted ").append(fixed).append(" mod(s) and removed ").append(removed)
+                    .append(" incompatible mod(s) with no working version.\n\nDetails:\n");
+            sb.append(bullets);
+        }
+        return sb.toString();
+    }
+/**
+     * Builds the Mods window: an undecorated (borderless) window that stays in sync with the
+     * launcher's theme, is draggable via its header, resizable from its edges, and opens by default
+     * at a size proportional to the display -- wider and taller than the old 560x520 dialog.
+     */
+    private Stage buildModsWindowStage(String title, Node center) {
+        Stage win = new Stage();
+        win.initOwner(stage);
+        win.initModality(Modality.WINDOW_MODAL);
+        win.initStyle(javafx.stage.StageStyle.UNDECORATED);
+        win.setTitle(title);
+
+        Label titleLbl = new Label(title);
+        titleLbl.getStyleClass().add("mods-win-title");
+
+        Button closeBtn = new Button(" \u00D7 ");
+        closeBtn.getStyleClass().add("mods-win-close");
+        closeBtn.setOnAction(e -> win.close());
+
+        Region spacer = new Region();
+        HBox.setHgrow(spacer, Priority.ALWAYS);
+        HBox header = new HBox(10, titleLbl, spacer, closeBtn);
+        header.setAlignment(Pos.CENTER_LEFT);
+        header.getStyleClass().add("mods-win-header");
+
+        BorderPane root = new BorderPane();
+        root.setTop(header);
+        root.setCenter(center);
+        root.getStyleClass().addAll("root-pane", "mods-win-root", darkMode ? "theme-dark" : "theme-light");
+
+        Scene sc = new Scene(root);
+        sc.getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
+        sc.getStylesheets().add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
+        win.setScene(sc);
+
+        // Default size proportional to the display (fits any screen) and comfortably large.
+        javafx.geometry.Rectangle2D vb = javafx.stage.Screen.getPrimary().getVisualBounds();
+        double w = Math.max(920, Math.min(1400, vb.getWidth() * 0.8));
+        double h = Math.max(640, Math.min(900, vb.getHeight() * 0.82));
+        win.setWidth(w);
+        win.setHeight(h);
+        win.setMinWidth(860);
+        win.setMinHeight(580);
+        win.centerOnScreen();
+
+        enableWindowChrome(win, root, header);
+
+        win.setOnCloseRequest(e -> win.hide());
+        return win;
+    }
+
+    /** Lets a custom (borderless) undecorated window be moved (drag its header) and resized from any
+     *  edge or corner. As you hover each boundary it shows the matching OS resize cursor arrow:
+     *  N/S vertical, E/W horizontal, and both diagonals (NW/SE and NE/SW). Applied to EVERY custom
+     *  window (Mods, Settings, Server Management, version picker) via the shared stage builders. */
+    private void enableWindowChrome(Stage win, Node root, Node header) {
+        final double BORDER = 8;
+        final double[] start = new double[2];   // screen x,y at press
+        final double[] orig = new double[4];    // window x,y,w,h at press
+        final double[] dragOff = new double[2]; // grab offset within the header
+        final boolean[] west = new boolean[1], east = new boolean[1],
+                       north = new boolean[1], south = new boolean[1];
+        final boolean[] resizing = new boolean[1], dragging = new boolean[1];
+
+        java.util.function.BiConsumer<Double, Double> zone = (px, py) -> {
+            double w = root.getLayoutBounds().getWidth();
+            double h = root.getLayoutBounds().getHeight();
+            west[0] = px <= BORDER;
+            east[0] = px >= w - BORDER;
+            north[0] = py <= BORDER;
+            south[0] = py >= h - BORDER;
+        };
+
+        java.util.function.DoubleSupplier headerBottom = () -> {
+            double bh = header.getBoundsInParent().getHeight();
+            return bh > 0 ? header.getBoundsInParent().getMaxY() : header.prefHeight(-1);
+        };
+
+        Runnable updateCursor = () -> {
+            if (west[0] && north[0]) root.setCursor(javafx.scene.Cursor.NW_RESIZE);      // diagonal
+            else if (east[0] && north[0]) root.setCursor(javafx.scene.Cursor.NE_RESIZE);  // other diagonal
+            else if (west[0] && south[0]) root.setCursor(javafx.scene.Cursor.SW_RESIZE);  // other diagonal
+            else if (east[0] && south[0]) root.setCursor(javafx.scene.Cursor.SE_RESIZE);  // diagonal
+            else if (west[0] || east[0]) root.setCursor(javafx.scene.Cursor.H_RESIZE);    // horizontal
+            else if (north[0] || south[0]) root.setCursor(javafx.scene.Cursor.V_RESIZE);  // vertical
+            else root.setCursor(javafx.scene.Cursor.DEFAULT);
+        };
+
+        root.setOnMouseMoved(e -> {
+            zone.accept(e.getX(), e.getY());
+            updateCursor.run();
         });
 
-        VBox content = new VBox(14, dropZone, scroll, addBtn);
-        content.setPadding(new Insets(20));
-        content.getStyleClass().add("mods-dialog-content");
-        VBox.setVgrow(scroll, Priority.ALWAYS);
+        root.setOnMousePressed(e -> {
+            if (!e.isPrimaryButtonDown()) return;
+            zone.accept(e.getX(), e.getY());
+            start[0] = e.getScreenX(); start[1] = e.getScreenY();
+            orig[0] = win.getX(); orig[1] = win.getY(); orig[2] = win.getWidth(); orig[3] = win.getHeight();
+            boolean edge = west[0] || east[0] || north[0] || south[0];
+            if (edge) {
+                resizing[0] = true; dragging[0] = false;
+            } else if (e.getY() <= headerBottom.getAsDouble()) {
+                dragOff[0] = e.getScreenX() - win.getX();
+                dragOff[1] = e.getScreenY() - win.getY();
+                dragging[0] = true; resizing[0] = false;
+            } else {
+                dragging[0] = false; resizing[0] = false;
+            }
+        });
 
-        dialog.getDialogPane().setContent(content);
-        refresh.run();
-        dialog.showAndWait();
+        root.setOnMouseDragged(e -> {
+            if (!e.isPrimaryButtonDown()) return;
+            if (resizing[0]) {
+                double dx = e.getScreenX() - start[0];
+                double dy = e.getScreenY() - start[1];
+                double nw = orig[2] + (east[0] ? dx : 0) - (west[0] ? dx : 0);
+                double nh = orig[3] + (south[0] ? dy : 0) - (north[0] ? dy : 0);
+                nw = Math.max(win.getMinWidth(), nw);
+                nh = Math.max(win.getMinHeight(), nh);
+                double nx = orig[0];
+                double ny = orig[1];
+                if (west[0]) nx = orig[0] + (orig[2] - nw);
+                if (north[0]) ny = orig[1] + (orig[3] - nh);
+                win.setX(nx);
+                win.setY(ny);
+                win.setWidth(nw);
+                win.setHeight(nh);
+            } else if (dragging[0]) {
+                win.setX(e.getScreenX() - dragOff[0]);
+                win.setY(e.getScreenY() - dragOff[1]);
+            }
+        });
+
+        root.setOnMouseReleased(e -> {
+            resizing[0] = false;
+            dragging[0] = false;
+            zone.accept(e.getX(), e.getY());
+            updateCursor.run();
+        });
+
+        root.setOnMouseExited(e -> {
+            if (!resizing[0] && !dragging[0]) root.setCursor(javafx.scene.Cursor.DEFAULT);
+        });
     }
+
+    /** Builds a generic borderless (undecorated) window styled exactly like the Mods window --
+     *  draggable via its header, resizable from its edges, and matching the launcher's theme.
+     *  All the "secondary" windows (Settings, Server Management, Change Version) are built through
+     *  this so they share the Mods window's look, instead of the old bordered OS dialogs. */
+    private Stage buildBorderlessStage(String title, Node center, javafx.stage.Window owner,
+                                       Modality modality, double minW, double minH,
+                                       double prefW, double prefH) {
+        Stage win = new Stage();
+        if (owner != null) win.initOwner(owner);
+        win.initModality(modality);
+        win.initStyle(javafx.stage.StageStyle.UNDECORATED);
+        win.setTitle(title);
+
+        Label titleLbl = new Label(title);
+        titleLbl.getStyleClass().add("mods-win-title");
+
+        Button closeBtn = new Button(" \u00D7 ");
+        closeBtn.getStyleClass().add("mods-win-close");
+        closeBtn.setOnAction(e -> win.close());
+
+        Region spacer = new Region();
+        HBox.setHgrow(spacer, Priority.ALWAYS);
+        HBox header = new HBox(10, titleLbl, spacer, closeBtn);
+        header.setAlignment(Pos.CENTER_LEFT);
+        header.getStyleClass().add("mods-win-header");
+
+        BorderPane root = new BorderPane();
+        root.setTop(header);
+        root.setCenter(center);
+        root.getStyleClass().addAll("root-pane", "mods-win-root", darkMode ? "theme-dark" : "theme-light");
+
+        Scene sc = new Scene(root);
+        sc.getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
+        sc.getStylesheets().add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
+        win.setScene(sc);
+
+        win.setMinWidth(minW);
+        win.setMinHeight(minH);
+        win.setWidth(prefW);
+        win.setHeight(prefH);
+
+        enableWindowChrome(win, root, header);
+        win.setOnCloseRequest(e -> win.hide());
+        return win;
+    }
+
+
+    /** The shared entry point every secondary window goes through. Re-opens (focuses) an already
+     *  open one, otherwise builds it borderless and shows just that one window over the launcher --
+     *  it no longer reopens the other secondary windows. */
+    private Stage openShellWindow(String key, String title, Node content, double minW, double minH,
+                                  double prefW, double prefH) {
+        Stage existing = shellWindows.get(key);
+        if (existing != null && existing.isShowing()) {
+            existing.toFront();
+            existing.requestFocus();
+            return existing;
+        }
+        Stage win = buildBorderlessStage(title, content, stage, Modality.NONE,
+                minW, minH, prefW, prefH);
+        shellWindows.put(key, win);
+        win.setOnCloseRequest(e -> {
+            win.hide();
+            e.consume();
+            shellWindows.remove(key);
+        });
+        win.centerOnScreen();
+        win.show();
+        win.toFront();
+        win.requestFocus();
+        return win;
+    }
+
+    /** The BorderPane root of a shell window, or null -- used so the Launcher tab can re-theme the
+     *  whole Settings window live without needing the old OS dialog's dialogPane. */
+    private javafx.scene.layout.BorderPane stageShellRoot(String key) {
+        javafx.stage.Stage w = shellWindows.get(key);
+        if (w == null || w.getScene() == null) return null;
+        javafx.scene.Node r = w.getScene().getRoot();
+        return r instanceof javafx.scene.layout.BorderPane ? (javafx.scene.layout.BorderPane) r : null;
+    }
+
 
     /** locked=true (a real sodium-*.jar under a DEY instance) shows a lock icon and a
      * "BUNDLED" badge instead of the enable checkbox and delete button -- it's a real jar
@@ -3651,7 +4111,7 @@ public class LauncherApp extends Application {
 
         // Modrinth icon (+ click-through to the project page) once we've resolved this mod's slug.
         String modSlug = addonSlugByBase.get(normalizeAddonBase(mod.fileName()));
-        Node iconTile = modIconNode(modSlug != null ? modrinthIconPath(modSlug) : null, 46);
+        Node iconTile = modIconNode(modSlug != null ? modrinthIconPath(modSlug) : null, 52);
         if (modSlug != null) {
             iconTile.setCursor(javafx.scene.Cursor.HAND);
             final String clickSlug = modSlug;
@@ -3728,7 +4188,7 @@ public class LauncherApp extends Application {
      * actions valid for that state -- no username field is ever visible except right after
      * the user explicitly clicks "Create an offline account".
      */
-    private VBox buildAccountTab(Dialog<Void> dialog, Runnable[] refreshHolder) {
+    private VBox buildAccountTab(Runnable[] refreshHolder) {
         VBox content = new VBox(20);
         content.setPadding(new Insets(24));
         PlayerIdentity active = identityStore.getActive();
@@ -3751,7 +4211,7 @@ public class LauncherApp extends Application {
             Label statusLabel = new Label();
             statusLabel.getStyleClass().add("notice-label");
             statusLabel.setWrapText(true);
-            signInBtn.setOnAction(e -> onSignInWithMicrosoft(signInBtn, deviceCodeBox, statusLabel, dialog, refreshHolder));
+            signInBtn.setOnAction(e -> onSignInWithMicrosoft(signInBtn, deviceCodeBox, statusLabel, refreshHolder));
             content.getChildren().addAll(msNote, signInBtn, deviceCodeBox, statusLabel);
 
             // ---- Create an offline account: username field hidden until this is clicked ----
@@ -3956,7 +4416,7 @@ public class LauncherApp extends Application {
     // ==================== SKINS TAB ====================
 
     /** LEFT: skin profile list + capes. RIGHT: 3D preview + Import/Remove. Matches the spec's layout sketch. */
-    private HBox buildSkinsTab(Dialog<Void> dialog) {
+    private HBox buildSkinsTab() {
         VBox left = new VBox(18);
         left.setPadding(new Insets(24, 12, 24, 24));
         left.setPrefWidth(320);
@@ -4037,7 +4497,7 @@ public class LauncherApp extends Application {
         right.getChildren().addAll(previewHost, modelRow, actionRow, applyCapeBtn, capeLimitNote);
 
         Runnable[] refresh = new Runnable[1];
-        refresh[0] = () -> refreshSkinsTab(profilesBox, capesBox, deyCapesBox, dialog, refresh, classicBtn, slimBtn, applyCapeBtn);
+        refresh[0] = () -> refreshSkinsTab(profilesBox, capesBox, deyCapesBox, refresh, classicBtn, slimBtn, applyCapeBtn);
         refresh[0].run();
         applyCapeBtn.setOnAction(e -> onApplyCape(applyCapeBtn, refresh));
 
@@ -4052,8 +4512,8 @@ public class LauncherApp extends Application {
             }
         });
 
-        importBtn.setOnAction(e -> onImportSkinProfile(dialog, refresh));
-        removeBtn.setOnAction(e -> onRemoveSkin(dialog, refresh));
+        importBtn.setOnAction(e -> onImportSkinProfile(refresh));
+        removeBtn.setOnAction(e -> onRemoveSkin(refresh));
 
         HBox root = new HBox(left, right);
         HBox.setHgrow(right, Priority.ALWAYS);
@@ -4061,7 +4521,7 @@ public class LauncherApp extends Application {
     }
 
     /** Rebuilds skin profile rows, cape rows, and the 3D preview from current disk/account state. */
-    private void refreshSkinsTab(TilePane profilesBox, TilePane capesBox, TilePane deyCapesBox, Dialog<Void> dialog, Runnable[] refresh,
+    private void refreshSkinsTab(TilePane profilesBox, TilePane capesBox, TilePane deyCapesBox, Runnable[] refresh,
                                   RadioButton classicBtn, RadioButton slimBtn, Button applyCapeBtn) {
         profilesBox.getChildren().clear();
         capesBox.getChildren().clear();
@@ -4408,7 +4868,7 @@ public class LauncherApp extends Application {
         new Thread(task, "cape-apply").start();
     }
 
-    private void onImportSkinProfile(Dialog<Void> dialog, Runnable[] refresh) {
+    private void onImportSkinProfile(Runnable[] refresh) {
         PlayerIdentity active = identityStore.getActive();
         if (active == null) {
             new Alert(Alert.AlertType.WARNING, "Set up an account in the Account tab first.", ButtonType.OK).showAndWait();
@@ -4470,7 +4930,7 @@ public class LauncherApp extends Application {
         new Thread(task, "skin-upload").start();
     }
 
-    private void onRemoveSkin(Dialog<Void> dialog, Runnable[] refresh) {
+    private void onRemoveSkin(Runnable[] refresh) {
         PlayerIdentity active = identityStore.getActive();
         if (active == null) return;
         if (active.accountType == AccountType.OFFLINE) {
@@ -4542,7 +5002,7 @@ public class LauncherApp extends Application {
         for (int ix = x; ix < x + w; ix++) for (int iy = y; iy < y + h; iy++) writer.setColor(ix, iy, color);
     }
 
-    private void onSignInWithMicrosoft(Button signInBtn, VBox deviceCodeBox, Label statusLabel, Dialog<Void> dialog, Runnable[] refreshHolder) {
+    private void onSignInWithMicrosoft(Button signInBtn, VBox deviceCodeBox, Label statusLabel, Runnable[] refreshHolder) {
         signInBtn.setDisable(true);
         deviceCodeBox.getChildren().clear();
         statusLabel.setText("Starting Microsoft sign-in...");
@@ -4677,19 +5137,9 @@ public class LauncherApp extends Application {
 
     /** One unified Settings window: Account, Skins, Game, and Launcher as tabs -- instead of
      * two separate popup windows -- so there's a single place for all of this, and it opens
-     * already on whichever tab makes sense for how it was invoked. */
+     * already on whichever tab makes sense for how it was invoked. Uses the same borderless
+     * window style as the Mods window. */
     private void openPreferencesDialog(String initialTabTitle) {
-        Dialog<Void> dialog = new Dialog<>();
-        dialog.initOwner(stage);
-        dialog.initModality(Modality.WINDOW_MODAL);
-        dialog.setTitle("Settings");
-        dialog.getDialogPane().getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
-        dialog.getDialogPane().getStylesheets().add(
-                DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
-        dialog.getDialogPane().getStyleClass().addAll("root-pane", darkMode ? "theme-dark" : "theme-light");
-        dialog.getDialogPane().getButtonTypes().addAll(ButtonType.CLOSE);
-        dialog.setResizable(true);
-
         TabPane tabs = new TabPane();
         tabs.getStyleClass().add("settings-tabs");
         tabs.setTabClosingPolicy(TabPane.TabClosingPolicy.UNAVAILABLE);
@@ -4701,11 +5151,11 @@ public class LauncherApp extends Application {
         accountScroll.getStyleClass().add("account-tab-scroll");
         Tab accountTab = new Tab("Account", accountScroll);
         Runnable[] refreshAccountHolder = new Runnable[1];
-        refreshAccountHolder[0] = () -> accountScroll.setContent(buildAccountTab(dialog, refreshAccountHolder));
+        refreshAccountHolder[0] = () -> accountScroll.setContent(buildAccountTab(refreshAccountHolder));
         refreshAccountHolder[0].run();
 
         // ---- Skins ----
-        Tab skinsTab = new Tab("Skins", buildSkinsTab(dialog));
+        Tab skinsTab = new Tab("Skins", buildSkinsTab());
 
         // ---- Game ----
         GameLauncher.LaunchSettings[] pending = { settings };
@@ -4717,19 +5167,7 @@ public class LauncherApp extends Application {
         gameScroll.getStyleClass().add("settings-scroll");
         Tab gameTab = new Tab("Game", gameScroll);
 
-        // ---- Launcher ----
-        ScrollPane launcherScroll = new ScrollPane(buildLauncherSettingsPane(markDirty, dialog.getDialogPane()));
-        launcherScroll.setFitToWidth(true);
-        launcherScroll.getStyleClass().add("settings-scroll");
-        Tab launcherTab = new Tab("Launcher", launcherScroll);
-
-        tabs.getTabs().addAll(accountTab, skinsTab, gameTab, launcherTab);
-        for (Tab t : tabs.getTabs()) {
-            if (t.getText().equals(initialTabTitle)) {
-                tabs.getSelectionModel().select(t);
-                break;
-            }
-        }
+        tabs.getTabs().addAll(accountTab, skinsTab, gameTab);
 
         Label savedLabel = new Label();
         savedLabel.getStyleClass().add("notice-label");
@@ -4766,6 +5204,7 @@ public class LauncherApp extends Application {
             prefs.gameWidth = settings.width();
             prefs.gameHeight = settings.height();
             prefs.fullscreen = settings.fullscreen();
+            prefs.softwareOpenGl = settings.softwareOpenGl();
             prefs.save();
             savedLabel.setText("Settings saved.");
             dirty.set(false);
@@ -4780,14 +5219,32 @@ public class LauncherApp extends Application {
         root.setPadding(new Insets(0, 0, 18, 0));
         VBox.setVgrow(tabs, Priority.ALWAYS);
 
-        dialog.getDialogPane().setContent(root);
+        // ---- Launcher (built after root so its theme toggle can re-theme this whole window) ----
+        ScrollPane launcherScroll = new ScrollPane(buildLauncherSettingsPane(markDirty, () -> {
+            javafx.scene.layout.BorderPane wroot = stageShellRoot("settings");
+            if (wroot == null) return;
+            wroot.getStyleClass().removeAll("theme-dark", "theme-light");
+            wroot.getStyleClass().add(darkMode ? "theme-dark" : "theme-light");
+            wroot.getStylesheets().removeIf(s -> s.startsWith("data:text/css"));
+            wroot.getStylesheets().add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
+        }));
+        launcherScroll.setFitToWidth(true);
+        launcherScroll.getStyleClass().add("settings-scroll");
+        Tab launcherTab = new Tab("Launcher", launcherScroll);
+        tabs.getTabs().add(launcherTab);
+
+        for (Tab t : tabs.getTabs()) {
+            if (t.getText().equals(initialTabTitle)) {
+                tabs.getSelectionModel().select(t);
+                break;
+            }
+        }
+
         // Configurable from Launcher > Settings Window Size -- defaults big enough for the
         // Skins tab's profile/cape list + large 3D preview to actually have room to breathe.
-        dialog.getDialogPane().setPrefSize(prefs.settingsWindowWidth, prefs.settingsWindowHeight);
-        dialog.getDialogPane().setMinWidth(760);
-        dialog.getDialogPane().setMinHeight(520);
-        dialog.setOnHidden(e -> { if (skinPreview != null) skinPreview.stop(); });
-        dialog.showAndWait();
+        Stage win = openShellWindow("settings", "Settings", root,
+                760, 520, prefs.settingsWindowWidth, prefs.settingsWindowHeight);
+        win.setOnHiding(e -> { if (skinPreview != null) skinPreview.stop(); });
     }
 
 
@@ -4803,7 +5260,7 @@ public class LauncherApp extends Application {
             markDirty.run();
             ramLabel.setText((int) val.doubleValue() + " MB max RAM");
             pending[0] = new GameLauncher.LaunchSettings(pending[0].ramMinMb(), (int) val.doubleValue(),
-                    pending[0].width(), pending[0].height(), pending[0].fullscreen());
+                    pending[0].width(), pending[0].height(), pending[0].fullscreen(), pending[0].softwareOpenGl());
         });
 
         TextField widthField = new TextField(String.valueOf(settings.width()));
@@ -4812,15 +5269,26 @@ public class LauncherApp extends Application {
         heightField.setPrefWidth(90);
         Runnable applyRes = () -> pending[0] = new GameLauncher.LaunchSettings(pending[0].ramMinMb(), pending[0].ramMaxMb(),
                 parseIntOr(widthField.getText(), pending[0].width()),
-                parseIntOr(heightField.getText(), pending[0].height()), pending[0].fullscreen());
+                parseIntOr(heightField.getText(), pending[0].height()), pending[0].fullscreen(), pending[0].softwareOpenGl());
         widthField.textProperty().addListener((o, a, b) -> { applyRes.run(); markDirty.run(); });
         heightField.textProperty().addListener((o, a, b) -> { applyRes.run(); markDirty.run(); });
 
         CheckBox fullscreenBox = new CheckBox("Launch fullscreen");
         fullscreenBox.setSelected(settings.fullscreen());
         fullscreenBox.selectedProperty().addListener((o, a, b) -> pending[0] = new GameLauncher.LaunchSettings(
-                pending[0].ramMinMb(), pending[0].ramMaxMb(), pending[0].width(), pending[0].height(), b));
+                pending[0].ramMinMb(), pending[0].ramMaxMb(), pending[0].width(), pending[0].height(), b, pending[0].softwareOpenGl()));
         fullscreenBox.selectedProperty().addListener((o, a, b) -> markDirty.run());
+
+        CheckBox softwareGlBox = new CheckBox("Software rendering (compatibility)");
+        softwareGlBox.setSelected(settings.softwareOpenGl());
+        softwareGlBox.selectedProperty().addListener((o, a, b) -> pending[0] = new GameLauncher.LaunchSettings(
+                pending[0].ramMinMb(), pending[0].ramMaxMb(), pending[0].width(), pending[0].height(), pending[0].fullscreen(), b));
+        softwareGlBox.selectedProperty().addListener((o, a, b) -> markDirty.run());
+        Label softwareGlHint = new Label("For machines whose GPU can't expose OpenGL 3.3 "
+                + "(\"GLXBadFBConfig\" / \"Driver does not support OpenGL 3.3\"). Renders on the CPU "
+                + "(slower but works) without admin rights. Linux only; no effect on Windows.");
+        softwareGlHint.setWrapText(true);
+        softwareGlHint.getStyleClass().add("settings-hint-label");
 
         GridPane grid = new GridPane();
         grid.setHgap(12);
@@ -4835,10 +5303,13 @@ public class LauncherApp extends Application {
         resBox.setAlignment(Pos.CENTER_LEFT);
         grid.add(resBox, 1, 4);
         grid.add(fullscreenBox, 0, 5, 2, 1);
+        grid.add(sectionLabel("COMPATIBILITY"), 0, 6, 2, 1);
+        grid.add(softwareGlBox, 0, 7, 2, 1);
+        grid.add(softwareGlHint, 0, 8, 2, 1);
         return grid;
     }
 
-    private GridPane buildLauncherSettingsPane(Runnable markDirty, DialogPane dialogPane) {
+    private GridPane buildLauncherSettingsPane(Runnable markDirty, Runnable restyleWindow) {
         ToggleButton themeToggle = new ToggleButton();
         setButtonIcon(
             themeToggle,
@@ -4861,11 +5332,10 @@ public class LauncherApp extends Application {
             prefs.darkMode = darkMode;
             prefs.save();
             applyTheme();
-            // applyTheme() only re-themes the main window's scene -- this dialog is its own
-            // top-level Stage under the hood, so it needs its own style classes swapped too,
-            // right now, instead of waiting for the user to close and reopen Settings.
-            dialogPane.getStyleClass().removeAll("theme-dark", "theme-light");
-            dialogPane.getStyleClass().add(darkMode ? "theme-dark" : "theme-light");
+            // applyTheme() only re-themes the main window's scene -- this borderless window
+            // is its own top-level Stage, so it needs its own style classes swapped too, right
+            // now, instead of waiting for the user to close and reopen Settings.
+            restyleWindow.run();
         });
 
         Slider uiScaleSlider = new Slider(0.75, 2.5, prefs.uiScale);
@@ -4898,12 +5368,11 @@ public class LauncherApp extends Application {
             uiScaleLabel.setText(Math.round(prefs.uiScale * 100) + "%");
             textScaleLabel.setText(Math.round(prefs.textScale * 100) + "%");
             applyDynamicStyle();
-            // applyDynamicStyle() only touches the main window's scene -- this dialog carries
-            // its own separate copy of the same data: URI stylesheet, added once at open time,
-            // so it needs to be swapped out here too or the scale only visibly changes on the
-            // window behind the dialog until you close and reopen Settings.
-            dialogPane.getStylesheets().removeIf(s -> s.startsWith("data:text/css"));
-            dialogPane.getStylesheets().add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
+            // applyDynamicStyle() only touches the main window's scene -- this borderless window
+            // carries its own separate copy of the same data: URI stylesheet, added once at open
+            // time, so it needs to be swapped out here too or the scale only visibly changes on the
+            // window behind it until you close and reopen Settings.
+            restyleWindow.run();
             prefs.save();
         };
         uiScaleSlider.valueProperty().addListener((o, a, b) -> livePreview.run());
@@ -5209,6 +5678,26 @@ public class LauncherApp extends Application {
                     }
                 }
                 if (modLoader.equals("Fabric") && deyMode) {
+                    updateMessage("Making sure Iris (shaders) is installed...");
+                    try {
+                        // Sodium↔Iris conflict disarming: Iris needs Sodium as its runtime backend.
+                        // If no performance-mod jar can run for this version, disable (never delete)
+                        // any active Iris instead of pushing the pair that crashed on DEY 26.2.
+                        if (sodiumBackendPresent(gameDir.resolve("mods"))) {
+                            String installed = new IrisInstaller().ensureInstalled(entry.id(), gameDir.resolve("mods"));
+                            if (installed != null) {
+                                String finalName = installed;
+                                Platform.runLater(() -> log("Installed " + finalName));
+                            }
+                        } else {
+                            new IrisInstaller().disableActive(gameDir.resolve("mods"));
+                        }
+                    } catch (Exception irisEx) {
+                        String msg = irisEx.getMessage();
+                        Platform.runLater(() -> log("Couldn't auto-install Iris (continuing without shaders): " + msg));
+                    }
+                }
+                if (modLoader.equals("Fabric") && deyMode) {
                     updateMessage("Making sure Fabric API is installed...");
                     try {
                         String installed = new FabricApiInstaller().ensureInstalled(entry.id(), gameDir.resolve("mods"));
@@ -5236,18 +5725,21 @@ public class LauncherApp extends Application {
                 }
 
                 updateMessage(quickPlayTarget != null ? "Launching straight into " + quickPlayTarget + "..." : "Launching...");
-                Process process = new GameLauncher().launch(prepared, session, gameDir, settings, javaBinary.toString(), quickPlayTarget);
 
-                // Stream the game's own output into our log area instead of inheriting the console.
-                try (var reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
-                    String line;
-                    while ((line = reader.readLine()) != null) {
-                        String finalLine = line;
-                        Platform.runLater(() -> log(finalLine));
-                    }
+                // Self-healing: on machines whose GPU can't provide OpenGL 3.3 (the classic Linux
+                // "GLXBadFBConfig" / "Driver does not support OpenGL 3.3" crash), retry ONCE with Mesa
+                // software rendering enabled, so the game gets a window even when the software-rendering
+                // setting was left off. Only fires when the first attempt actually died from that
+                // signature (runGameAndWait's diagnosis is null on a normal exit), and it flips the
+                // toggle only for this single retry -- it is never persisted or forced on healthy runs.
+                LaunchOutcome first = runGameAndWait(prepared, session, gameDir, settings, javaBinary, quickPlayTarget);
+                if (first.diagnosis() != null && !settings.softwareOpenGl()) {
+                    Platform.runLater(() -> log("Retrying once with software rendering (compatibility) enabled..."));
+                    GameLauncher.LaunchSettings compat = new GameLauncher.LaunchSettings(
+                            settings.ramMinMb(), settings.ramMaxMb(), settings.width(), settings.height(),
+                            settings.fullscreen(), true);
+                    runGameAndWait(prepared, session, gameDir, compat, javaBinary, quickPlayTarget);
                 }
-                int exit = process.waitFor();
-                Platform.runLater(() -> log("Game exited with code " + exit));
                 return null;
             }
         };
@@ -5266,6 +5758,39 @@ public class LauncherApp extends Application {
 
     private void log(String line) {
         logArea.appendText(line + "\n");
+    }
+
+    /** Result of one game run: the exit code plus a human-readable crash diagnosis (null on a normal exit). */
+    private record LaunchOutcome(int exit, String diagnosis) {}
+
+    /**
+     * Launches the game and streams its output into the log, keeping a bounded recent-output tail so a
+     * native/GL crash can be explained (see {@link LaunchDiagnostics}) instead of just showing the raw
+     * exit code. Returns the exit code and diagnosis so the caller can decide whether to self-heal.
+     */
+    private LaunchOutcome runGameAndWait(GameFiles.PreparedVersion prepared, AuthSession session, Path gameDir,
+                                         GameLauncher.LaunchSettings s, Path javaBinary, String quickPlayTarget) throws Exception {
+        Process process = new GameLauncher().launch(prepared, session, gameDir, s, javaBinary.toString(), quickPlayTarget);
+
+        // Keep a bounded recent-output tail so that, if the game ends in a native/GL crash, we can
+        // explain it in plain words instead of just the raw exit code.
+        Deque<String> recent = new ArrayDeque<>();
+        try (var reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                String finalLine = line;
+                Platform.runLater(() -> log(finalLine));
+                recent.addLast(finalLine);
+                if (recent.size() > 120) recent.pollFirst();
+            }
+        }
+        int exit = process.waitFor();
+        Platform.runLater(() -> log("Game exited with code " + exit));
+        String diagnosis = LaunchDiagnostics.analyze(new java.util.ArrayList<>(recent), exit);
+        if (diagnosis != null) {
+            Platform.runLater(() -> log("\n==== Crash diagnostic ====\n" + diagnosis));
+        }
+        return new LaunchOutcome(exit, diagnosis);
     }
 
     // ---- Cross-platform icon helpers ----
@@ -5348,20 +5873,28 @@ public class LauncherApp extends Application {
         pane.getChildren().add(icon(IconFactory.Icon.PUZZLE, size * 0.5));
         if (iconPath != null && Files.exists(iconPath)) {
             try {
-                ImageView iv = new ImageView(new Image(iconPath.toUri().toString()));
-                iv.setFitWidth(size);
-                iv.setFitHeight(size);
-                iv.setPreserveRatio(true);
-                iv.setSmooth(false);
-                iv.getStyleClass().add("mod-icon-img");
-                pane.getChildren().add(iv);
+                javafx.scene.image.Image fx = decodeCachedIcon(iconPath);
+                if (fx != null) {
+                    ImageView iv = new ImageView(fx);
+                    iv.setFitWidth(size);
+                    iv.setFitHeight(size);
+                    iv.setPreserveRatio(true);
+                    iv.setSmooth(true);
+                    iv.getStyleClass().add("mod-icon-img");
+                    pane.getChildren().add(iv);
+                }
             } catch (Exception ignored) {
             }
         }
         return pane;
     }
 
-    /** Same tile but loading a remote image in the background; shows the glyph placeholder until it arrives. */
+    /**
+     * Same tile but loading a remote image in the background; shows the glyph placeholder until it arrives.
+     * Modrinth serves most icons as WebP, which JavaFX's {@code Image} can't decode natively, so WebP
+     * URLs are downloaded and decoded through ImageIO (the bundled TwelveMonkeys plugin) on a background
+     * thread and then rendered. Non-WebP URLs use JavaFX's native loader.
+     */
     private Node remoteModIcon(String uri, double size) {
         StackPane pane = new StackPane();
         pane.setPrefSize(size, size);
@@ -5370,18 +5903,93 @@ public class LauncherApp extends Application {
         pane.getStyleClass().add("mod-icon-tile");
         pane.getChildren().add(icon(IconFactory.Icon.PUZZLE, size * 0.5));
         if (uri != null && !uri.isBlank()) {
-            try {
-                ImageView iv = new ImageView(new Image(uri, size, size, true, false, true));
-                iv.setFitWidth(size);
-                iv.setFitHeight(size);
-                iv.setPreserveRatio(true);
-                iv.setSmooth(false);
-                iv.getStyleClass().add("mod-icon-img");
-                pane.getChildren().add(iv);
-            } catch (Exception ignored) {
+            boolean webp = uri.toLowerCase().contains(".webp");
+            if (!webp) {
+                try {
+                    ImageView iv = new ImageView(new Image(uri, size, size, true, false, true));
+                    iv.setFitWidth(size);
+                    iv.setFitHeight(size);
+                    iv.setPreserveRatio(true);
+                    iv.setSmooth(true);
+                    iv.getStyleClass().add("mod-icon-img");
+                    pane.getChildren().add(iv);
+                    return pane;
+                } catch (Exception ignored) {
+                    // fall through to the background decoder
+                }
             }
+            ImageView iv = new ImageView();
+            iv.setFitWidth(size);
+            iv.setFitHeight(size);
+            iv.setPreserveRatio(true);
+            iv.setSmooth(true);
+            iv.getStyleClass().add("mod-icon-img");
+            pane.getChildren().add(iv);
+            Task<Void> decode = new Task<>() {
+                @Override
+                protected Void call() {
+                    byte[] bytes = new ModrinthClient().downloadBytes(uri);
+                    if (bytes != null && bytes.length > 0) {
+                        try {
+                            javafx.scene.image.Image fx = decodeIconBytes(bytes);
+                            if (fx != null) {
+                                Platform.runLater(() -> iv.setImage(fx));
+                            }
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    return null;
+                }
+            };
+            new Thread(decode, "icon-decode").start();
         }
         return pane;
+    }
+
+    /** Loads a cached icon tile: JavaFX natively for PNG/etc, ImageIO (twelvemonkeys) for WebP leftovers. */
+    private javafx.scene.image.Image decodeCachedIcon(java.nio.file.Path iconPath) {
+        try {
+            return new javafx.scene.image.Image(iconPath.toUri().toString());
+        } catch (Exception notNative) {
+            try {
+                java.awt.image.BufferedImage bi = javax.imageio.ImageIO.read(iconPath.toFile());
+                return bi == null ? null : bufferedToFx(bi);
+            } catch (Exception e) {
+                return null;
+            }
+        }
+    }
+
+    /** Decodes icon bytes (any ImageIO-supported format, incl. WebP) into a JavaFX image. */
+    private javafx.scene.image.Image decodeIconBytes(byte[] bytes) {
+        try {
+            var in = new java.io.ByteArrayInputStream(bytes);
+            javax.imageio.stream.ImageInputStream iis = javax.imageio.ImageIO.createImageInputStream(in);
+            var reader = javax.imageio.ImageIO.getImageReaders(iis);
+            if (!reader.hasNext()) return null;
+            var r = reader.next();
+            r.setInput(iis);
+            java.awt.image.BufferedImage bi = r.read(0);
+            r.dispose();
+            return bi == null ? null : bufferedToFx(bi);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Converts an AWT image to a JavaFX writable image (needed because JavaFX can't read WebP directly). */
+    private javafx.scene.image.Image bufferedToFx(java.awt.image.BufferedImage bi) {
+        int w = bi.getWidth();
+        int h = bi.getHeight();
+        javafx.scene.image.WritableImage wi = new javafx.scene.image.WritableImage(w, h);
+        javafx.scene.image.PixelWriter pw = wi.getPixelWriter();
+        for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+                int argb = bi.getRGB(x, y);
+                pw.setArgb(x, y, argb);
+            }
+        }
+        return wi;
     }
 /**
      * Resolves an online player's UUID by name via Mojang's public API, then fetches/caches their

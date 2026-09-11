@@ -126,4 +126,38 @@ public class ServerAddonsManager {
         Files.createDirectories(folder);
         Files.copy(sourceJar, folder.resolve(sourceJar.getFileName()), StandardCopyOption.REPLACE_EXISTING);
     }
+
+    /**
+     * The addon's own declared Fabric/Forge project id (usually the Modrinth slug), read from its
+     * metadata. Plugins (Purpur) have no such id, so this returns null for them and they fall back
+     * to the display-name search.
+     */
+    public String addonSlug(String fileName) {
+        if (folder == null) return null;
+        Path p = folder.resolve(fileName);
+        if (!Files.exists(p)) return null;
+        try (var zip = new java.util.zip.ZipFile(p.toFile())) {
+            var fabricEntry = zip.getEntry("fabric.mod.json");
+            if (fabricEntry != null) {
+                try (var in = zip.getInputStream(fabricEntry)) {
+                    var json = com.google.gson.JsonParser.parseString(new String(in.readAllBytes()))
+                            .getAsJsonObject();
+                    if (json.has("id") && !json.get("id").getAsString().isBlank()) {
+                        return json.get("id").getAsString();
+                    }
+                }
+            }
+            var forgeEntry = zip.getEntry("META-INF/mods.toml");
+            if (forgeEntry != null) {
+                try (var in = zip.getInputStream(forgeEntry)) {
+                    String toml = new String(in.readAllBytes());
+                    var m = java.util.regex.Pattern.compile("^\\s*modId\\s*=\\s*\"([^\"]+)\"",
+                            java.util.regex.Pattern.MULTILINE).matcher(toml);
+                    if (m.find()) return m.group(1);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
 }

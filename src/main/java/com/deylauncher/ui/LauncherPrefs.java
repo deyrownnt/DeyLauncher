@@ -42,6 +42,10 @@ public class LauncherPrefs {
     public int gameWidth = 854;
     public int gameHeight = 480;
     public boolean fullscreen = false;
+    // Software-OpenGL compatibility (Settings > Game): on Linux machines without a usable OpenGL 3.3
+    // GPU context, this launches Minecraft through Mesa's software renderer (LIBGL_ALWAYS_SOFTWARE).
+    // Defaults off so healthy machines keep GPU acceleration.
+    public boolean softwareOpenGl = false;
 
     // Friends / presence (Account tab, Settings > Launcher)
     public boolean invisibleMode = false;         // broadcast OFFLINE to friends even while actually online
@@ -80,6 +84,7 @@ public class LauncherPrefs {
             p.gameWidth = (int) parseDouble(props, "gameWidth", p.gameWidth);
             p.gameHeight = (int) parseDouble(props, "gameHeight", p.gameHeight);
             p.fullscreen = Boolean.parseBoolean(props.getProperty("fullscreen", "false"));
+            p.softwareOpenGl = Boolean.parseBoolean(props.getProperty("softwareOpenGl", "false"));
             p.invisibleMode = Boolean.parseBoolean(props.getProperty("invisibleMode", "false"));
             p.shareServerAddress = Boolean.parseBoolean(props.getProperty("shareServerAddress", "false"));
             p.myServerAddress = props.getProperty("myServerAddress", "");
@@ -110,6 +115,7 @@ public class LauncherPrefs {
             props.setProperty("gameWidth", String.valueOf(gameWidth));
             props.setProperty("gameHeight", String.valueOf(gameHeight));
             props.setProperty("fullscreen", String.valueOf(fullscreen));
+            props.setProperty("softwareOpenGl", String.valueOf(softwareOpenGl));
             props.setProperty("invisibleMode", String.valueOf(invisibleMode));
             props.setProperty("shareServerAddress", String.valueOf(shareServerAddress));
             props.setProperty("myServerAddress", myServerAddress == null ? "" : myServerAddress);
