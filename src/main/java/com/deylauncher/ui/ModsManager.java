@@ -101,4 +101,44 @@ public class ModsManager {
         Files.createDirectories(modsDir);
         Files.copy(sourceJar, modsDir.resolve(sourceJar.getFileName()), StandardCopyOption.REPLACE_EXISTING);
     }
+
+    /** The on-disk path of a mod jar (enabled or disabled), or null if it doesn't exist. */
+    public Path jarPath(String fileName) {
+        if (Files.exists(modsDir.resolve(fileName))) return modsDir.resolve(fileName);
+        if (Files.exists(disabledDir.resolve(fileName))) return disabledDir.resolve(fileName);
+        return null;
+    }
+
+    /**
+     * The mod's own declared Fabric/Forge project id ("slug"), read from its metadata. This is
+     * usually the exact Modrinth slug, so it lets the icon enrichment match mods that a plain
+     * display-name search would miss. Returns null when the jar carries no usable id.
+     */
+    public String modSlug(String fileName) {
+        Path p = jarPath(fileName);
+        if (p == null) return null;
+        try (var zip = new java.util.zip.ZipFile(p.toFile())) {
+            var fabricEntry = zip.getEntry("fabric.mod.json");
+            if (fabricEntry != null) {
+                try (var in = zip.getInputStream(fabricEntry)) {
+                    var json = com.google.gson.JsonParser.parseString(new String(in.readAllBytes()))
+                            .getAsJsonObject();
+                    if (json.has("id") && !json.get("id").getAsString().isBlank()) {
+                        return json.get("id").getAsString();
+                    }
+                }
+            }
+            var forgeEntry = zip.getEntry("META-INF/mods.toml");
+            if (forgeEntry != null) {
+                try (var in = zip.getInputStream(forgeEntry)) {
+                    String toml = new String(in.readAllBytes());
+                    var m = java.util.regex.Pattern.compile("^\\s*modId\\s*=\\s*\"([^\"]+)\"",
+                            java.util.regex.Pattern.MULTILINE).matcher(toml);
+                    if (m.find()) return m.group(1);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        return null;
+    }
 }

@@ -13,23 +13,22 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 
 /**
- * Fabric API ships bundled with every DEY Fabric build -- most Fabric mods (Sodium included,
- * for some versions) declare it as a dependency, so having it missing is a common source of
- * "the game won't even start" reports. Fetched from Modrinth's public, documented API, the
- * same integration point SodiumInstaller and FabricInstaller already use.
+ * Iris (the shaders mod) is a Fabric/Quilt-only mod that sits on top of Sodium to
+ * provide shader support. Every DEY Fabric build ships Sodium, so it also ships Iris
+ * so players get shaders out of the box -- exactly the same pattern SodiumInstaller
+ * uses (fetch the build matching mcVersion+loader from Modrinth's public API).
  *
- * Fabric API is Fabric/Quilt-only by definition -- there's no Forge build and no Forge
- * equivalent to substitute (Forge's own API is built into Forge itself), so this only runs
- * for DEY Fabric instances, never Forge ones.
+ * Iris has no Forge port under a usable name that we auto-bundle (Oculus exists for
+ * Forge, but DEY client builds are Fabric-only), so like Fabric API this is only ever
+ * installed for the "Fabric" loader.
  */
-public class FabricApiInstaller {
+public class IrisInstaller {
 
-    private static final String PROJECT_SLUG = "fabric-api";
-    private static final String LOADER_NAME = "fabric";
+    private static final String PROJECT_SLUG = "iris";
 
     private final HttpClient http = HttpClient.newHttpClient();
 
-    /** True if a fabric-api-*.jar is already present in this instance's mods folder. */
+    /** True if a matching Iris jar is already present in this instance's mods folder. */
     public boolean isInstalled(Path modsDir) throws Exception {
         if (!Files.isDirectory(modsDir)) return false;
         String prefix = familyPrefix();
@@ -43,12 +42,22 @@ public class FabricApiInstaller {
     }
 
     /**
-     * Ensures the Fabric API build matching mcVersion is installed and is the ONE that runs. Only
-     * EXACTLY matching Minecraft versions are considered, preferring stable releases. A stale
-     * /wrong-version fabric-api jar is replaced (updated/downgraded) -- never just deleted. If Modrinth
-     * has no build for this EXACT version, any existing active fabric-api jar is moved to mods-disabled
-     * (disabled, NOT deleted) so the game still loads. Returns the file's name, a "DISABLED:<names>"
-     * marker, or null.
+     * Sodium↔Iris conflict disarming: moves every active Iris jar into mods-disabled (never deletes)
+     * so Iris cannot load. Used when the performance mod (Sodium) can't run for the selected Minecraft
+     * version -- Iris needs Sodium as its runtime backend, so leaving Iris active without it just
+     * compounds the crash. Returns how many jars were disabled.
+     */
+    public int disableActive(Path modsDir) {
+        return ModsUtil.disableActiveFamily(modsDir, familyPrefix()).size();
+    }
+
+    /**
+     * Ensures the Iris build matching mcVersion (Fabric) is installed and is the ONE that runs. Only
+     * EXACTLY matching Minecraft versions are considered (a build for "1.19" is NOT reused for
+     * "1.19.3"), preferring stable releases. A stale/wrong-version Iris jar is replaced
+     * (updated/downgraded) -- never just deleted. If Modrinth has no build for this EXACT version, any
+     * existing active Iris jar is moved to mods-disabled (disabled, NOT deleted) so the game still
+     * loads. Returns the installed file's name, a "DISABLED:<names>" marker, or null.
      */
     public String ensureInstalled(String mcVersion, Path modsDir) throws Exception {
         String listUrl = "https://api.modrinth.com/v2/project/" + PROJECT_SLUG + "/version";
@@ -63,8 +72,8 @@ public class FabricApiInstaller {
 
         JsonObject best = findBestCompatible(versions, mcVersion);
         if (best == null) {
-            // No build supports this EXACT Minecraft version. Never delete Fabric API to "fix" it --
-            // disable (move to mods-disabled) any active Fabric API jar so the game still loads.
+            // No build supports this EXACT Minecraft version. Never delete Iris to "fix" it -- disable
+            // (move to mods-disabled) any active Iris jar so the game loads without shaders.
             java.util.List<String> disabled = ModsUtil.disableActiveFamily(modsDir, familyPrefix());
             if (!disabled.isEmpty()) return "DISABLED:" + String.join(",", disabled);
             return null;
@@ -98,7 +107,7 @@ public class FabricApiInstaller {
         }
         Files.move(tmp, dest, StandardCopyOption.REPLACE_EXISTING);
 
-        // Replace: drop any other (stale / wrong-version) fabric-api jar -- an update/downgrade, not a bare delete.
+        // Replace: drop any other (stale / wrong-version) Iris jar -- an update/downgrade, not a bare delete.
         ModsUtil.removeFamilyJarsExcept(modsDir, prefix, fileName);
         return fileName;
     }
@@ -108,7 +117,7 @@ public class FabricApiInstaller {
         JsonObject newest = null, newestStable = null;
         for (var el : versions) {
             JsonObject v = el.getAsJsonObject();
-            if (!supportsLoader(v) || !supportsVersion(v, mcVersion)) continue;
+            if (!supportsLoader(v, "fabric") || !supportsVersion(v, mcVersion)) continue;
             JsonArray files = v.getAsJsonArray("files");
             if (files == null || files.isEmpty()) continue;
             if (newest == null) newest = v;
@@ -126,10 +135,10 @@ public class FabricApiInstaller {
                 || num.contains("snapshot") || num.contains("dev") || num.contains("nightly");
     }
 
-    private boolean supportsLoader(JsonObject version) {
+    private boolean supportsLoader(JsonObject version, String loaderName) {
         if (!version.has("loaders")) return false;
         for (var l : version.getAsJsonArray("loaders")) {
-            if (l.getAsString().equalsIgnoreCase(LOADER_NAME)) return true;
+            if (l.getAsString().equalsIgnoreCase(loaderName)) return true;
         }
         return false;
     }
