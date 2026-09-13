@@ -64,6 +64,16 @@ public class AddedServersStore {
         save(current);
     }
 
+    /** Renames a bookmarked server in place (the address never changes). No-op on a blank name. */
+    public void rename(String id, String name) {
+        if (name == null || name.isBlank()) return;
+        var current = list();
+        for (var s : current) {
+            if (s.id().equals(id)) s.name = name.trim();
+        }
+        save(current);
+    }
+
     public void touchLastJoined(String id) {
         var current = list();
         for (var s : current) {

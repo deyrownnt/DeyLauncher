@@ -93,6 +93,23 @@ public final class EdgePush {
                 workArea.getHeight());
     }
 
+    /**
+     * Where a half-tiled window goes when the user grabs its header again: it snaps back to the
+     * size it had BEFORE it was tiled, positioned under the pointer so the drag feels continuous.
+     * This is the counterpart to {@link #halfTile} -- the desktop's own "drag a tiled window away
+     * to restore it" behaviour.
+     *
+     * @param width  the pre-tile width to restore
+     * @param height the pre-tile height to restore
+     * @param pointerX global pointer x at the grab
+     * @param pointerY global pointer y at the grab
+     * @param headerH  the window's header/title-bar height (so the pointer keeps a natural grip)
+     */
+    public static Rectangle2D restoreUnderPointer(double width, double height,
+                                                  double pointerX, double pointerY, double headerH) {
+        return new Rectangle2D(pointerX - width / 2.0, pointerY - headerH / 2.0, width, height);
+    }
+
     /** True when (x,y) lies inside any of the given screens. */
     private static boolean covered(double x, double y, List<Rectangle2D> screens) {
         for (int i = 0; i < screens.size(); i++) {

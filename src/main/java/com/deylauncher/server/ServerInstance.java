@@ -43,6 +43,11 @@ public class ServerInstance {
      *  read, so it doesn't need a data-format change when that's built. */
     public java.util.List<String> managerUsernames = new java.util.ArrayList<>();
 
+    /** Whether this server is listed under "Servers they own" on your friend profile. Toggled per
+     *  server from Account settings, so you choose exactly which of your servers friends can see.
+     *  Defaults to true (Gson keeps this initializer for existing server.json files). */
+    public boolean visibleToFriends = true;
+
     public ServerInstance() {}
 
     public ServerInstance(String name, ServerType type, String minecraftVersion) {
