@@ -157,6 +157,21 @@ public final class ServerStatusPing {
         return ping(a.host(), a.port(), timeoutMs);
     }
 
+    /** Same as {@link #ping(String, int)} but retries on a miss before giving up. A single probe can
+     *  genuinely miss a server that IS online -- a slow/high-latency link (player-hosted servers
+     *  behind a playit.gg tunnel in particular), a cold TCP path on the very first check, or the
+     *  best-effort SRV lookup eating into the round trip can each make one attempt time out even
+     *  though the exact same server answers fine a moment later. Retrying once before calling a
+     *  server OFFLINE is what the background status badge should actually do. */
+    public static Status pingWithRetry(String rawAddress, int timeoutMs, int retries) {
+        Status last = Status.offline();
+        for (int attempt = 0; attempt <= retries; attempt++) {
+            last = ping(rawAddress, timeoutMs);
+            if (last.online()) return last;
+        }
+        return last;
+    }
+
     /** Probes {@code host:port}. Never throws -- any failure yields {@link Status#offline()}. */
     public static Status ping(String host, int port, int timeoutMs) {
         try (Socket socket = new Socket()) {

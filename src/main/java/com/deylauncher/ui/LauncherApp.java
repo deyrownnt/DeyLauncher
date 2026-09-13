@@ -567,7 +567,14 @@ public class LauncherApp extends Application {
     }
 
     /** Clean exit shared by the OS close action and the in-window × button: stops the wave pulse,
-     *  saves window size prefs, publishes offline presence, then closes the stage. */
+     *  saves window size prefs, publishes offline presence, then closes the stage.
+     *
+     *  IMPORTANT: this also force-terminates the JVM. stage.close() alone only tears down the FX
+     *  toolkit -- it does NOT guarantee the process actually exits, because any background worker
+     *  thread still running (friends refresh, presence, icon fetch, etc.) is a plain non-daemon
+     *  Thread and will keep the JVM alive indefinitely. During a self-update this is exactly what
+     *  makes the flow look "stuck" at Preparing restart: the restart helper script waits for this
+     *  process's PID to actually die before it can swap the new files in, and it never does. */
     private void doCleanExit() {
         appRunning = false;
         WavePulse.instance().stop(); // stop the online-dot wave animation with the window
@@ -578,6 +585,8 @@ public class LauncherApp extends Application {
         }
         publishOfflineOnExit();
         stage.close();
+        Platform.exit();
+        System.exit(0); // guarantee real process death even if a background thread is still running
     }
 
     // ---- Self-updater (GitHub releases) ----
@@ -662,8 +671,13 @@ public class LauncherApp extends Application {
         updateProgress.progressProperty().unbind();
         updateProgress.progressProperty().bind(t.progressProperty());
         t.setOnSucceeded(e -> {
+            // Must read the Task's value here, while still on the FX Application Thread --
+            // Task.getValue() throws IllegalStateException off that thread, so capture it into a
+            // local now instead of calling t.getValue() lazily inside the background lambda below
+            // (that silently killed the install thread before it ever got started).
+            Path downloaded = t.getValue();
             updateStatus.setText("Downloaded " + info.assetName() + " -- applying update...");
-            new Thread(() -> installLocalUpdate(t.getValue(), info), "deylauncher-update-install").start();
+            new Thread(() -> installLocalUpdate(downloaded, info), "deylauncher-update-install").start();
         });
         t.setOnFailed(e -> {
             updateBtn.setDisable(false);
@@ -715,6 +729,8 @@ public class LauncherApp extends Application {
             Path helper = AppUpdater.writeRestartScript(layout, stagingApp, staging,
                     ProcessHandle.current().pid());
             AppUpdater.launchHelper(helper, layout.windows());
+            // doCleanExit() force-terminates the JVM (see its javadoc) -- required here so the
+            // restart helper's "wait for this PID to die" loop doesn't hang on a leftover thread.
             Platform.runLater(this::doCleanExit);
         } catch (Exception ex) {
             Platform.runLater(() -> {
@@ -1405,6 +1421,10 @@ public class LauncherApp extends Application {
 
         if (iconUrl != null && !iconUrl.isBlank()) {
             java.nio.file.Path cache = serverIconCachePath(name);
+            // Solid black backdrop that only appears once the real icon has loaded -- so any
+            // transparent parts of it read as clean black instead of the letter avatar behind it.
+            Circle imgBackdrop = new Circle(size / 2.0, Color.BLACK);
+            imgBackdrop.setVisible(false);
             ImageView iv = new ImageView();
             iv.setFitWidth(size);
             iv.setFitHeight(size);
@@ -1412,7 +1432,7 @@ public class LauncherApp extends Application {
             Circle clip = new Circle(size / 2.0, size / 2.0, size / 2.0);
             iv.setClip(clip);
             iv.setUserData(Boolean.TRUE);
-            tile.getChildren().add(iv);
+            tile.getChildren().addAll(imgBackdrop, iv);
             final ImageView ref = iv;
             Task<java.nio.file.Path> fetch = new Task<>() {
                 @Override protected java.nio.file.Path call() {
@@ -1429,6 +1449,11 @@ public class LauncherApp extends Application {
                 java.nio.file.Path cached = fetch.getValue();
                 if (cached != null && Boolean.TRUE.equals(ref.getUserData())) {
                     ref.setImage(new Image(cached.toUri().toString()));
+                    // Real icon is in -- hide the letter avatar (effectively "deleted") and let
+                    // the black backdrop show through any transparent pixels instead of it.
+                    bg.setVisible(false);
+                    inits.setVisible(false);
+                    imgBackdrop.setVisible(true);
                 }
             });
             new Thread(fetch, "profile-server-icon").start();
@@ -1463,19 +1488,26 @@ public class LauncherApp extends Application {
         Label inits = new Label(initials);
         inits.setTextFill(javafx.scene.paint.Color.WHITE);
         inits.setFont(Font.font(Font.getDefault().getFamily(), FontWeight.BOLD, size * 0.38));
+        // Solid black backdrop that only appears once a real server icon is showing -- so any
+        // transparent pixels in that icon read as clean black instead of letting the colored
+        // letter avatar (or a stale previous image) bleed through behind it.
+        Circle imgBackdrop = new Circle(size / 2.0, Color.BLACK);
+        imgBackdrop.setVisible(false);
         ImageView iv = new ImageView();
         iv.setFitWidth(size);
         iv.setFitHeight(size);
         iv.setSmooth(true);
         iv.setClip(new Circle(size / 2.0, size / 2.0, size / 2.0));
+        tile.getProperties().put("deyServerIconView", iv);
+        tile.getProperties().put("deyServerIconLetters", new Node[]{bg, inits});
+        tile.getProperties().put("deyServerIconBackdrop", imgBackdrop);
+        tile.getChildren().addAll(bg, inits, imgBackdrop, iv);
         if (localIcon != null && Files.exists(localIcon)) {
             try {
-                iv.setImage(new Image(localIcon.toUri().toString(), size, size, true, true));
+                showServerIcon(tile, new Image(localIcon.toUri().toString(), size, size, true, true));
             } catch (Exception ignored) {
             }
         }
-        tile.getProperties().put("deyServerIconView", iv);
-        tile.getChildren().addAll(bg, inits, iv);
         return tile;
     }
 
@@ -1483,6 +1515,22 @@ public class LauncherApp extends Application {
         if (tile == null) return null;
         Object v = tile.getProperties().get("deyServerIconView");
         return v instanceof ImageView iv ? iv : null;
+    }
+
+    /** Swaps a server tile from its lettered placeholder over to a real icon image: hides the
+     *  colored initials avatar (so it's effectively "deleted" once a real icon exists) and reveals
+     *  the black backdrop behind the image, so any transparent parts of the icon show clean black
+     *  instead of the old letter avatar showing through. Safe to call more than once. */
+    private void showServerIcon(Node tile, Image image) {
+        if (tile == null || image == null) return;
+        ImageView iv = serverIconImageView(tile);
+        if (iv != null) iv.setImage(image);
+        Object lettersObj = tile.getProperties().get("deyServerIconLetters");
+        if (lettersObj instanceof Node[] letters) {
+            for (Node n : letters) if (n != null) n.setVisible(false);
+        }
+        Object backdropObj = tile.getProperties().get("deyServerIconBackdrop");
+        if (backdropObj instanceof Node backdrop) backdrop.setVisible(true);
     }
 
     /** Decodes a data:image/png;base64 favicon from a status response into the given PNG cache file. */
@@ -1555,7 +1603,11 @@ public class LauncherApp extends Application {
         if (ui.owned() && !ui.running()) return;
         Task<ServerStatusPing.Status> task = new Task<>() {
             @Override protected ServerStatusPing.Status call() {
-                return ServerStatusPing.ping(address, 2500);
+                // Retry once on a miss -- see pingWithRetry's javadoc: a single 2.5s probe can miss a
+                // server that's genuinely online (tunnel latency, a cold TCP path, SRV lookup eating
+                // into the round trip), and this badge only ever pings once per row, so a lone failed
+                // attempt used to stick as "OFFLINE" until the page was rebuilt.
+                return ServerStatusPing.pingWithRetry(address, 2500, 1);
             }
         };
         task.setOnSucceeded(e -> {
@@ -1575,7 +1627,7 @@ public class LauncherApp extends Application {
                     if (iv != null) { // refreshIcon is false when a custom server-icon.png is in charge
                         cacheFavicon(st.faviconDataUri(), ui.faviconCache());
                         try {
-                            iv.setImage(new Image(ui.faviconCache().toUri().toString(),
+                            showServerIcon(ui.iconTile(), new Image(ui.faviconCache().toUri().toString(),
                                     ui.iconSize(), ui.iconSize(), true, true));
                         } catch (Exception ignored) {
                         }

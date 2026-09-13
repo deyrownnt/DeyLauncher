@@ -30,6 +30,7 @@ public class DeyCapesService {
         DEFAULT_CAPES.put("og", new String[]{"OG Cape", "capes/og_cape.png"});
         DEFAULT_CAPES.put("premium", new String[]{"Premium Cape", "capes/premium_cape.png"});
         DEFAULT_CAPES.put("tester", new String[]{"Tester Cape", "capes/tester_cape.png"});
+        DEFAULT_CAPES.put("expanding", new String[]{"Expanding Cape", "capes/expanding_cape.png"});
     }
 
     public DeyCapesService(GitHubConfig config) {
