@@ -48,7 +48,7 @@ launcher, no system-wide install needed):
 jpackage \
   --type app-image \
   --input build/libs \
-  --main-jar DeyLauncher-0.1.0.jar \
+  --main-jar DeyLauncher-0.1.3.jar \
   --main-class com.deylauncher.ui.LauncherApp \
   --name DeyLauncher \
   --icon src/main/resources/app-icon.png \
@@ -82,7 +82,7 @@ gradlew.bat clean shadowJar
 jpackage `
   --type app-image `
   --input build\libs `
-  --main-jar DeyLauncher-0.1.0.jar `
+  --main-jar DeyLauncher-0.1.3.jar `
   --main-class com.deylauncher.ui.LauncherApp `
   --name DeyLauncher `
   --icon src\main\resources\app-icon.ico `
@@ -105,7 +105,7 @@ Simplest fallback: have Windows friends install a JDK 17+ themselves
 directly:
 
 ```powershell
-java -jar DeyLauncher-0.1.0.jar
+java -jar DeyLauncher-0.1.3.jar
 ```
 
 Less polished (they need Java installed, no native `.exe`), but zero

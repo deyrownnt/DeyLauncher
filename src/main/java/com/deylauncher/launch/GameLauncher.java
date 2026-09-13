@@ -1,6 +1,7 @@
 package com.deylauncher.launch;
 
 import com.deylauncher.auth.AuthSession;
+import com.deylauncher.update.AppUpdater;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
@@ -148,7 +149,7 @@ public class GameLauncher {
                 ? version.versionJson().get("type").getAsString() : "release");
         m.put("natives_directory", version.nativesDir().toString());
         m.put("launcher_name", "DeyLauncher");
-        m.put("launcher_version", "0.1.0");
+        m.put("launcher_version", AppUpdater.currentVersion()); // must match the actual running version (embedded at build)
         m.put("classpath", classpath);
         m.put("resolution_width", String.valueOf(settings.width()));
         m.put("resolution_height", String.valueOf(settings.height()));

@@ -324,13 +324,14 @@ mkdir -p dist
 jpackage \
   --type app-image \
   --input build/jpackage-input \
-  --main-jar DeyLauncher-0.1.0.jar \
+  # The jar name follows the `version` in build.gradle.kts (e.g. 0.1.3 -> DeyLauncher-0.1.3.jar).
+  --main-jar DeyLauncher-0.1.3.jar \
   --main-class com.deylauncher.ui.LauncherApp \
   --name DeyLauncher \
   --icon src/main/resources/app-icon.png \
   --dest dist \
   --java-options "--module-path \$APPDIR --add-modules javafx.controls,javafx.graphics" \
-  --java-options "--enable-native-access=javafx.graphics"
+  --java-options "--enable-native-access=javafx.graphics,ALL-UNNAMED"
 ```
 
 The resulting application is located in:
