@@ -214,18 +214,30 @@ public final class AppUpdater {
 
     /** Resolves where this running app is installed and its launcher binary, so an update can be
      *  applied in place. Returns null when NOT running from a packaged app (e.g. launched via
-     *  Gradle / class files) -- the caller then falls back to opening the release page. */
+     *  Gradle / class files) -- the caller then falls back to opening the release page.
+     *
+     *  jpackage app-image layouts put the launcher and the bundled runtime at DIFFERENT relative
+     *  depths depending on OS (confirmed against JEP 392):
+     *    Windows: <installRoot>/DeyLauncher.exe   + <installRoot>/runtime        + <installRoot>/app/*.jar
+     *    Linux:   <installRoot>/bin/DeyLauncher   + <installRoot>/lib/runtime    + <installRoot>/lib/app/*.jar
+     *  so each OS needs its own check per candidate root -- checking both at the SAME directory
+     *  level (as this used to) never matches on Linux and always fell back to "running from source",
+     *  even for a real installed app. */
     public static InstallLayout resolveInstallLayout() {
         Path jar = findCodeSourceJar();
         if (jar == null) return null;
-        Path dir = jar.getParent();
-        for (Path p = dir; p != null; p = p.getParent()) {
-            Path launcherWin = p.resolve("DeyLauncher.exe");
-            Path launcherLin = p.resolve("bin").resolve("DeyLauncher");
-            boolean hasRuntime = Files.isDirectory(p.resolve("runtime"));
-            if (hasRuntime && (Files.exists(launcherWin) || Files.exists(launcherLin))) {
-                return new InstallLayout(p, Files.exists(launcherWin) ? launcherWin : launcherLin,
-                        Files.exists(launcherWin));
+        boolean win = isWindows();
+        for (Path p = jar.getParent(); p != null; p = p.getParent()) {
+            if (win) {
+                Path launcher = p.resolve("DeyLauncher.exe");
+                if (Files.exists(launcher) && Files.isDirectory(p.resolve("runtime"))) {
+                    return new InstallLayout(p, launcher, true);
+                }
+            } else {
+                Path launcher = p.resolve("bin").resolve("DeyLauncher");
+                if (Files.exists(launcher) && Files.isDirectory(p.resolve("lib").resolve("runtime"))) {
+                    return new InstallLayout(p, launcher, false);
+                }
             }
         }
         return null;
@@ -247,11 +259,25 @@ public final class AppUpdater {
     /** Downloads the update asset to a temp file, reporting bytesRead/total to {@code progress}. */
     public static Path downloadRelease(UpdateInfo info, ObjLongConsumer<Long> progress) throws Exception {
         HttpClient client = HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NORMAL).build();
-        HttpRequest req = HttpRequest.newBuilder(URI.create(info.assetUrl())).GET().build();
+        // GitHub (and the objects.githubusercontent.com CDN it redirects release downloads to) can
+        // reject or error out on requests with no User-Agent -- fetchReleases() already sends one for
+        // the API call, this needs the same for the asset download itself.
+        HttpRequest req = HttpRequest.newBuilder(URI.create(info.assetUrl()))
+                .header("User-Agent", OWNER + "-DeyLauncher")
+                .header("Accept", "application/octet-stream")
+                .GET().build();
         HttpResponse<InputStream> resp = client.send(req, HttpResponse.BodyHandlers.ofInputStream());
         if (resp.statusCode() != 200) {
-            try (InputStream in = resp.body()) { in.readAllBytes(); }
-            throw new IOException("Download failed with HTTP " + resp.statusCode());
+            // Surface enough detail (asset, exact URL, response headers/body) to actually diagnose a
+            // failure like this instead of just "HTTP 500" -- that alone isn't actionable.
+            String body;
+            try (InputStream in = resp.body()) {
+                byte[] bytes = in.readNBytes(1024);
+                body = new String(bytes, StandardCharsets.UTF_8).replaceAll("\\s+", " ").trim();
+            }
+            throw new IOException("Download failed with HTTP " + resp.statusCode()
+                    + " for asset '" + info.assetName() + "' at " + info.assetUrl()
+                    + (body.isEmpty() ? "" : " -- response: " + body));
         }
         long total = info.sizeBytes() > 0 ? info.sizeBytes()
                 : resp.headers().firstValueAsLong("Content-Length").orElse(0);
