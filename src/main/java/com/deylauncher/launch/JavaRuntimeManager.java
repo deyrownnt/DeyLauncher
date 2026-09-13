@@ -4,6 +4,7 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
@@ -40,6 +41,11 @@ public class JavaRuntimeManager {
      * to its java executable ready to hand to ProcessBuilder.
      */
     public Path ensureRuntimeFor(JsonObject versionJson) throws Exception {
+        return ensureRuntimeFor(versionJson, null);
+    }
+
+    /** Progress-aware overload: feeds a 0..1 fraction of the runtime bytes written so far (opt-in). */
+    public Path ensureRuntimeFor(JsonObject versionJson, DownloadProgress progress) throws Exception {
         String component = versionJson.has("javaVersion")
                 ? versionJson.getAsJsonObject("javaVersion").get("component").getAsString()
                 : "jre-legacy"; // versions old enough to omit this field only ever needed the legacy runtime
@@ -67,7 +73,11 @@ public class JavaRuntimeManager {
         String manifestUrl = entry.getAsJsonObject("manifest").get("url").getAsString();
 
         JsonObject manifest = fetchJson(manifestUrl);
-        downloadAllFiles(manifest.getAsJsonObject("files"), componentDir);
+        JsonObject files = manifest.getAsJsonObject("files");
+        double[] done = { 0.0 };
+        double total = runtimeBytesNeeded(files, componentDir);
+        downloadAllFiles(files, componentDir, progress, done, total);
+        if (progress != null) progress.onProgress(1.0);
 
         if (!Files.exists(javaBin)) {
             throw new IllegalStateException("Runtime downloaded but java binary not found at " + javaBin
@@ -76,7 +86,25 @@ public class JavaRuntimeManager {
         return javaBin;
     }
 
-    private void downloadAllFiles(JsonObject files, Path componentDir) throws Exception {
+    /** Sums the declared sizes of the runtime files that still need downloading, for progress reporting. */
+    private double runtimeBytesNeeded(JsonObject files, Path componentDir) {
+        double total = 0.0;
+        for (String relativePath : files.keySet()) {
+            JsonObject fileEntry = files.getAsJsonObject(relativePath);
+            if (!"file".equals(fileEntry.get("type").getAsString())) continue;
+            try {
+                JsonObject raw = fileEntry.getAsJsonObject("downloads").getAsJsonObject("raw");
+                long size = raw.get("size").getAsLong();
+                Path target = componentDir.resolve(relativePath);
+                if (!Files.exists(target) || Files.size(target) != size) total += size;
+            } catch (Exception ignored) {
+            }
+        }
+        return total;
+    }
+
+    private void downloadAllFiles(JsonObject files, Path componentDir, DownloadProgress progress,
+                                  double[] done, double total) throws Exception {
         for (String relativePath : files.keySet()) {
             JsonObject fileEntry = files.getAsJsonObject(relativePath);
             String type = fileEntry.get("type").getAsString();
@@ -88,12 +116,7 @@ public class JavaRuntimeManager {
                     JsonObject raw = fileEntry.getAsJsonObject("downloads").getAsJsonObject("raw");
                     long size = raw.get("size").getAsLong();
                     if (!Files.exists(target) || Files.size(target) != size) {
-                        Files.createDirectories(target.getParent());
-                        HttpRequest req = HttpRequest.newBuilder(URI.create(raw.get("url").getAsString())).GET().build();
-                        HttpResponse<Path> resp = http.send(req, HttpResponse.BodyHandlers.ofFile(target));
-                        if (resp.statusCode() >= 400) {
-                            throw new IOException("Failed downloading runtime file " + relativePath);
-                        }
+                        streamDownload(raw.get("url").getAsString(), target, relativePath, progress, done, total);
                     }
                     boolean executable = fileEntry.has("executable") && fileEntry.get("executable").getAsBoolean();
                     if (executable) markExecutable(target);
@@ -113,6 +136,30 @@ public class JavaRuntimeManager {
                     }
                 }
                 default -> { /* unknown entry type -- skip rather than fail the whole download */ }
+            }
+        }
+    }
+
+    /** Streams one runtime file to disk, counting bytes into {@code done} so the caller can report a
+     *  0..1 phase fraction. A small error here is fatal for the whole runtime download (same as before). */
+    private void streamDownload(String url, Path target, String relativePath,
+                                DownloadProgress progress, double[] done, double total) throws Exception {
+        Files.createDirectories(target.getParent());
+        HttpRequest req = HttpRequest.newBuilder(URI.create(url)).GET().build();
+        HttpResponse<InputStream> resp = http.send(req, HttpResponse.BodyHandlers.ofInputStream());
+        if (resp.statusCode() >= 400) {
+            throw new IOException("Failed downloading runtime file " + relativePath);
+        }
+        boolean streaming = progress != null && total > 0;
+        try (var in = resp.body(); var out = Files.newOutputStream(target)) {
+            byte[] buf = new byte[64 * 1024];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+                if (streaming) {
+                    done[0] += n;
+                    progress.onProgress(Math.min(1.0, done[0] / total));
+                }
             }
         }
     }
