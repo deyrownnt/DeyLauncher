@@ -689,6 +689,15 @@
     -fx-fill: -fx-text-fill;
 }
 
+/* Icon-only toggle buttons (e.g. the Servers page filter funnel): keep the glyph legible and turn
+   it the accent color while the toggle is active, matching the text color of a selected toggle. */
+.theme-dark .toggle-button:selected .icon-svg {
+    -fx-fill: #ff7a1f;
+}
+.theme-light .toggle-button:selected .icon-svg {
+    -fx-fill: #e8690f;
+}
+
 /* Keep status dots visually small */
 .status-icon {
     -fx-scale-x: 0.7;

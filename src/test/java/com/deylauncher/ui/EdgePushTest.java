@@ -102,6 +102,17 @@ class EdgePushTest {
     }
 
     @Test
+    void restoreUnderPointer_returnsThePreTileSizeCenteredOnThePointer() {
+        // Dragging a half-tiled window away must restore the size it had before it was tiled, and
+        // drop it under the pointer so the drag feels continuous (Windows-style "un-tile by drag").
+        Rectangle2D restored = EdgePush.restoreUnderPointer(1280, 720, 400, 300, 40);
+        assertEquals(400 - 640, restored.getMinX(), 1e-9);
+        assertEquals(300 - 20, restored.getMinY(), 1e-9);
+        assertEquals(1280, restored.getWidth(), 1e-9);
+        assertEquals(720, restored.getHeight(), 1e-9);
+    }
+
+    @Test
     void slide_movesOutwardAtTheGivenSpeed() {
         double[] out = new double[2];
 

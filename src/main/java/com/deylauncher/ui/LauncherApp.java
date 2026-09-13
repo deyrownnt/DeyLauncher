@@ -1322,12 +1322,16 @@ public class LauncherApp extends Application {
     }
 
     /** Publishes the currently-owned servers (from this install) to the friend profile, in the
-     *  background. Name + port; no icon since self-hosted servers have no hosted image. */
+     *  background. Only servers the user marked visible (Account > Friend Profile > Owned Servers)
+     *  are shared; the rest stay private to this PC. Name + port; no icon since self-hosted servers
+     *  may have no hosted image. */
     private void publishOwnedServers(PlayerIdentity active) {
         if (friendsService == null) return;
         java.util.List<FriendsData.ServerInfo> owned = new java.util.ArrayList<>();
         for (var srv : serverStore.listAll()) {
-            if (srv.name != null && !srv.name.isBlank()) owned.add(new FriendsData.ServerInfo(srv.name, srv.port, null));
+            if (srv.visibleToFriends && srv.name != null && !srv.name.isBlank()) {
+                owned.add(new FriendsData.ServerInfo(srv.name, srv.port, null));
+            }
         }
         Task<Void> task = new Task<>() {
             @Override protected Void call() throws Exception {
@@ -1400,12 +1404,12 @@ public class LauncherApp extends Application {
         tile.getChildren().addAll(bg, inits);
 
         if (iconUrl != null && !iconUrl.isBlank()) {
-            long id = Math.abs((name == null ? "" : name).hashCode());
+            java.nio.file.Path cache = serverIconCachePath(name);
             ImageView iv = new ImageView();
             iv.setFitWidth(size);
             iv.setFitHeight(size);
             iv.setSmooth(true);
-            Circle clip = new Circle(size / 2.0);
+            Circle clip = new Circle(size / 2.0, size / 2.0, size / 2.0);
             iv.setClip(clip);
             iv.setUserData(Boolean.TRUE);
             tile.getChildren().add(iv);
@@ -1413,8 +1417,6 @@ public class LauncherApp extends Application {
             Task<java.nio.file.Path> fetch = new Task<>() {
                 @Override protected java.nio.file.Path call() {
                     try {
-                        java.nio.file.Path cache = gameFiles.root.resolve("server-icons")
-                                .resolve("srv" + id + ".png");
                         java.nio.file.Files.createDirectories(cache.getParent());
                         var h = java.net.http.HttpClient.newHttpClient();
                         var req = java.net.http.HttpRequest.newBuilder(java.net.URI.create(iconUrl)).GET().build();
@@ -1434,13 +1436,80 @@ public class LauncherApp extends Application {
         return tile;
     }
 
-    /** A "Join Server" button that pulses a green glow while the profile is open. */
-    private Button glowingJoinButton(String address) {
-        Button b = new Button("Join Server");
-        b.getStyleClass().add("pill-button");
-        setButtonIcon(b, IconFactory.Icon.PLAY, "Join");
+    /** Where a downscaled/cached server icon lives on disk (shared by favicons and friend icons). */
+    private Path serverIconCachePath(String key) {
+        long id = Math.abs((key == null ? "" : key).hashCode());
+        return gameFiles.root.resolve("server-icons").resolve("srv" + id + ".png");
+    }
+
+    /**
+     * A circular server avatar: a colored disc with the server's initials, plus an icon image
+     * layered on top when a local file already exists. The ImageView is stashed in the tile's
+     * properties so a background ping can drop in a freshly fetched favicon later without a rebuild.
+     */
+    private StackPane serverIconTile(String name, Path localIcon, double size) {
+        StackPane tile = new StackPane();
+        tile.setMinSize(size, size);
+        tile.setMaxSize(size, size);
+        String initials = "";
+        if (name != null && !name.isBlank()) {
+            String t = name.trim();
+            initials = t.substring(0, 1).toUpperCase();
+            int sp = t.indexOf(' ');
+            if (sp > 0 && sp + 1 < t.length()) initials += t.charAt(sp + 1);
+        }
+        double hue = Math.abs((name == null ? "" : name).hashCode()) % 360;
+        Circle bg = new Circle(size / 2.0, Color.hsb(hue, 0.45, 0.40));
+        Label inits = new Label(initials);
+        inits.setTextFill(javafx.scene.paint.Color.WHITE);
+        inits.setFont(Font.font(Font.getDefault().getFamily(), FontWeight.BOLD, size * 0.38));
+        ImageView iv = new ImageView();
+        iv.setFitWidth(size);
+        iv.setFitHeight(size);
+        iv.setSmooth(true);
+        iv.setClip(new Circle(size / 2.0, size / 2.0, size / 2.0));
+        if (localIcon != null && Files.exists(localIcon)) {
+            try {
+                iv.setImage(new Image(localIcon.toUri().toString(), size, size, true, true));
+            } catch (Exception ignored) {
+            }
+        }
+        tile.getProperties().put("deyServerIconView", iv);
+        tile.getChildren().addAll(bg, inits, iv);
+        return tile;
+    }
+
+    private ImageView serverIconImageView(Node tile) {
+        if (tile == null) return null;
+        Object v = tile.getProperties().get("deyServerIconView");
+        return v instanceof ImageView iv ? iv : null;
+    }
+
+    /** Decodes a data:image/png;base64 favicon from a status response into the given PNG cache file. */
+    private static void cacheFavicon(String dataUri, Path out) {
+        try {
+            if (dataUri == null || out == null) return;
+            int comma = dataUri.indexOf(',');
+            String b64 = comma >= 0 ? dataUri.substring(comma + 1) : dataUri;
+            byte[] bytes = java.util.Base64.getDecoder().decode(b64.trim());
+            if (bytes.length == 0) return;
+            Files.createDirectories(out.getParent());
+            Files.write(out, bytes);
+        } catch (Exception ignored) {
+            // A missing/odd favicon is never worth surfacing -- the initials tile already looks fine.
+        }
+    }
+
+    /**
+     * Adds the pulsing green "online / joinable" glow to a Join button. Idempotent (safe to call on
+     * every ping refresh) and auto-stops the animation when the button leaves the scene, so
+     * re-rendering the server list never leaves an orphan timeline running behind the scenes.
+     */
+    private void ensureJoinGlow(Button b) {
+        if (b == null || b.getProperties().containsKey("deyJoinGlow")) return;
+        b.getProperties().put("deyJoinGlow", Boolean.TRUE);
         DropShadow glow = new DropShadow();
-        glow.setColor(javafx.scene.paint.Color.rgb(120, 255, 150, 0.95));
+        glow.setColor(Color.rgb(120, 255, 150, 0.95));
         glow.setRadius(14);
         b.setEffect(glow);
         Timeline tl = new Timeline(
@@ -1449,11 +1518,81 @@ public class LauncherApp extends Application {
         tl.setAutoReverse(true);
         tl.setCycleCount(Animation.INDEFINITE);
         tl.play();
+        b.sceneProperty().addListener((o, oldScene, newScene) -> {
+            if (newScene == null) {
+                tl.stop();
+                b.setEffect(null);
+            }
+        });
+    }
+
+    /** A "Join Server" button that pulses a green glow while the profile is open. */
+    private Button glowingJoinButton(String address) {
+        Button b = new Button("Join Server");
+        b.getStyleClass().add("pill-button");
+        setButtonIcon(b, IconFactory.Icon.PLAY, "Join");
+        ensureJoinGlow(b);
         b.setOnAction(e -> {
             selectNavTab(navHomeBtn);
             onPlay(address);
         });
         return b;
+    }
+
+    /** The live parts of a server card/row a background ping updates in place. */
+    private record ServerCardUi(Label badge, Button joinBtn, StackPane iconTile, Path faviconCache,
+                                double iconSize, boolean owned, boolean running, boolean refreshIcon) {}
+
+    /**
+     * Pings a server in the background and reflects the result on its already-built card/row: the
+     * status badge gains an "ONLINE · N/M players" reading, the Join button starts glowing, and a
+     * favicon (when the server sends one) is cached and shown. Results are dropped if the row was
+     * re-rendered meanwhile, so a slow ping can never scribble over a newer row.
+     */
+    private void pingServerAsync(String address, ServerCardUi ui) {
+        if (address == null || address.isBlank() || ui == null || ui.badge() == null) return;
+        // A stopped local server can't answer, so skip the socket attempt (and its timeout) entirely.
+        if (ui.owned() && !ui.running()) return;
+        Task<ServerStatusPing.Status> task = new Task<>() {
+            @Override protected ServerStatusPing.Status call() {
+                return ServerStatusPing.ping(address, 2500);
+            }
+        };
+        task.setOnSucceeded(e -> {
+            if (ui.badge().getScene() == null) return; // detached by a re-render: stale result
+            ServerStatusPing.Status st = task.getValue();
+            if (st.online()) {
+                String players = st.maxPlayers() > 0
+                        ? st.onlinePlayers() + "/" + st.maxPlayers() + " players"
+                        : st.onlinePlayers() + " players";
+                ui.badge().setText("ONLINE  ·  " + players);
+                ui.badge().getStyleClass().setAll("badge-online");
+                Node dot = ui.badge().getGraphic();
+                if (dot instanceof Circle c) c.getStyleClass().setAll("status-dot-online");
+                if (ui.joinBtn() != null) ensureJoinGlow(ui.joinBtn());
+                if (st.faviconDataUri() != null && ui.faviconCache() != null && ui.refreshIcon()) {
+                    ImageView iv = serverIconImageView(ui.iconTile());
+                    if (iv != null) { // refreshIcon is false when a custom server-icon.png is in charge
+                        cacheFavicon(st.faviconDataUri(), ui.faviconCache());
+                        try {
+                            iv.setImage(new Image(ui.faviconCache().toUri().toString(),
+                                    ui.iconSize(), ui.iconSize(), true, true));
+                        } catch (Exception ignored) {
+                        }
+                    }
+                }
+            } else if (ui.owned()) {
+                setBadge(ui.badge(), ui.running()); // still starting up? show RUNNING, not OFFLINE
+            } else {
+                ui.badge().setText("OFFLINE");
+                ui.badge().getStyleClass().setAll("badge-offline");
+                Node dot = ui.badge().getGraphic();
+                if (dot instanceof Circle c) c.getStyleClass().setAll("status-dot-offline");
+            }
+        });
+        Thread t = new Thread(task, "server-ping");
+        t.setDaemon(true);
+        t.start();
     }
 
     /** Opens a social link / email / website in the OS browser. Safe no-op if it isn't a link. */
@@ -1524,6 +1663,8 @@ public class LauncherApp extends Application {
 
     private enum ServerSortMode { NAME_ASC, NAME_DESC, RECENTLY_PLAYED, LEAST_RECENTLY_PLAYED }
     private ServerSortMode serversSortMode = ServerSortMode.RECENTLY_PLAYED;
+    /** Whether the Servers page's filter/sort row is shown -- hidden by default, toggled by the funnel button. */
+    private boolean serversFilterVisible = false;
 
     private void renderServersPageContent() {
         serversPageContent.getChildren().clear();
@@ -1538,10 +1679,28 @@ public class LauncherApp extends Application {
         ToggleButton recentBtn = sortToggleButton("Recently Played", ServerSortMode.RECENTLY_PLAYED, sortGroup);
         ToggleButton leastRecentBtn = sortToggleButton("Least Recently Played", ServerSortMode.LEAST_RECENTLY_PLAYED, sortGroup);
         HBox sortBar = new HBox(6, nameAscBtn, nameDescBtn, recentBtn, leastRecentBtn);
+        // The filter/sort row is hidden by default and revealed by the funnel button next to Add
+        // Server. `managed` is toggled too so a hidden row leaves no gap in the layout.
+        sortBar.setVisible(serversFilterVisible);
+        sortBar.setManaged(serversFilterVisible);
 
         Button addServerBtn = new Button("+  Add Server");
         addServerBtn.getStyleClass().add("pill-button");
         addServerBtn.setOnAction(e -> openAddServerDialog());
+
+        // Filter toggle: an SVG funnel (IconFactory), so it renders identically on every device
+        // rather than depending on an emoji/unicode glyph being installed. Sits next to Add Server.
+        ToggleButton filterToggle = new ToggleButton();
+        filterToggle.getStyleClass().add("pill-button");
+        setButtonIconOnly(filterToggle, IconFactory.Icon.FILTER);
+        filterToggle.setSelected(serversFilterVisible);
+        filterToggle.setTooltip(new Tooltip(serversFilterVisible ? "Hide filters" : "Show filters"));
+        filterToggle.setOnAction(e -> {
+            serversFilterVisible = filterToggle.isSelected();
+            sortBar.setVisible(serversFilterVisible);
+            sortBar.setManaged(serversFilterVisible);
+            filterToggle.setTooltip(new Tooltip(serversFilterVisible ? "Hide filters" : "Show filters"));
+        });
 
         Button createServerBtn = new Button("+  Create Server");
         createServerBtn.getStyleClass().add("play-button");
@@ -1549,7 +1708,7 @@ public class LauncherApp extends Application {
 
         Region headerSpacer = new Region();
         HBox.setHgrow(headerSpacer, Priority.ALWAYS);
-        HBox headerRow = new HBox(12, heading, headerSpacer, addServerBtn, createServerBtn);
+        HBox headerRow = new HBox(12, heading, headerSpacer, filterToggle, addServerBtn, createServerBtn);
         headerRow.setAlignment(Pos.CENTER_LEFT);
         serversPageContent.getChildren().addAll(headerRow, sortBar);
 
@@ -1649,8 +1808,10 @@ public class LauncherApp extends Application {
             wavePulseDots.add(dot);
 
             // Server icon + friendly server name so friends recognise where they'd be joining.
-            Node serverIcon = icon(IconFactory.Icon.SERVER, 15);
-            serverIcon.getStyleClass().add("server-icon");
+            // Uses the friend's published icon when they have one, else the initials tile.
+            Node serverIcon = entry.currentServerIconUrl != null && !entry.currentServerIconUrl.isBlank()
+                    ? serverTile(display, entry.currentServerIconUrl, 28)
+                    : serverIconTile(display, null, 28);
             Label serverLabel = new Label(display);
             serverLabel.getStyleClass().add("notice-label");
             HBox serverBox = new HBox(7, serverIcon, serverLabel);
@@ -1665,6 +1826,7 @@ public class LauncherApp extends Application {
             Button joinBtn = new Button();
             joinBtn.getStyleClass().add("pill-button");
             setButtonIcon(joinBtn, IconFactory.Icon.PLAY, "Join");
+            ensureJoinGlow(joinBtn); // the friend is online on this server right now, so it's joinable
             joinBtn.setOnAction(ev -> {
                 selectNavTab(navHomeBtn);
                 onPlay(entry.serverAddress);
@@ -1681,6 +1843,13 @@ public class LauncherApp extends Application {
     private VBox buildYourServerCard(ServerInstance server) {
         boolean running = runningServers.containsKey(server.id) && runningServers.get(server.id).isRunning();
 
+        // A custom server-icon.png (set in Properties) is authoritative; otherwise the pinged
+        // favicon is cached here and shown once it arrives.
+        Path localIcon = serverStore.serverDir(server.id).resolve("server-icon.png");
+        boolean hasLocalIcon = Files.exists(localIcon);
+        Path faviconCache = serverIconCachePath("owned:" + server.id);
+        StackPane iconTile = serverIconTile(server.name, hasLocalIcon ? localIcon : faviconCache, 44);
+
         Label cardNameLabel = new Label(server.name);
         cardNameLabel.getStyleClass().add("mod-name");
         Label cardSubLabel = new Label(server.type.displayName() + "  ·  " + server.minecraftVersion);
@@ -1690,15 +1859,26 @@ public class LauncherApp extends Application {
 
         // Only this header (not the whole card) opens management on click, so the Join row
         // below has its own buttons that work independently without the click bubbling up.
-        VBox cardHeader = new VBox(6, cardNameLabel, cardSubLabel, cardStatusBadge);
+        VBox cardText = new VBox(6, cardNameLabel, cardSubLabel, cardStatusBadge);
+        HBox cardHeader = new HBox(12, iconTile, cardText);
+        cardHeader.setAlignment(Pos.CENTER_LEFT);
         cardHeader.setOnMouseClicked(e -> openServerManagementDialog(server));
 
         HBox cardJoinRow = buildJoinSplitRow(server);
+        Button joinMainBtn = cardJoinRow.getChildren().isEmpty()
+                ? null : (Button) cardJoinRow.getChildren().get(0);
 
         VBox card = new VBox(10, cardHeader, cardJoinRow);
         card.setPadding(new Insets(16));
         card.setPrefWidth(260);
         card.getStyleClass().add("skin-library-tile");
+        // Live status: only a RUNNING server can answer a status ping, so a stopped one keeps its
+        // STOPPED badge without a needless socket attempt.
+        if (running) {
+            pingServerAsync("localhost:" + server.port,
+                    new ServerCardUi(cardStatusBadge, joinMainBtn, iconTile, faviconCache, 44,
+                            true, true, !hasLocalIcon));
+        }
         return card;
     }
 
@@ -1801,11 +1981,26 @@ public class LauncherApp extends Application {
     }
 
     private HBox buildAddedServerRow(AddedServersStore.AddedServer s) {
+        VBox textBox = new VBox(2);
         Label name = new Label(s.name());
         name.getStyleClass().add("mod-name");
+        name.setCursor(javafx.scene.Cursor.HAND);
+        Tooltip.install(name, new Tooltip("Click the name to rename this server"));
         Label address = new Label(s.address());
         address.getStyleClass().add("notice-label");
-        VBox textBox = new VBox(2, name, address);
+        textBox.getChildren().addAll(name, address);
+        name.setOnMouseClicked(ev -> startInlineRename(s, textBox, name));
+
+        Path iconCache = serverIconCachePath(s.address());
+        StackPane iconTile = serverIconTile(s.name(), iconCache, 40);
+
+        // Filled in by the background ping (Checking... -> ONLINE · N/M players / OFFLINE).
+        Label status = new Label("Checking...");
+        status.getStyleClass().add("badge-offline");
+        Circle statusDot = new Circle(3.6);
+        statusDot.getStyleClass().add("status-dot-offline");
+        status.setGraphic(statusDot);
+        status.setGraphicTextGap(6);
 
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
@@ -1825,10 +2020,44 @@ public class LauncherApp extends Application {
             renderServersPageContent();
         });
 
-        HBox row = new HBox(12, textBox, spacer, joinBtn, removeBtn);
+        HBox row = new HBox(12, iconTile, textBox, status, spacer, joinBtn, removeBtn);
         row.setAlignment(Pos.CENTER_LEFT);
         row.getStyleClass().add("mod-row");
+        pingServerAsync(s.address(), new ServerCardUi(status, joinBtn, iconTile, iconCache, 40,
+                false, false, true));
         return row;
+    }
+
+    /**
+     * Turns an added server's name label into an inline editor. Enter or clicking away commits the
+     * new name (persisted by AddedServersStore), Escape cancels; either way the row is re-rendered.
+     */
+    private void startInlineRename(AddedServersStore.AddedServer s, VBox textBox, Label name) {
+        int idx = textBox.getChildren().indexOf(name);
+        if (idx < 0) return;
+        TextField editor = new TextField(s.name());
+        editor.getStyleClass().add("input-field");
+        editor.setPrefWidth(200);
+        textBox.getChildren().set(idx, editor);
+        editor.requestFocus();
+        editor.selectAll();
+        final boolean[] done = {false};
+        Runnable commit = () -> {
+            if (done[0]) return;
+            done[0] = true;
+            addedServersStore.rename(s.id(), editor.getText());
+            renderServersPageContent();
+        };
+        editor.setOnAction(e -> commit.run());
+        editor.setOnKeyPressed(k -> {
+            if (k.getCode() == javafx.scene.input.KeyCode.ESCAPE) {
+                done[0] = true;
+                renderServersPageContent();
+            }
+        });
+        editor.focusedProperty().addListener((o, was, is) -> {
+            if (was && !is) commit.run();
+        });
     }
 
     private void openAddServerDialog() {
@@ -2551,7 +2780,7 @@ public class LauncherApp extends Application {
         Runnable markDirty = () -> dirty.set(true);
 
         // ---- Server icon drag-and-drop ----
-        Label iconLabel = sectionLabel("SERVER ICON (64x64 PNG)");
+        Label iconLabel = sectionLabel("SERVER ICON (64x64)");
         Path iconPath = serverDir.resolve("server-icon.png");
         ImageView iconPreview = new ImageView();
         iconPreview.setFitWidth(64);
@@ -2562,12 +2791,14 @@ public class LauncherApp extends Application {
             } catch (Exception ignored) {
             }
         }
-        Label dropHint = new Label("Drag & drop a 64x64 PNG here");
+        Label dropHint = new Label("Drag & drop any image -- it's converted to 64x64 for you");
         dropHint.getStyleClass().add("notice-label");
+        dropHint.setWrapText(true);
+        dropHint.setMaxWidth(150);
         VBox dropZone = new VBox(8, iconPreview, dropHint);
         dropZone.setAlignment(Pos.CENTER);
         dropZone.getStyleClass().add("drop-zone");
-        dropZone.setPrefSize(140, 120);
+        dropZone.setPrefSize(150, 130);
         dropZone.setOnDragOver(e -> {
             if (e.getDragboard().hasFiles()) e.acceptTransferModes(javafx.scene.input.TransferMode.COPY);
             dropZone.getStyleClass().add("drop-zone-active");
@@ -2578,12 +2809,17 @@ public class LauncherApp extends Application {
             if (files != null && !files.isEmpty()) {
                 try {
                     var img = javax.imageio.ImageIO.read(files.get(0));
-                    if (img != null && img.getWidth() == 64 && img.getHeight() == 64) {
-                        Files.copy(files.get(0).toPath(), iconPath, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-                        iconPreview.setImage(new Image(iconPath.toUri().toString()));
-                        dropHint.setText("Saved.");
+                    if (img == null) {
+                        dropHint.setText("Couldn't read that file as an image.");
                     } else {
-                        dropHint.setText("Must be exactly 64x64 PNG.");
+                        // Accept ANY size/format: normalize to the exact 64x64 PNG the server needs.
+                        // Non-square images are center-cropped first, so they aren't stretched.
+                        writeServerIcon64(img, iconPath);
+                        iconPreview.setImage(new Image(iconPath.toUri().toString()));
+                        int w = img.getWidth(), h = img.getHeight();
+                        dropHint.setText((w == 64 && h == 64)
+                                ? "Saved."
+                                : "Saved -- converted from " + w + "x" + h + " to 64x64.");
                     }
                 } catch (Exception ex) {
                     dropHint.setText("Couldn't read that file.");
@@ -2792,6 +3028,24 @@ public class LauncherApp extends Application {
                 sectionLabel("RESOURCE PACK"), packUrlField, packPromptField,
                 packDropZone, packSha1Label, packHonestNote);
         return tabShell(scroll, saveBtn, savedNote);
+    }
+
+    /** Normalizes any dropped image to the exact 64x64 PNG a Minecraft server wants. Non-square
+     *  input is center-cropped to a square first so it isn't stretched, then scaled; the result is
+     *  always written as a PNG (also normalizing JPG/WebP input) with alpha preserved. */
+    private static void writeServerIcon64(java.awt.image.BufferedImage src, Path out) throws java.io.IOException {
+        int side = Math.max(1, Math.min(src.getWidth(), src.getHeight()));
+        int sx = (src.getWidth() - side) / 2;
+        int sy = (src.getHeight() - side) / 2;
+        java.awt.image.BufferedImage icon =
+                new java.awt.image.BufferedImage(64, 64, java.awt.image.BufferedImage.TYPE_INT_ARGB);
+        java.awt.Graphics2D g = icon.createGraphics();
+        g.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION,
+                java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+        g.drawImage(src, 0, 0, 64, 64, sx, sy, sx + side, sy + side, null);
+        g.dispose();
+        Files.createDirectories(out.getParent());
+        javax.imageio.ImageIO.write(icon, "png", out.toFile());
     }
 
     private int parseIntSafe(String s, int fallback) {
@@ -4772,6 +5026,8 @@ public class LauncherApp extends Application {
         final boolean[] prevSlid = new boolean[1];
         final boolean[] pushRefused = new boolean[1]; // this desktop refused to move a window off its screens
         final int[] snapEdge = new int[1];   // snap mode: the EdgePush.LEFT/RIGHT edge the window is armed on
+        final boolean[] halfTiled = new boolean[1]; // currently filling a lateral half-tile from snap mode
+        final double[] preTile = new double[4];     // window x,y,w,h captured the moment it was first tiled
         final long[] topBandSince = new long[1];
         final boolean[] topPushed = new boolean[1]; // top edge already slid off -> don't maximize on release
         final AnimationTimer[] pushTimer = new AnimationTimer[1];
@@ -4830,6 +5086,13 @@ public class LauncherApp extends Application {
             javafx.geometry.Rectangle2D wa =
                     screenAt.apply(new double[]{lastPtr[0], lastPtr[1]}).getVisualBounds();
             javafx.geometry.Rectangle2D tile = EdgePush.halfTile(wa, snapEdge[0] == EdgePush.LEFT);
+            // Remember the size the window had BEFORE it was first tiled, so grabbing its header
+            // again can restore it (see the MOUSE_PRESSED handler). Re-tiling must keep the original.
+            if (!halfTiled[0]) {
+                preTile[0] = win.getX(); preTile[1] = win.getY();
+                preTile[2] = win.getWidth(); preTile[3] = win.getHeight();
+                halfTiled[0] = true;
+            }
             win.setMaximized(false);
             win.setX(tile.getMinX());
             win.setY(tile.getMinY());
@@ -5060,6 +5323,7 @@ public class LauncherApp extends Application {
                     prevBounds[2] = win.getWidth(); prevBounds[3] = win.getHeight();
                     lastPtr[0] = e.getScreenX(); lastPtr[1] = e.getScreenY();
                     dragging[0] = true; resizing[0] = false;
+                    halfTiled[0] = false; // maximizing replaced any half-tile state
                     return;
                 }
 
@@ -5070,7 +5334,24 @@ public class LauncherApp extends Application {
                     // Pressed an edge/corner -> start resizing. Direction is locked at press, so once the
                     // pointer leaves the corner it keeps resizing those two axes only ("lateral only").
                     resizing[0] = true; dragging[0] = false;
+                    halfTiled[0] = false; // a manual resize retires the remembered pre-tile size
                 } else if (p[1] <= headerBottom.getAsDouble()) {
+                    // Grabbing the header of a window that snap mode half-tiled restores the size it had
+                    // BEFORE it was pushed to the side and drops it under the pointer -- the same "drag a
+                    // tiled window away to un-tile it" behaviour the desktop itself has.
+                    if (halfTiled[0]) {
+                        double rw = preTile[2] > 0 ? preTile[2] : orig[2];
+                        double rh = preTile[3] > 0 ? preTile[3] : orig[3];
+                        javafx.geometry.Rectangle2D restored = EdgePush.restoreUnderPointer(
+                                rw, rh, e.getScreenX(), e.getScreenY(), headerBottom.getAsDouble());
+                        win.setWidth(rw);
+                        win.setHeight(rh);
+                        win.setX(restored.getMinX());
+                        win.setY(restored.getMinY());
+                        prevBounds[0] = restored.getMinX(); prevBounds[1] = restored.getMinY();
+                        prevBounds[2] = rw; prevBounds[3] = rh;
+                        halfTiled[0] = false;
+                    }
                     lastPtr[0] = e.getScreenX(); lastPtr[1] = e.getScreenY();
                     dragging[0] = true; resizing[0] = false;
                     // The edge gesture is armed by the drag events, never by the press alone: a plain
@@ -5089,6 +5370,7 @@ public class LauncherApp extends Application {
                 double[] p = new double[2];
                 readLocal.accept(e, p);
                 if (p[1] > headerBottom.getAsDouble()) return; // only the title bar double-click toggles
+                halfTiled[0] = false; // maximize/restore supersedes any remembered half-tile size
                 if (!win.isMaximized()) {
                     prevBounds[0] = win.getX(); prevBounds[1] = win.getY();
                     prevBounds[2] = win.getWidth(); prevBounds[3] = win.getHeight();
@@ -5580,6 +5862,8 @@ public class LauncherApp extends Application {
             if (friendsService != null) {
                 content.getChildren().add(sectionLabel("FRIEND PROFILE"));
                 content.getChildren().add(buildSocialsEditor(active));
+                content.getChildren().add(sectionLabel("OWNED SERVERS ON MY PROFILE"));
+                content.getChildren().add(buildServerVisibilityEditor(active));
             }
 
             Button logoutBtn = new Button();
@@ -5711,6 +5995,37 @@ public class LauncherApp extends Application {
         HBox addRow = new HBox(8, typeBox, valueField, addBtn);
         HBox.setHgrow(valueField, Priority.ALWAYS);
         box.getChildren().addAll(addRow, rows, new HBox(10, saveBtn, status));
+        return box;
+    }
+
+    /**
+     * Owned-servers visibility for the friend profile: one checkbox per server this install owns, so
+     * you choose exactly which servers friends see under "Servers they own" on your profile. Hiding a
+     * server immediately republishes presence without it (see {@link #publishOwnedServers}).
+     */
+    private Node buildServerVisibilityEditor(PlayerIdentity active) {
+        VBox box = new VBox(8);
+        var servers = serverStore.listAll();
+        if (servers.isEmpty()) {
+            box.getChildren().add(noticeText("You don't host any servers yet -- create one on the "
+                    + "Servers page, then choose here whether friends can see it."));
+            return box;
+        }
+        Label note = new Label("Check a server to show it on your friend profile; uncheck it to keep it "
+                + "completely private to this PC. Changes save instantly.");
+        note.getStyleClass().add("notice-label");
+        note.setWrapText(true);
+        box.getChildren().add(note);
+        for (var srv : servers) {
+            CheckBox cb = new CheckBox(srv.name != null && !srv.name.isBlank() ? srv.name : "Unnamed server");
+            cb.setSelected(srv.visibleToFriends);
+            cb.selectedProperty().addListener((o, was, is) -> {
+                srv.visibleToFriends = is;
+                serverStore.save(srv);
+                publishOwnedServers(active); // republish so friends see the change right away
+            });
+            box.getChildren().add(cb);
+        }
         return box;
     }
 
