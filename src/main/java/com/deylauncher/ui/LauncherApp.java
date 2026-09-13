@@ -19,6 +19,7 @@ import com.deylauncher.modloader.DeyCapesInstaller;
 import com.deylauncher.modloader.ModPairResolver;
 import com.deylauncher.modloader.ModsUtil;
 import com.deylauncher.server.*;
+import com.deylauncher.update.AppUpdater;
 import com.google.gson.JsonObject;
 import com.deylauncher.version.VersionManifest;
 import javafx.application.Application;
@@ -38,6 +39,7 @@ import javafx.scene.layout.*;
 import javafx.scene.paint.Color;
 import javafx.scene.shape.Circle;
 import javafx.scene.shape.Rectangle;
+import javafx.scene.shape.StrokeType;
 import javafx.scene.text.Font;
 import javafx.scene.text.FontWeight;
 import javafx.util.Duration;
@@ -47,6 +49,7 @@ import javafx.stage.FileChooser;
 import javafx.stage.Modality;
 import javafx.stage.Popup;
 import javafx.stage.Stage;
+import javafx.stage.StageStyle;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -75,7 +78,7 @@ public class LauncherApp extends Application {
     private ComboBox<String> modLoaderBox;
     private Button modsBtn;
     private Button playButton;
-    private ProgressBar progressBar;
+    private WaveLaunchBar launchProgress;
     private Scene scene;
     private Stage stage;
     private final GameFiles gameFiles = new GameFiles(); // just for .root -- no I/O until prepare() is called
@@ -124,6 +127,16 @@ public class LauncherApp extends Application {
     private Button navHomeBtn, navFriendsBtn, navServersBtn;
     private StackPane pageHost;
     private Node mainPageRoot;
+
+    // ---- Main-window custom chrome (borderless stage) + self-updater ----
+    private javafx.scene.layout.BorderPane root;      // the themed content root of the main window
+    private javafx.scene.layout.StackPane windowStack; // scene root: lets an overlay cover everything
+    private HBox topBar;                              // drag handle for the undecorated main window
+    private Button updateBtn;                        // orange download icon, shown only when an update is available
+    private AppUpdater.UpdateInfo updateInfo;        // detected update waiting to be installed
+    private javafx.scene.layout.StackPane updateOverlay;
+    private ProgressBar updateProgress;
+    private Label updateStatus;
 
     // ---- Shared "secondary" borderless windows (Settings / Server Management / Change Version) ----
     // All open like the Mods window (borderless + themed + draggable + resizable). Each opens on
@@ -209,12 +222,17 @@ public class LauncherApp extends Application {
 
         stage.setTitle("DeyLauncher");
         stage.getIcons().add(new Image(getClass().getResourceAsStream("/app-icon.png")));
+        stage.initStyle(StageStyle.UNDECORATED);   // borderless main window, same as the Mods window
 
-        BorderPane root = new BorderPane();
+        root = new BorderPane();
         root.getStyleClass().add("root-pane");
 
         root.setTop(buildTopBar());
         root.setCenter(buildCenterArea());
+
+        // Scene root is a StackPane so the update/loading overlay can cover the whole window.
+        windowStack = new StackPane(root);
+        windowStack.getStyleClass().add("window-stack");
 
         if (firstLaunch) {
             javafx.geometry.Rectangle2D bounds =
@@ -224,25 +242,19 @@ public class LauncherApp extends Application {
             prefs.startHeight = bounds.getHeight() * 0.75;
         }
 
-        scene = new Scene(root, prefs.startWidth, prefs.startHeight);
+        scene = new Scene(windowStack, prefs.startWidth, prefs.startHeight);
         scene.getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
         applyDynamicStyle();
         applyTheme();
 
         stage.setScene(scene);
-        stage.setMinWidth(860);
+        // The top bar (brand, nav, account/settings, and the - [] x controls) must always stay fully visible
+        // at any allowed window size -- so the minimum width never lets the top bar's right-hand controls clip.
+        stage.setMinWidth(Math.max(860, topBar.prefWidth(-1)));
         stage.setMinHeight(560);
         stage.centerOnScreen();
-        stage.setOnCloseRequest(e -> {
-            appRunning = false;
-            WavePulse.instance().stop(); // stop the online-dot wave animation with the window
-            if (prefs.rememberWindowSize) {
-                prefs.startWidth = stage.getWidth();
-                prefs.startHeight = stage.getHeight();
-                prefs.save();
-            }
-            publishOfflineOnExit();
-        });
+        enableWindowChrome(stage, windowStack, topBar); // drag by the top bar, resize from any edge
+        stage.setOnCloseRequest(e -> doCleanExit());
         stage.show();
         if (prefs.launcherStartFullscreen) stage.setFullScreen(true);
 
@@ -252,6 +264,7 @@ public class LauncherApp extends Application {
         restoreOnlineSessionAsync();
         publishPresenceQuietly();
         startPresenceTasks();
+        checkForUpdatesAsync();
     }
 
     /**
@@ -486,11 +499,251 @@ public class LauncherApp extends Application {
         settingsBtn.getStyleClass().add("icon-button");
         settingsBtn.setOnAction(e -> openSettingsDialog());
 
-        HBox bar = new HBox(20, brand, navGroup, spacer, accountBtn, settingsBtn);
-        bar.setPadding(new Insets(16, 28, 16, 28));
+        // Orange download button -- appears only when a newer release is available on GitHub.
+        updateBtn = new Button();
+        updateBtn.setGraphic(icon(IconFactory.Icon.DOWNLOAD, 18));
+        updateBtn.setGraphicTextGap(0);
+        updateBtn.getStyleClass().addAll("icon-button", "update-button");
+        updateBtn.setVisible(false);
+        updateBtn.setManaged(false);
+        updateBtn.setOnAction(e -> startUpdate());
+
+        HBox bar = new HBox(20, brand, navGroup, spacer, updateBtn, accountBtn, settingsBtn, buildWindowControls());
+        bar.setPadding(new Insets(16, 18, 16, 28));
         bar.setAlignment(Pos.CENTER_LEFT);
         bar.getStyleClass().add("top-bar");
+        this.topBar = bar;
         return bar;
+    }
+
+    // ---- Window controls (- [] x) for the borderless main window ----
+    private HBox buildWindowControls() {
+        Button min = new Button();
+        Rectangle minGlyph = new Rectangle(12, 1.6);
+        minGlyph.setStrokeType(StrokeType.INSIDE);
+        minGlyph.getStyleClass().add("win-glyph-bar");
+        min.setGraphic(minGlyph);
+        min.getStyleClass().add("win-ctl-button");
+        min.setOnAction(e -> stage.setIconified(true));
+
+        Button max = new Button();
+        Rectangle maxGlyph = new Rectangle(11, 11);
+        maxGlyph.setStrokeType(StrokeType.INSIDE);
+        maxGlyph.setStrokeWidth(1.5);
+        maxGlyph.setFill(Color.TRANSPARENT);
+        maxGlyph.getStyleClass().add("win-glyph-rect");
+        max.setGraphic(maxGlyph);
+        max.getStyleClass().add("win-ctl-button");
+        max.setOnAction(e -> stage.setMaximized(!stage.isMaximized()));
+
+        Button close = new Button();
+        Label xGlyph = new Label("\u2715");
+        xGlyph.getStyleClass().add("win-glyph-x");
+        close.setGraphic(xGlyph);
+        close.getStyleClass().addAll("win-ctl-button", "win-ctl-close");
+        close.setOnAction(e -> doCleanExit());
+
+        HBox group = new HBox(2, min, max, close);
+        group.setAlignment(Pos.CENTER_RIGHT);
+        group.getStyleClass().add("win-ctl-group");
+        return group;
+    }
+
+    /** Clean exit shared by the OS close action and the in-window × button: stops the wave pulse,
+     *  saves window size prefs, publishes offline presence, then closes the stage. */
+    private void doCleanExit() {
+        appRunning = false;
+        WavePulse.instance().stop(); // stop the online-dot wave animation with the window
+        if (prefs.rememberWindowSize) {
+            prefs.startWidth = stage.getWidth();
+            prefs.startHeight = stage.getHeight();
+            prefs.save();
+        }
+        publishOfflineOnExit();
+        stage.close();
+    }
+
+    // ---- Self-updater (GitHub releases) ----
+
+    /** Background check: queries the latest stable release; if it's newer than the running version
+     *  with a suitable asset, reveals the orange update button (with a small bounce-in). */
+    private void checkForUpdatesAsync() {
+        Task<AppUpdater.UpdateInfo> task = new Task<>() {
+            @Override protected AppUpdater.UpdateInfo call() throws Exception {
+                return AppUpdater.findUpdate().orElse(null);
+            }
+        };
+        task.setOnSucceeded(e -> {
+            AppUpdater.UpdateInfo info = task.getValue();
+            if (info == null) return;                                   // already up to date (or nothing available)
+            updateInfo = info;
+            updateBtn.setTooltip(new Tooltip("Update DeyLauncher to " + info.tag()));
+            updateBtn.setManaged(true);
+            updateBtn.setVisible(true);
+            FadeTransition in = new FadeTransition(Duration.millis(320), updateBtn);
+            in.setFromValue(0); in.setToValue(1);
+            ScaleTransition pop = new ScaleTransition(Duration.millis(320), updateBtn);
+            pop.setFromX(0.4); pop.setFromY(0.4); pop.setToX(1); pop.setToY(1);
+            new ParallelTransition(in, pop).play();
+        });
+        task.setOnFailed(e -> { /* offline / no repo / rate-limited -- just don't show the button */ });
+        new Thread(task, "deylauncher-update-check").start();
+    }
+
+    /** Pressing the update button: a quick press-pulse, the button fades out, then the loading overlay
+     *  slides in and the download begins automatically. */
+    private void startUpdate() {
+        if (updateInfo == null) return;
+        AppUpdater.UpdateInfo info = updateInfo;
+        updateBtn.setDisable(true);
+        ScaleTransition press = new ScaleTransition(Duration.millis(90), updateBtn);
+        press.setToX(0.88); press.setToY(0.88); press.setInterpolator(Interpolator.EASE_IN);
+        press.setAutoReverse(true); press.setCycleCount(2);
+        press.setOnFinished(e -> {
+            FadeTransition hide = new FadeTransition(Duration.millis(130), updateBtn);
+            hide.setToValue(0);
+            hide.setOnFinished(e2 -> updateBtn.setVisible(false));
+            hide.play();
+            showUpdateOverlayAndDownload(info);
+        });
+        press.play();
+    }
+
+    /** Builds (once per update), displays and animates the full-window loading overlay, then starts the download. */
+    private void showUpdateOverlayAndDownload(AppUpdater.UpdateInfo info) {
+        if (updateOverlay != null) windowStack.getChildren().remove(updateOverlay);
+        updateOverlay = buildUpdateOverlay(info);
+        updateOverlay.setOpacity(0);
+        windowStack.getChildren().add(updateOverlay);
+
+        javafx.scene.Node card = updateOverlay.getChildren().get(0); // index 0 = card, index 1 = close button
+        card.setOpacity(0);
+        card.setTranslateY(18);
+        card.setScaleX(0.96); card.setScaleY(0.96);
+
+        FadeTransition darkFade = new FadeTransition(Duration.millis(260), updateOverlay);
+        darkFade.setToValue(1);
+        FadeTransition cardFade = new FadeTransition(Duration.millis(380), card);
+        cardFade.setToValue(1);
+        ScaleTransition cardScale = new ScaleTransition(Duration.millis(380), card);
+        cardScale.setToX(1); cardScale.setToY(1);
+        TranslateTransition cardSlide = new TranslateTransition(Duration.millis(380), card);
+        cardSlide.setToY(0); cardSlide.setInterpolator(Interpolator.EASE_OUT);
+        ParallelTransition enter = new ParallelTransition(darkFade, cardFade, cardScale, cardSlide);
+        enter.setOnFinished(e -> beginUpdate(downloadTask()));
+        enter.play();
+    }
+
+    /** Builds the background download Task for the detected update, binding progress to the overlay bar. */
+    private javafx.concurrent.Task<Path> downloadTask() {
+        AppUpdater.UpdateInfo info = updateInfo;
+        javafx.concurrent.Task<Path> t = new javafx.concurrent.Task<>() {
+            @Override protected Path call() throws Exception {
+                return AppUpdater.downloadRelease(info, this::updateProgress);
+            }
+        };
+        updateProgress.progressProperty().unbind();
+        updateProgress.progressProperty().bind(t.progressProperty());
+        t.setOnSucceeded(e -> {
+            updateStatus.setText("Downloaded " + info.assetName() + " -- applying update...");
+            new Thread(() -> installLocalUpdate(t.getValue(), info), "deylauncher-update-install").start();
+        });
+        t.setOnFailed(e -> {
+            updateBtn.setDisable(false);
+            updateBtn.setVisible(true);
+            updateStatus.setText("Update failed: " + (t.getException() == null ? "unknown error" : t.getException().getMessage()));
+            if (updateOverlay != null && updateOverlay.getChildren().size() > 1)
+                updateOverlay.getChildren().get(1).setVisible(true); // reveal the close button
+        });
+        return t;
+    }
+
+    private void beginUpdate(javafx.concurrent.Task<Path> t) {
+        if (updateStatus != null) updateStatus.setText("Downloading " + updateInfo.assetName() + " ...");
+        new Thread(t, "deylauncher-update-download").start();
+    }
+
+    /** After the download completes: extract, swap into place and restart via a tiny helper process.
+     *  Runs on a background thread -- every UI touch is marshalled through Platform.runLater. */
+    private void installLocalUpdate(Path downloaded, AppUpdater.UpdateInfo info) {
+        try {
+            AppUpdater.InstallLayout layout = AppUpdater.resolveInstallLayout();
+            if (layout == null) {
+                AppUpdater.openReleasePage();
+                Platform.runLater(() -> {
+                    updateStatus.setText("Running from source -- opening the release page instead.");
+                    updateBtn.setDisable(false);
+                    revealUpdateClose();
+                });
+                return;
+            }
+            Platform.runLater(() -> updateStatus.setText("Extracting update..."));
+            Path staging = Files.createTempDirectory("DeyLauncher-extract");
+            Path stagingApp = AppUpdater.extractTo(downloaded, staging, layout.windows());
+            Platform.runLater(() -> updateStatus.setText("Preparing restart..."));
+            Path helper = AppUpdater.writeRestartScript(layout, stagingApp, staging);
+            AppUpdater.launchHelper(helper, layout.windows());
+            Platform.runLater(this::doCleanExit);
+        } catch (Exception ex) {
+            Platform.runLater(() -> {
+                updateBtn.setDisable(false);
+                updateBtn.setVisible(true);
+                updateStatus.setText("Update failed: " + ex.getMessage());
+                revealUpdateClose();
+            });
+        }
+    }
+
+    private void revealUpdateClose() {
+        if (updateOverlay != null && updateOverlay.getChildren().size() > 1)
+            updateOverlay.getChildren().get(1).setVisible(true);
+    }
+
+    /** The dark full-window loading card shown while an update downloads/installs. */
+    private StackPane buildUpdateOverlay(AppUpdater.UpdateInfo info) {
+        VBox card = new VBox(18);
+        card.setAlignment(Pos.CENTER);
+        card.setMaxWidth(470);
+        card.setStyle("-fx-background-color:#17181b; -fx-background-radius:16; -fx-border-radius:16; -fx-border-color:#2a2b30; -fx-padding:34;");
+
+        Label headline = new Label("Updating DeyLauncher");
+        headline.setStyle("-fx-text-fill:#f5f5f6; -fx-font-size:22px; -fx-font-weight:bold;");
+        Label ver = new Label(AppUpdater.currentVersion() + "   \u2192   " + info.tag());
+        ver.setStyle("-fx-text-fill:#ff7a1f; -fx-font-size:15px; -fx-font-weight:bold;");
+        ver.setAlignment(Pos.CENTER);
+
+        ProgressIndicator spin = new ProgressIndicator();
+        spin.setPrefSize(46, 46);
+        spin.setStyle("-fx-progress-color:#ff7a1f;");
+        spin.setProgress(ProgressIndicator.INDETERMINATE_PROGRESS);
+
+        updateProgress = new ProgressBar(0);
+        updateProgress.setMaxWidth(Double.MAX_VALUE);
+        updateProgress.getStyleClass().add("update-progress");
+
+        updateStatus = new Label("Preparing...");
+        updateStatus.setWrapText(true);
+        updateStatus.setTextAlignment(javafx.scene.text.TextAlignment.CENTER);
+        updateStatus.setStyle("-fx-text-fill:#9a9ba3; -fx-font-size:13px;");
+
+        card.getChildren().addAll(headline, ver, spin, updateProgress, updateStatus);
+
+        Button closeBtn = new Button("\u2715");
+        closeBtn.getStyleClass().add("mods-win-close");
+        closeBtn.setVisible(false);
+        closeBtn.setOnAction(e -> {
+            windowStack.getChildren().remove(updateOverlay);
+            updateOverlay = null;
+            updateBtn.setDisable(false);
+            updateBtn.setVisible(true);
+        });
+
+        StackPane dark = new StackPane(card, closeBtn);
+        StackPane.setAlignment(closeBtn, Pos.TOP_RIGHT);
+        StackPane.setMargin(closeBtn, new Insets(14));
+        dark.setStyle("-fx-background-color: rgba(8,8,10,0.88);");
+        dark.setMaxSize(Double.MAX_VALUE, Double.MAX_VALUE);
+        return dark;
     }
 
     /** Switches the page host between Home (the real play page) and the Library/Servers
@@ -3451,10 +3704,57 @@ public class LauncherApp extends Application {
         memGrid.add(minRamSlider, 0, 1);
         memGrid.add(maxRamSlider, 1, 1);
 
+        // ---- Danger zone: permanently delete this server ----
+        Region dangerSpacer = new Region();
+        HBox.setHgrow(dangerSpacer, Priority.ALWAYS);
+
+        Button deleteBtn = new Button();
+        setButtonIconOnly(deleteBtn, IconFactory.Icon.TRASH);
+        deleteBtn.getStyleClass().add("danger-delete-button");
+        deleteBtn.setTooltip(new Tooltip("Delete this server permanently"));
+
+        Label dangerTitle = new Label("Delete this server");
+        dangerTitle.getStyleClass().add("danger-title");
+        HBox dangerHeader = new HBox(12, deleteBtn, dangerTitle, dangerSpacer);
+        dangerHeader.setAlignment(Pos.CENTER_LEFT);
+
+        Label dangerNote = new Label("Permanently removes this server and all of its world, "
+                + "player and addon data from this PC. This can't be undone.");
+        dangerNote.getStyleClass().add("notice-label");
+        dangerNote.setWrapText(true);
+
+        VBox dangerZone = new VBox(10, dangerHeader, dangerNote);
+        dangerZone.getStyleClass().add("server-danger-zone");
+
+        deleteBtn.setOnAction(e -> {
+            Alert confirm = new Alert(Alert.AlertType.CONFIRMATION,
+                    "Delete \"" + server.name + "\"?\nIts folder and all server data will be removed permanently.",
+                    ButtonType.CANCEL, ButtonType.OK);
+            confirm.setHeaderText("Delete server");
+            var pick = confirm.showAndWait();
+            if (pick.isPresent() && pick.get() == ButtonType.OK) {
+                ServerProcessManager pm = runningServers.remove(server.id);
+                if (pm != null) pm.stop();
+                try {
+                    serverStore.delete(server.id);
+                } catch (Exception ex) {
+                    log("Failed to delete server: " + ex.getMessage());
+                }
+                PlayerIdentity me = identityStore.getActive();
+                if (me != null) {
+                    try { publishOwnedServers(me); } catch (Exception ignored) { }
+                }
+                renderServersPageContent();
+                javafx.stage.Stage mgmt = shellWindows.get("server-" + server.id);
+                if (mgmt != null) mgmt.close();
+            }
+        });
+
         box.getChildren().addAll(
                 sectionLabel("MEMORY"), memGrid,
                 sectionLabel("PORT"), portField,
-                sectionLabel("JAVA ENVIRONMENT"), javaEnvBox, javaEnvNote);
+                sectionLabel("JAVA ENVIRONMENT"), javaEnvBox, javaEnvNote,
+                sectionLabel("DANGER ZONE"), dangerZone);
         return tabShell(scroll, saveBtn, savedNote);
     }
 
@@ -3740,16 +4040,17 @@ public class LauncherApp extends Application {
         playButton.setMaxWidth(Double.MAX_VALUE);
         playButton.setOnAction(e -> onPlay());
 
-        progressBar = new ProgressBar(0);
-        progressBar.setMaxWidth(Double.MAX_VALUE);
-        progressBar.setVisible(false);
-        progressBar.getStyleClass().add("play-progress");
+        launchProgress = new WaveLaunchBar();
+        launchProgress.setMaxWidth(Double.MAX_VALUE);
+        launchProgress.setVisible(false);
+        launchProgress.setManaged(false);
+        launchProgress.getStyleClass().add("play-progress");
 
         VBox right = new VBox(14,
                 mainHeadingLabel, mainDescriptionLabel, offlineNotice,
                 modLoaderLabel, modLoaderBox,
                 versionLabel, versionBox,
-                modsBtn, playButton, progressBar);
+                modsBtn, playButton, launchProgress);
         right.setPadding(new Insets(32));
         right.setAlignment(Pos.CENTER_LEFT);
         right.getStyleClass().add("play-card");
@@ -4363,13 +4664,15 @@ public class LauncherApp extends Application {
      *  N/S vertical, E/W horizontal, and both diagonals (NW/SE and NE/SW). Applied to EVERY custom
      *  window (Mods, Settings, Server Management, version picker) via the shared stage builders. */
     private void enableWindowChrome(Stage win, Node root, Node header) {
-        final double BORDER = 8;
+        final double BORDER = 14;   // whole perimeter resizes (not just the top bar); 14px is an easy grab zone
         final double[] start = new double[2];   // screen x,y at press
         final double[] orig = new double[4];    // window x,y,w,h at press
-        final double[] dragOff = new double[2]; // grab offset within the header
+        final double[] lastPtr = new double[2]; // previous screen x,y during a drag (for delta movement)
         final boolean[] west = new boolean[1], east = new boolean[1],
                        north = new boolean[1], south = new boolean[1];
         final boolean[] resizing = new boolean[1], dragging = new boolean[1];
+        final boolean[] snapping = new boolean[1]; // window's top edge at the screen top -> maximize on release
+        final double MAX_SNAP = 8;                // px from the screen's top edge that counts as "snap to full screen"
 
         java.util.function.BiConsumer<Double, Double> zone = (px, py) -> {
             double w = root.getLayoutBounds().getWidth();
@@ -4385,71 +4688,247 @@ public class LauncherApp extends Application {
             return bh > 0 ? header.getBoundsInParent().getMaxY() : header.prefHeight(-1);
         };
 
+        // Window can't be resized/dragged while maximized or full-screen, so never show those cursors then.
+        final double[] lastY = new double[1];
+        java.util.function.BooleanSupplier locked = () -> win.isMaximized() || win.isFullScreen();
+
         Runnable updateCursor = () -> {
-            if (west[0] && north[0]) root.setCursor(javafx.scene.Cursor.NW_RESIZE);      // diagonal
-            else if (east[0] && north[0]) root.setCursor(javafx.scene.Cursor.NE_RESIZE);  // other diagonal
-            else if (west[0] && south[0]) root.setCursor(javafx.scene.Cursor.SW_RESIZE);  // other diagonal
-            else if (east[0] && south[0]) root.setCursor(javafx.scene.Cursor.SE_RESIZE);  // diagonal
-            else if (west[0] || east[0]) root.setCursor(javafx.scene.Cursor.H_RESIZE);    // horizontal
-            else if (north[0] || south[0]) root.setCursor(javafx.scene.Cursor.V_RESIZE);  // vertical
-            else root.setCursor(javafx.scene.Cursor.DEFAULT);
+            if (locked.getAsBoolean()) {
+                root.setCursor(null); // maximized / full-screen: no resize or move, plain default
+                return;
+            }
+            if (west[0] && north[0]) root.setCursor(javafx.scene.Cursor.NW_RESIZE);      // top-left corner
+            else if (east[0] && north[0]) root.setCursor(javafx.scene.Cursor.NE_RESIZE);  // top-right corner
+            else if (west[0] && south[0]) root.setCursor(javafx.scene.Cursor.SW_RESIZE);  // bottom-left corner
+            else if (east[0] && south[0]) root.setCursor(javafx.scene.Cursor.SE_RESIZE);  // bottom-right corner
+            else if (west[0] || east[0]) root.setCursor(javafx.scene.Cursor.H_RESIZE);    // left/right edge
+            else if (north[0] || south[0]) root.setCursor(javafx.scene.Cursor.V_RESIZE);  // top/bottom edge
+            else if (lastY[0] <= headerBottom.getAsDouble()) root.setCursor(javafx.scene.Cursor.MOVE); // drag area
+            // Outside any resize/move zone: release the forced cursor (null) so the node under the
+            // pointer decides normally again (e.g. Hand over the nav buttons) -- the cursor "reverts".
+            else root.setCursor(null);
         };
 
-        root.setOnMouseMoved(e -> {
-            zone.accept(e.getX(), e.getY());
-            updateCursor.run();
-        });
+        // The per-root handlers don't reach over the main window's densely packed controls: in JavaFX,
+        // MOUSE_MOVED / ENTERED / EXITED are delivered only to the single node under the pointer (picked
+        // deepest-first) and do NOT bubble to ancestors. Registering scene-level event FILTERS catches every
+        // such event no matter which child control is targeted, so the resize/move cursor tracks over real
+        // content exactly like a fully-native window. The event origin may be any deep control, so we
+        // re-project its coordinates back onto `root` (the scene root of this window).
+        java.util.function.BiConsumer<javafx.scene.input.MouseEvent, double[]> readLocal = (e, out) -> {
+            javafx.geometry.Point2D p = root.sceneToLocal(e.getSceneX(), e.getSceneY());
+            out[0] = p.getX();
+            out[1] = p.getY();
+        };
 
-        root.setOnMousePressed(e -> {
-            if (!e.isPrimaryButtonDown()) return;
-            zone.accept(e.getX(), e.getY());
-            start[0] = e.getScreenX(); start[1] = e.getScreenY();
-            orig[0] = win.getX(); orig[1] = win.getY(); orig[2] = win.getWidth(); orig[3] = win.getHeight();
-            boolean edge = west[0] || east[0] || north[0] || south[0];
-            if (edge) {
-                resizing[0] = true; dragging[0] = false;
-            } else if (e.getY() <= headerBottom.getAsDouble()) {
-                dragOff[0] = e.getScreenX() - win.getX();
-                dragOff[1] = e.getScreenY() - win.getY();
-                dragging[0] = true; resizing[0] = false;
-            } else {
-                dragging[0] = false; resizing[0] = false;
-            }
-        });
+        javafx.scene.Scene sc = win.getScene();
+        if (sc != null) {
+            sc.addEventFilter(javafx.scene.input.MouseEvent.MOUSE_MOVED, e -> {
+                double[] p = new double[2];
+                readLocal.accept(e, p);
+                zone.accept(p[0], p[1]);
+                lastY[0] = p[1];
+                updateCursor.run();
+            });
 
-        root.setOnMouseDragged(e -> {
-            if (!e.isPrimaryButtonDown()) return;
-            if (resizing[0]) {
-                double dx = e.getScreenX() - start[0];
-                double dy = e.getScreenY() - start[1];
-                double nw = orig[2] + (east[0] ? dx : 0) - (west[0] ? dx : 0);
-                double nh = orig[3] + (south[0] ? dy : 0) - (north[0] ? dy : 0);
-                nw = Math.max(win.getMinWidth(), nw);
-                nh = Math.max(win.getMinHeight(), nh);
-                double nx = orig[0];
-                double ny = orig[1];
-                if (west[0]) nx = orig[0] + (orig[2] - nw);
-                if (north[0]) ny = orig[1] + (orig[3] - nh);
-                win.setX(nx);
-                win.setY(ny);
-                win.setWidth(nw);
-                win.setHeight(nh);
-            } else if (dragging[0]) {
-                win.setX(e.getScreenX() - dragOff[0]);
-                win.setY(e.getScreenY() - dragOff[1]);
-            }
-        });
+            // (Re)entering the window: immediately adopt the right cursor for that spot.
+            sc.addEventFilter(javafx.scene.input.MouseEvent.MOUSE_ENTERED, e -> {
+                double[] p = new double[2];
+                readLocal.accept(e, p);
+                zone.accept(p[0], p[1]);
+                lastY[0] = p[1];
+                updateCursor.run();
+            });
 
-        root.setOnMouseReleased(e -> {
-            resizing[0] = false;
-            dragging[0] = false;
-            zone.accept(e.getX(), e.getY());
-            updateCursor.run();
-        });
+            // Left a resize/move zone (or the window itself) -> revert to the normal cursor. While actually
+            // resizing/dragging we keep the shape, because MOUSE_MOVED already refreshes it on every move.
+            sc.addEventFilter(javafx.scene.input.MouseEvent.MOUSE_EXITED, e -> {
+                if (!resizing[0] && !dragging[0]) root.setCursor(null);
+            });
 
-        root.setOnMouseExited(e -> {
-            if (!resizing[0] && !dragging[0]) root.setCursor(javafx.scene.Cursor.DEFAULT);
-        });
+            sc.addEventFilter(javafx.scene.input.MouseEvent.MOUSE_PRESSED, e -> {
+                if (!e.isPrimaryButtonDown()) return;
+                if (locked.getAsBoolean()) {
+                    resizing[0] = false;
+                    dragging[0] = false;
+                    return;
+                }
+                double[] p = new double[2];
+                readLocal.accept(e, p);
+                zone.accept(p[0], p[1]);
+                start[0] = e.getScreenX(); start[1] = e.getScreenY();
+                orig[0] = win.getX(); orig[1] = win.getY(); orig[2] = win.getWidth(); orig[3] = win.getHeight();
+                boolean edge = west[0] || east[0] || north[0] || south[0];
+                if (edge) {
+                    // Pressed an edge/corner -> start resizing. Direction is locked at press, so once the
+                    // pointer leaves the corner it keeps resizing those two axes only ("lateral only").
+                    resizing[0] = true; dragging[0] = false;
+                } else if (p[1] <= headerBottom.getAsDouble()) {
+                    lastPtr[0] = e.getScreenX(); lastPtr[1] = e.getScreenY();
+                    dragging[0] = true; resizing[0] = false;
+                } else {
+                    dragging[0] = false; resizing[0] = false;
+                }
+            });
+
+            // Drag-to-top maximize helpers. `pointerScreen` resolves the physical screen under the pointer,
+            // so on a multi-monitor setup (even with different sizes) we maximize to the right display.
+            // `applySnapCue` shows a subtle orange top border while a window is inside the full-screen zone.
+            java.util.function.Function<javafx.scene.input.MouseEvent, javafx.stage.Screen> pointerScreen = ev -> {
+                javafx.stage.Screen best = javafx.stage.Screen.getPrimary();
+                double px = ev.getScreenX(), py = ev.getScreenY();
+                double bestArea = -1.0;
+                for (javafx.stage.Screen s : javafx.stage.Screen.getScreens()) {
+                    javafx.geometry.Rectangle2D vb = s.getVisualBounds();
+                    double ox = Math.max(0, Math.min(vb.getMaxX(), px) - Math.max(vb.getMinX(), px));
+                    double oy = Math.max(0, Math.min(vb.getMaxY(), py) - Math.max(vb.getMinY(), py));
+                    double area = ox * oy;
+                    if (area > bestArea) { bestArea = area; best = s; }
+                }
+                return best;
+            };
+            Runnable applySnapCue = () -> root.setStyle(snapping[0]
+                    ? "-fx-border-color: #ff7a1f transparent transparent transparent; -fx-border-width: 6 0 0 0;"
+                    : "");
+
+            // Edge overscroll: if the pointer gets pinned at an OUTER edge of the whole desktop (no monitor
+            // beyond), keep sliding the window out past that edge while the button is held. The cursor can't
+            // leave the display, but the window can -- so it can be parked fully below/above/side of a screen
+            // with nothing there. Pull it back by dragging inward (or just release).
+            final double OVER_SPEED = 520;             // px/sec pushed out while pinned at an edge
+            final double[] overDir = {0, 0};           // slide speed per axis (px/sec)
+            AnimationTimer[] overTimer = new AnimationTimer[1];
+            Runnable startOver = () -> {
+                if (overTimer[0] != null) return;
+                long[] prev = {0};
+                overTimer[0] = new AnimationTimer() {
+                    @Override public void handle(long now) {
+                        if (prev[0] == 0) prev[0] = now;
+                        double dt = (now - prev[0]) / 1_000_000_000.0;
+                        prev[0] = now;
+                        win.setX(win.getX() + overDir[0] * dt);
+                        win.setY(win.getY() + overDir[1] * dt);
+                    }
+                };
+                overTimer[0].start();
+            };
+            Runnable stopOver = () -> {
+                if (overTimer[0] != null) {
+                    try { overTimer[0].stop(); } catch (IllegalStateException ignored) {}
+                    overTimer[0] = null;
+                }
+            };
+            java.util.function.Consumer<javafx.scene.input.MouseEvent> edgeOver = e -> {
+                double mnx = Double.MAX_VALUE, mxx = -Double.MAX_VALUE,
+                       mny = Double.MAX_VALUE, mxy = -Double.MAX_VALUE;
+                for (javafx.stage.Screen s : javafx.stage.Screen.getScreens()) {
+                    javafx.geometry.Rectangle2D b = s.getBounds();
+                    mnx = Math.min(mnx, b.getMinX());  mxx = Math.max(mxx, b.getMaxX());
+                    mny = Math.min(mny, b.getMinY());  mxy = Math.max(mxy, b.getMaxY());
+                }
+                double px = e.getScreenX(), py = e.getScreenY();
+                double ex = 1.0, ey = 1.0;             // tolerance so the last desktop pixel counts as "at edge"
+                int sx = 0, sy = 0;
+                if (px <= mnx + ex) sx = -1; else if (px >= mxx - ex) sx = 1;
+                if (py >= mxy - ey) sy = 1; // bottom edge -> overscroll DOWN (drag under the screen)
+                // Top edge intentionally does NOT overscroll up -- that edge is the drag-to-top maximize zone.
+                overDir[0] = sx * OVER_SPEED;
+                overDir[1] = sy * OVER_SPEED;
+                if (sx != 0 || sy != 0) startOver.run(); else stopOver.run();
+            };
+
+            sc.addEventFilter(javafx.scene.input.MouseEvent.MOUSE_DRAGGED, e -> {
+                if (!e.isPrimaryButtonDown()) return;
+                if (resizing[0]) {
+                    double dx = e.getScreenX() - start[0];
+                    double dy = e.getScreenY() - start[1];
+                    double nw = orig[2] + (east[0] ? dx : 0) - (west[0] ? dx : 0);
+                    double nh = orig[3] + (south[0] ? dy : 0) - (north[0] ? dy : 0);
+                    nw = Math.max(win.getMinWidth(), nw);
+                    nh = Math.max(win.getMinHeight(), nh);
+                    double nx = orig[0];
+                    double ny = orig[1];
+                    if (west[0]) nx = orig[0] + (orig[2] - nw);
+                    if (north[0]) ny = orig[1] + (orig[3] - nh);
+                    win.setX(nx);
+                    win.setY(ny);
+                    win.setWidth(nw);
+                    win.setHeight(nh);
+                } else if (dragging[0]) {
+                    // Delta-based drag: move the window by the pointer's movement since the last event,
+                    // not by its absolute screen position. This keeps tracking smooth and lets the window
+                    // be moved to ANY position -- including partly below the bottom of the screen.
+                    double dx = e.getScreenX() - lastPtr[0];
+                    double dy = e.getScreenY() - lastPtr[1];
+                    lastPtr[0] = e.getScreenX();
+                    lastPtr[1] = e.getScreenY();
+                    win.setX(win.getX() + dx);
+                    win.setY(win.getY() + dy);
+
+                    // Drag-to-top maximize: when the window's top edge reaches the top of the screen under
+                    // the pointer, flag it so release fills that screen's full bounds. Dragging back down
+                    // clears the flag, so you stay in full-screen only while you hold it up there.
+                    javafx.stage.Screen scr = pointerScreen.apply(e);
+                    javafx.geometry.Rectangle2D vb = scr.getVisualBounds();
+                    snapping[0] = win.getY() <= vb.getMinY() + MAX_SNAP;
+                    applySnapCue.run();
+
+                    // Overscroll once the pointer is pinned at a desktop outer edge (so the window can keep
+                    // moving under a screen even though the cursor can't follow it there).
+                    edgeOver.accept(e);
+                }
+            });
+
+            sc.addEventFilter(javafx.scene.input.MouseEvent.MOUSE_RELEASED, e -> {
+                stopOver.run(); // a release always ends any ongoing edge-overscroll
+                // Drag-to-top maximize: releasing while the window's top is pinned to the top edge fills
+                // the full screen of the monitor under the pointer (works across different-size monitors).
+                if (dragging[0] && snapping[0]) {
+                    javafx.stage.Screen scr = pointerScreen.apply(e);
+                    javafx.geometry.Rectangle2D vb = scr.getVisualBounds();
+                    win.setX(vb.getMinX());
+                    win.setY(vb.getMinY());
+                    win.setWidth(vb.getWidth());
+                    win.setHeight(vb.getHeight());
+                }
+                snapping[0] = false;
+                applySnapCue.run();
+                resizing[0] = false;
+                dragging[0] = false;
+                double[] p = new double[2];
+                readLocal.accept(e, p);
+                zone.accept(p[0], p[1]);
+                lastY[0] = p[1];
+                updateCursor.run();
+            });
+
+            // Keyboard nudging: with this window focused, arrow keys move it exactly in that direction --
+            // including below/beside/above the desktop, where the mouse cursor can never reach (there is no
+            // monitor there for the pointer to move into). Shift+arrow = a big step, arrow = fine step.
+            // We never hijack the arrows while a text field is focused (Settings, notes, server inputs), and
+            // maximized/full-screen windows don't nudge.
+            sc.addEventFilter(javafx.scene.input.KeyEvent.KEY_PRESSED, e -> {
+                if (locked.getAsBoolean()) return;
+                javafx.scene.Node owner = sc.getFocusOwner();
+                // Don't steal arrows from controls that use them for selection/typing.
+                if (owner instanceof javafx.scene.control.TextInputControl
+                        || owner instanceof javafx.scene.control.ComboBoxBase
+                        || owner instanceof javafx.scene.control.ListView
+                        || owner instanceof javafx.scene.control.TableView) return;
+                double step = e.isShiftDown() ? 64 : 12;
+                double dx = 0, dy = 0;
+                switch (e.getCode()) {
+                    case UP:    dy = -step; break;
+                    case DOWN:  dy =  step; break;
+                    case LEFT:  dx = -step; break;
+                    case RIGHT: dx =  step; break;
+                    default:    return;
+                }
+                e.consume();
+                win.setX(win.getX() + dx);
+                win.setY(win.getY() + dy);
+            });
+        }
     }
 
     /** Builds a generic borderless (undecorated) window styled exactly like the Mods window --
@@ -4631,8 +5110,8 @@ public class LauncherApp extends Application {
     }
 
     private void applyTheme() {
-        scene.getRoot().getStyleClass().removeAll("theme-dark", "theme-light");
-        scene.getRoot().getStyleClass().add(darkMode ? "theme-dark" : "theme-light");
+        root.getStyleClass().removeAll("theme-dark", "theme-light");
+        root.getStyleClass().add(darkMode ? "theme-dark" : "theme-light");
     }
 
     // ---- Account & Skin dialog: two tabs (Account / Skins) sharing one identityStore ----
@@ -6107,12 +6586,23 @@ public class LauncherApp extends Application {
         String capturedOnlineToken = (activeForPlay.accountType == AccountType.ONLINE
                 && activeForPlay.uuid.equals(liveOnlineAccountUuid)) ? liveOnlineAccessToken : null;
         playButton.setDisable(true);
-        progressBar.setVisible(true);
-        progressBar.setProgress(-1); // indeterminate while downloading
+        // The bar's progressProperty may still be bound to a previous launch's task (bind never
+        // auto-releases on completion), and a bound value can't be set -- release it before resetting.
+        launchProgress.progressProperty().unbind();
+        launchProgress.setProgress(0.0);
+        launchProgress.setManaged(true);
+        launchProgress.setVisible(true);
+        launchProgress.start(); // begin the orange sine-wave animation
 
         Task<Void> task = new Task<>() {
             @Override
             protected Void call() throws Exception {
+                // Report absolute launch progress (0..1) as a (workDone, totalWork) pair -- Task's
+                // updateProgress takes two args; the wave bar is bound to its progressProperty.
+                java.util.function.DoubleConsumer report = p -> {
+                    double v = p < 0 ? 0 : (p > 1 ? 1 : p);
+                    updateProgress((long) Math.round(v * 1_000_000L), 1_000_000L);
+                };
                 // Session selection, in order of trust: a live online account with a real token
                 // from this run > a saved offline account (set via Account > Apply) > a one-off
                 // typed name for someone who hasn't set up an account at all yet. The launcher's
@@ -6142,12 +6632,14 @@ public class LauncherApp extends Application {
                 var entry = manifest.findById(all, versionId);
                 if (entry == null) throw new IllegalStateException("Version not found: " + versionId);
                 var vanillaJson = manifest.fetchVersionDetail(entry);
+                report.accept(0.10); // version resolved; from here the big work begins
 
                 GameFiles files = new GameFiles();
                 JavaRuntimeManager runtimeManager = new JavaRuntimeManager(files.root);
 
                 updateMessage("Checking Java runtime...");
-                var javaBinary = runtimeManager.ensureRuntimeFor(vanillaJson);
+                var javaBinary = runtimeManager.ensureRuntimeFor(vanillaJson,
+                        f -> report.accept(0.10 + f * 0.20)); // runtime phase: 10% -> 30%
 
                 JsonObject versionJson;
                 if (modLoader.equals("Fabric")) {
@@ -6167,9 +6659,11 @@ public class LauncherApp extends Application {
                 } else {
                     versionJson = vanillaJson;
                 }
+                report.accept(0.30); // loader installed (or not needed) -- downloads are next
 
                 updateMessage("Downloading files (cached after first run)...");
-                var prepared = files.prepare(versionJson);
+                var prepared = files.prepare(versionJson,
+                        f -> report.accept(0.30 + f * 0.56)); // download phase: 30% -> 86%
 
                 var gameDir = files.root.resolve("instances").resolve(entry.id()
                         + (modLoader.equals("Vanilla") ? "" : "-" + modLoader.toLowerCase()));
@@ -6214,7 +6708,10 @@ public class LauncherApp extends Application {
                     }
                 }
 
+                report.accept(0.94); // everything downloaded/installed, just spinning up the game now
                 updateMessage(quickPlayTarget != null ? "Launching straight into " + quickPlayTarget + "..." : "Launching...");
+                report.accept(1.0); // "Minecraft open" -- bar is fully done
+                Platform.runLater(() -> launchProgress.finishLaunch());
 
                 // Self-healing: on machines whose GPU can't provide OpenGL 3.3 (the classic Linux
                 // "GLXBadFBConfig" / "Driver does not support OpenGL 3.3" crash), retry ONCE with Mesa
@@ -6234,13 +6731,24 @@ public class LauncherApp extends Application {
             }
         };
         task.messageProperty().addListener((obs, old, msg) -> log(msg));
+        // Pump the background launch's 0..1 progress into the gold sine-wave bar (bound on the FX thread,
+        // same pattern the update overlay uses) so the percentage + fill track the real launch state.
+        launchProgress.progressProperty().unbind();
+        launchProgress.progressProperty().bind(task.progressProperty());
         task.setOnSucceeded(e -> {
             playButton.setDisable(false);
-            progressBar.setVisible(false);
+            launchProgress.stop();
+            // Release the task binding so a future launch can reset the bar from 0 again.
+            launchProgress.progressProperty().unbind();
+            launchProgress.setManaged(false);
+            launchProgress.setVisible(false);
         });
         task.setOnFailed(e -> {
             playButton.setDisable(false);
-            progressBar.setVisible(false);
+            launchProgress.stop();
+            launchProgress.progressProperty().unbind();
+            launchProgress.setManaged(false);
+            launchProgress.setVisible(false);
             log("Error: " + task.getException());
         });
         new Thread(task, "play-task").start();
