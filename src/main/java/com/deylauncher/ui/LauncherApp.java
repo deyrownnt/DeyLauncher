@@ -20,6 +20,7 @@ import com.deylauncher.modloader.ModPairResolver;
 import com.deylauncher.modloader.ModsUtil;
 import com.deylauncher.server.*;
 import com.deylauncher.update.AppUpdater;
+import com.deylauncher.platform.PointerProbe;
 import com.google.gson.JsonObject;
 import com.deylauncher.version.VersionManifest;
 import javafx.application.Application;
@@ -248,9 +249,10 @@ public class LauncherApp extends Application {
         applyTheme();
 
         stage.setScene(scene);
-        // The top bar (brand, nav, account/settings, and the - [] x controls) must always stay fully visible
-        // at any allowed window size -- so the minimum width never lets the top bar's right-hand controls clip.
-        stage.setMinWidth(Math.max(860, topBar.prefWidth(-1)));
+        // The top bar (brand, nav, account/settings, and the - [] x controls) must always stay fully
+        // visible at any allowed window size -- so the minimum width accounts for the FULL rendered
+        // top bar, including the update button the moment it becomes available (see topBarMinWidth).
+        stage.setMinWidth(Math.max(860, topBarMinWidth()));
         stage.setMinHeight(560);
         stage.centerOnScreen();
         enableWindowChrome(stage, windowStack, topBar); // drag by the top bar, resize from any edge
@@ -516,6 +518,21 @@ public class LauncherApp extends Application {
         return bar;
     }
 
+    /** The smallest width the top bar can be laid out at without clipping any control. Measured with
+     *  the update button temporarily made live (it starts hidden/managed=false and comes in later),
+     *  so the window's minimum size keeps the whole top bar visible at every permitted window size. */
+    private double topBarMinWidth() {
+        boolean wasManaged = updateBtn.isManaged();
+        boolean wasVisible = updateBtn.isVisible();
+        updateBtn.setManaged(true);
+        updateBtn.setVisible(true);
+        double needed = topBar.prefWidth(-1);
+        updateBtn.setManaged(wasManaged);
+        updateBtn.setVisible(wasVisible);
+        if (needed > 0) topBar.setMinWidth(needed); // never let the bar itself compress its controls
+        return needed;
+    }
+
     // ---- Window controls (- [] x) for the borderless main window ----
     private HBox buildWindowControls() {
         Button min = new Button();
@@ -667,6 +684,20 @@ public class LauncherApp extends Application {
      *  Runs on a background thread -- every UI touch is marshalled through Platform.runLater. */
     private void installLocalUpdate(Path downloaded, AppUpdater.UpdateInfo info) {
         try {
+            // Belt-and-braces: only ever apply a release that is genuinely NEWER than what's running.
+            // This guards against a stale cached button/overlay racing a changed repo after we've
+            // already updated, and guarantees we never "update" to an equal or older version.
+            if (!AppUpdater.isNewer(info.latestVersion(), AppUpdater.currentVersion())) {
+                Platform.runLater(() -> {
+                    updateStatus.setText("Already up to date (" + info.latestVersion() + ").");
+                    updateBtn.setDisable(false);
+                    updateBtn.setVisible(false);
+                    updateBtn.setManaged(false);
+                    updateInfo = null;
+                    revealUpdateClose();
+                });
+                return;
+            }
             AppUpdater.InstallLayout layout = AppUpdater.resolveInstallLayout();
             if (layout == null) {
                 AppUpdater.openReleasePage();
@@ -681,7 +712,8 @@ public class LauncherApp extends Application {
             Path staging = Files.createTempDirectory("DeyLauncher-extract");
             Path stagingApp = AppUpdater.extractTo(downloaded, staging, layout.windows());
             Platform.runLater(() -> updateStatus.setText("Preparing restart..."));
-            Path helper = AppUpdater.writeRestartScript(layout, stagingApp, staging);
+            Path helper = AppUpdater.writeRestartScript(layout, stagingApp, staging,
+                    ProcessHandle.current().pid());
             AppUpdater.launchHelper(helper, layout.windows());
             Platform.runLater(this::doCleanExit);
         } catch (Exception ex) {
@@ -4673,6 +4705,7 @@ public class LauncherApp extends Application {
         final boolean[] resizing = new boolean[1], dragging = new boolean[1];
         final boolean[] snapping = new boolean[1]; // window's top edge at the screen top -> maximize on release
         final double MAX_SNAP = 8;                // px from the screen's top edge that counts as "snap to full screen"
+        final double[] prevBounds = new double[4]; // last non-maximized x,y,w,h, so a maximized window can be restored on grab / double-click
 
         java.util.function.BiConsumer<Double, Double> zone = (px, py) -> {
             double w = root.getLayoutBounds().getWidth();
@@ -4693,8 +4726,15 @@ public class LauncherApp extends Application {
         java.util.function.BooleanSupplier locked = () -> win.isMaximized() || win.isFullScreen();
 
         Runnable updateCursor = () -> {
-            if (locked.getAsBoolean()) {
-                root.setCursor(null); // maximized / full-screen: no resize or move, plain default
+            if (win.isFullScreen()) {
+                root.setCursor(null); // full-screen: no resize or move, plain default
+                return;
+            }
+            if (win.isMaximized()) {
+                // Maximized: edges can't be resized, but the header (title bar) can still be grabbed
+                // and dragged down to restore -- mirror a native window's move affordance.
+                if (lastY[0] <= headerBottom.getAsDouble()) root.setCursor(javafx.scene.Cursor.MOVE);
+                else root.setCursor(null);
                 return;
             }
             if (west[0] && north[0]) root.setCursor(javafx.scene.Cursor.NW_RESIZE);      // top-left corner
@@ -4707,6 +4747,248 @@ public class LauncherApp extends Application {
             // Outside any resize/move zone: release the forced cursor (null) so the node under the
             // pointer decides normally again (e.g. Hand over the nav buttons) -- the cursor "reverts".
             else root.setCursor(null);
+        };
+
+        // ---- Off-edge parking ---------------------------------------------------------------------
+        // A drag follows the cursor through the MOUSE_DRAGGED handler below. The moment the pointer
+        // reaches within a few px of ANY edge of the screen it is actually on, an AnimationTimer keeps
+        // sliding the window outward in that direction while the button is held -- exactly like a native
+        // window grab keeps moving the window even though the cursor itself is pinned against the edge.
+        // That is what lets a window be parked partly or fully off the top / bottom / left / right of a
+        // screen, without having to drag into the desktop's extreme outer corner.
+        //
+        // The live pointer comes from PointerProbe: pure-JavaFX Robot#getMousePosition() first, with the
+        // optional JNA NativeInput as a fallback (it can also report the button state, which ends a drag
+        // that is pinned at an edge on the true mouse-up even before a JavaFX release arrives). Every way
+        // a drag can end funnels through endDrag(), so a slide can never get stuck on.
+        final double EDGE = 6;                 // px from a screen edge that counts as "pinned"
+        final double PUSH = 760;               // px/sec the window slides outward while pinned
+        final long TOP_DWELL = 320_000_000L;   // hold in the top band this long to mean "push off the top"
+        final double[] tmpDir = new double[2]; // reused per-frame result of EdgePush.slide
+        final long[] pushPrev = new long[1];   // timestamp of the previous frame that actually slid
+        final int[] noProgress = new int[1];   // consecutive frames the desktop refused to move the window
+        final double[] prevStart = new double[2]; // window position at the start of the previous pushed frame
+        final double[] prevReq = new double[2];   // what that frame asked the window to do
+        final boolean[] prevSlid = new boolean[1];
+        final boolean[] pushRefused = new boolean[1]; // this desktop refused to move a window off its screens
+        final int[] snapEdge = new int[1];   // snap mode: the EdgePush.LEFT/RIGHT edge the window is armed on
+        final long[] topBandSince = new long[1];
+        final boolean[] topPushed = new boolean[1]; // top edge already slid off -> don't maximize on release
+        final AnimationTimer[] pushTimer = new AnimationTimer[1];
+
+        // Every screen's bounds, reused instead of re-allocated: refreshed only while the pointer
+        // actually sits at an edge (see checkBand), so a normal drag never touches it.
+        final java.util.List<javafx.geometry.Rectangle2D> allScreens = new java.util.ArrayList<>();
+        Runnable refreshScreens = () -> {
+            allScreens.clear();
+            for (javafx.stage.Screen s : javafx.stage.Screen.getScreens()) allScreens.add(s.getBounds());
+        };
+
+        Runnable stopPush = () -> {
+            if (pushTimer[0] != null) {
+                try { pushTimer[0].stop(); } catch (IllegalStateException ignored) {}
+                pushTimer[0] = null;
+            }
+            pushPrev[0] = 0;
+            topBandSince[0] = 0;
+            noProgress[0] = 0;
+            prevSlid[0] = false;
+            tmpDir[0] = 0; tmpDir[1] = 0;
+        };
+
+        java.util.function.Function<double[], javafx.stage.Screen> screenAt = xy -> {
+            javafx.stage.Screen best = javafx.stage.Screen.getPrimary();
+            double px = xy[0], py = xy[1];
+            double bestArea = -1.0;
+            for (javafx.stage.Screen s : javafx.stage.Screen.getScreens()) {
+                javafx.geometry.Rectangle2D vb = s.getVisualBounds();
+                double ox = Math.max(0, Math.min(vb.getMaxX(), px) - Math.max(vb.getMinX(), px));
+                double oy = Math.max(0, Math.min(vb.getMaxY(), py) - Math.max(vb.getMinY(), py));
+                double area = ox * oy;
+                if (area > bestArea) { bestArea = area; best = s; }
+            }
+            return best;
+        };
+
+        // Live cue for the armed edge gesture: an orange bar on the side the window is about to be tiled
+        // to (snap mode), or along the top when a release would maximize (drag-to-top, both modes).
+        Runnable applySnapCue = () -> {
+            if (snapEdge[0] == EdgePush.LEFT) {
+                root.setStyle("-fx-border-color: transparent transparent transparent #ff7a1f; -fx-border-width: 0 0 0 6;");
+            } else if (snapEdge[0] == EdgePush.RIGHT) {
+                root.setStyle("-fx-border-color: transparent #ff7a1f transparent transparent; -fx-border-width: 0 6 0 0;");
+            } else if (snapping[0]) {
+                root.setStyle("-fx-border-color: #ff7a1f transparent transparent transparent; -fx-border-width: 6 0 0 0;");
+            } else {
+                root.setStyle("");
+            }
+        };
+
+        // Snap mode: fill the half of the work area on the screen the pointer is on. Uses the VISUAL
+        // bounds so taskbars/panels stay visible, exactly like the desktop's own edge tiling.
+        Runnable applyHalfTile = () -> {
+            javafx.geometry.Rectangle2D wa =
+                    screenAt.apply(new double[]{lastPtr[0], lastPtr[1]}).getVisualBounds();
+            javafx.geometry.Rectangle2D tile = EdgePush.halfTile(wa, snapEdge[0] == EdgePush.LEFT);
+            win.setMaximized(false);
+            win.setX(tile.getMinX());
+            win.setY(tile.getMinY());
+            win.setWidth(Math.max(win.getMinWidth(), tile.getWidth()));
+            win.setHeight(Math.max(win.getMinHeight(), tile.getHeight()));
+        };
+
+        // The ONE place a drag/resize is torn down. Idempotent, so every terminal path can call it
+        // without double-clearing anything: a JavaFX mouse release, a button-up the release event never
+        // described, the window losing focus, or the window being hidden. This is what guarantees the
+        // off-edge slide can never get stuck on.
+        Runnable endDrag = () -> {
+            stopPush.run();
+            // Released at an edge. Snap mode tiles to the armed half; otherwise the drag-to-top cue
+            // maximizes, and that maximize is skipped when the top edge was deliberately used to slide the
+            // window off the top of the screen. The focus/hidden watchdogs clear these flags before they
+            // call in here, so a watchdog teardown never snaps or maximizes.
+            if (dragging[0] && !win.isFullScreen()) {
+                if (snapEdge[0] != 0) applyHalfTile.run();
+                else if (snapping[0] && !topPushed[0]) win.setMaximized(true);
+            }
+            dragging[0] = false;
+            resizing[0] = false;
+            snapping[0] = false;
+            snapEdge[0] = 0;
+            topPushed[0] = false;
+            applySnapCue.run();
+            if (!win.isMaximized() && !win.isFullScreen()) {
+                prevBounds[0] = win.getX(); prevBounds[1] = win.getY();
+                prevBounds[2] = win.getWidth(); prevBounds[3] = win.getHeight();
+            }
+            updateCursor.run();
+        };
+
+        // Starts the off-edge slide. Safe to call repeatedly: it only ever creates one timer.
+        Runnable startPush = () -> {
+            if (pushTimer[0] != null) return;
+            pushPrev[0] = 0; // the first frame only baselines the clock, so the window never jumps
+            AnimationTimer t = new AnimationTimer() {
+                @Override public void handle(long now) {
+                    if (!dragging[0] || !win.isShowing() || win.isFullScreen()) { stopPush.run(); return; }
+
+                    // Prefer the global pointer (pure-JavaFX Robot first, optional JNA fallback): it keeps
+                    // the slide going even once the window has slid out from under the cursor, and on the
+                    // native tier a dropped button ends the drag on the true mouse-up. If no probe is
+                    // available we hold the last drag-event position, which is all the push needs.
+                    double px, py;
+                    PointerProbe.Sample pt = PointerProbe.probe();
+                    if (pt != null) {
+                        if (pt.downKnown() && !pt.down()) { endDrag.run(); return; }
+                        px = pt.x(); py = pt.y();
+                    } else {
+                        px = lastPtr[0]; py = lastPtr[1];
+                    }
+
+                    javafx.geometry.Rectangle2D b = screenAt.apply(new double[]{px, py}).getBounds();
+
+                    // The top edge doubles as the drag-to-top maximize zone, so it only starts pushing
+                    // once the pointer has dwelled in that band long enough to clearly mean "keep going".
+                    boolean inTopBand = py <= b.getMinY() + EDGE;
+                    if (inTopBand) { if (topBandSince[0] == 0) topBandSince[0] = now; }
+                    else topBandSince[0] = 0;
+                    boolean topEnabled = topBandSince[0] != 0 && (now - topBandSince[0]) >= TOP_DWELL;
+
+                    int axes = EdgePush.axes(px, py, b, allScreens, EDGE, topEnabled);
+                    long prev = pushPrev[0];
+                    pushPrev[0] = now;
+                    if (axes == 0) {
+                        // Nothing to slide. Keep the timer alive only while the top dwell is still
+                        // counting down, so "hold at the top" can still become "slide off the top".
+                        if (inTopBand && !topEnabled) return;
+                        stopPush.run();
+                        return;
+                    }
+                    if ((axes & EdgePush.TOP) != 0 && !topPushed[0]) {
+                        topPushed[0] = true;  // sliding off the top -> a release must not maximize
+                        if (snapping[0]) { snapping[0] = false; applySnapCue.run(); }
+                    }
+                    if (prev == 0) return; // first sliding frame: baseline only
+
+                    EdgePush.slide(axes, PUSH, (now - prev) / 1_000_000_000.0, tmpDir);
+
+                    // Bounded slip guard: once the window is completely past the screen on an axis, stop
+                    // pushing that axis. Even in the pathological case of a dropped mouse-up the window
+                    // can then only end up parked off-screen -- it can never slide away forever.
+                    if ((axes & EdgePush.LEFT) != 0 && win.getX() + win.getWidth() <= b.getMinX()) tmpDir[0] = 0;
+                    if ((axes & EdgePush.RIGHT) != 0 && win.getX() >= b.getMaxX()) tmpDir[0] = 0;
+                    if ((axes & EdgePush.TOP) != 0 && win.getY() + win.getHeight() <= b.getMinY()) tmpDir[1] = 0;
+                    if ((axes & EdgePush.BOTTOM) != 0 && win.getY() >= b.getMaxY()) tmpDir[1] = 0;
+
+                    if (tmpDir[0] == 0 && tmpDir[1] == 0) { prevSlid[0] = false; return; } // bounded guard parked it
+
+                    // Did the PREVIOUS frame's request actually move the window? Desktops such as KWin on
+                    // Wayland clamp every window back inside the screens, so pushing there is pointless --
+                    // stop after a sustained refusal instead of calling setX 60x a second for nothing.
+                    // This compares the position at the START of each frame (reading it back right after
+                    // setX would just echo the request), so it can never trip on a desktop that does slide.
+                    double startX = win.getX(), startY = win.getY();
+                    if (prevSlid[0]) {
+                        boolean moved = (prevReq[0] == 0 || Math.abs(startX - prevStart[0]) > 0.05)
+                                && (prevReq[1] == 0 || Math.abs(startY - prevStart[1]) > 0.05);
+                        if (moved) noProgress[0] = 0;
+                        else if (++noProgress[0] > 45) {
+                            // The desktop refuses to move the window outward (KWin on Wayland keeps every
+                            // window inside the screen). Latch that and stop, so the rest of this hold does
+                            // not keep probing and calling setX for nothing.
+                            pushRefused[0] = true;
+                            stopPush.run();
+                            return;
+                        }
+                    }
+                    prevStart[0] = startX; prevStart[1] = startY;
+                    prevReq[0] = tmpDir[0]; prevReq[1] = tmpDir[1];
+                    prevSlid[0] = true;
+
+                    win.setX(startX + tmpDir[0]);
+                    win.setY(startY + tmpDir[1]);
+                }
+            };
+            pushTimer[0] = t;
+            try { t.start(); } catch (IllegalStateException ignored) { pushTimer[0] = null; }
+        };
+
+        // Decides whether the pointer is currently pinned at an edge of the screen it is actually on,
+        // and starts (or stops) the slide accordingly. Driven by the drag events, which keep arriving
+        // while the button is held, so moving the pointer back inwards ends the slide immediately.
+        Runnable checkBand = () -> {
+            if (!dragging[0]) {
+                if (snapEdge[0] != 0) { snapEdge[0] = 0; applySnapCue.run(); }
+                stopPush.run();
+                return;
+            }
+            double px = lastPtr[0], py = lastPtr[1];
+            javafx.geometry.Rectangle2D b = screenAt.apply(new double[]{px, py}).getBounds();
+            if (!EdgePush.inAnyBand(px, py, b, EDGE)) {
+                pushRefused[0] = false; // left the edge: a later push gets a fresh chance
+                if (snapEdge[0] != 0) { snapEdge[0] = 0; applySnapCue.run(); } // disarm the tile cue
+                stopPush.run();
+                return; // the common case: cheap
+            }
+            if (prefs.edgeSnapInsteadOfPark) {
+                // SNAP MODE (Settings > Launcher): never push a window off the screen -- just arm the
+                // left/right half-tile for release. The top edge needs no arming: it is the existing
+                // drag-to-top maximize, and the bottom edge stays a plain move.
+                refreshScreens.run();
+                int axes = EdgePush.axes(px, py, b, allScreens, EDGE, true);
+                int edge = (axes & EdgePush.LEFT) != 0 ? EdgePush.LEFT
+                         : (axes & EdgePush.RIGHT) != 0 ? EdgePush.RIGHT : 0;
+                if (snapEdge[0] != edge) { snapEdge[0] = edge; applySnapCue.run(); }
+                stopPush.run();
+                return;
+            }
+            // Right at an edge. If this desktop already refused to let the window slide outward, don't keep
+            // hammering it -- the drag itself carries on normally, only the futile push is skipped.
+            if (pushRefused[0]) return;
+            // Only right at an edge is the screen list needed, so the ordinary drag path allocates nothing.
+            refreshScreens.run();
+            if (EdgePush.axes(px, py, b, allScreens, EDGE, true) != 0) startPush.run();
+            else stopPush.run(); // edge shared with a neighbouring monitor -> not a real outer edge
         };
 
         // The per-root handlers don't reach over the main window's densely packed controls: in JavaFX,
@@ -4748,16 +5030,41 @@ public class LauncherApp extends Application {
 
             sc.addEventFilter(javafx.scene.input.MouseEvent.MOUSE_PRESSED, e -> {
                 if (!e.isPrimaryButtonDown()) return;
-                if (locked.getAsBoolean()) {
-                    resizing[0] = false;
-                    dragging[0] = false;
-                    return;
-                }
+                // The second click of a double-click must not start a drag -- it toggles maximize instead.
+                if (e.getClickCount() >= 2) { resizing[0] = false; dragging[0] = false; return; }
+                // A full-screen window is pinned: never move or resize it from a drag.
+                if (win.isFullScreen()) { resizing[0] = false; dragging[0] = false; return; }
+                // A fresh press always starts clean: no stale off-edge slide can survive into a new drag.
+                stopPush.run();
+                topPushed[0] = false;
+                pushRefused[0] = false; // a new gesture gets a fresh chance, even after a refusal
+                if (snapEdge[0] != 0) { snapEdge[0] = 0; applySnapCue.run(); }
                 double[] p = new double[2];
                 readLocal.accept(e, p);
                 zone.accept(p[0], p[1]);
                 start[0] = e.getScreenX(); start[1] = e.getScreenY();
                 orig[0] = win.getX(); orig[1] = win.getY(); orig[2] = win.getWidth(); orig[3] = win.getHeight();
+
+                // Grabbing a MAXIMIZED window's header restores it to its previous size and lets it follow
+                // the pointer -- exactly how a native OS window behaves. Edges are ignored while maximized.
+                if (win.isMaximized()) {
+                    if (p[1] > headerBottom.getAsDouble()) { resizing[0] = false; dragging[0] = false; return; }
+                    double gw = prevBounds[2] > 0 ? prevBounds[2] : orig[2];
+                    double gh = prevBounds[3] > 0 ? prevBounds[3] : orig[3];
+                    win.setMaximized(false);
+                    win.setWidth(gw);
+                    win.setHeight(gh);
+                    win.setX(e.getScreenX() - gw * 0.5);
+                    win.setY(e.getScreenY() - headerBottom.getAsDouble() * 0.5);
+                    prevBounds[0] = win.getX(); prevBounds[1] = win.getY();
+                    prevBounds[2] = win.getWidth(); prevBounds[3] = win.getHeight();
+                    lastPtr[0] = e.getScreenX(); lastPtr[1] = e.getScreenY();
+                    dragging[0] = true; resizing[0] = false;
+                    return;
+                }
+
+                prevBounds[0] = orig[0]; prevBounds[1] = orig[1];
+                prevBounds[2] = orig[2]; prevBounds[3] = orig[3];
                 boolean edge = west[0] || east[0] || north[0] || south[0];
                 if (edge) {
                     // Pressed an edge/corner -> start resizing. Direction is locked at press, so once the
@@ -4766,76 +5073,44 @@ public class LauncherApp extends Application {
                 } else if (p[1] <= headerBottom.getAsDouble()) {
                     lastPtr[0] = e.getScreenX(); lastPtr[1] = e.getScreenY();
                     dragging[0] = true; resizing[0] = false;
+                    // The edge gesture is armed by the drag events, never by the press alone: a plain
+                    // click on a window sitting against an edge must not slide or tile it.
                 } else {
                     dragging[0] = false; resizing[0] = false;
                 }
             });
 
-            // Drag-to-top maximize helpers. `pointerScreen` resolves the physical screen under the pointer,
-            // so on a multi-monitor setup (even with different sizes) we maximize to the right display.
-            // `applySnapCue` shows a subtle orange top border while a window is inside the full-screen zone.
-            java.util.function.Function<javafx.scene.input.MouseEvent, javafx.stage.Screen> pointerScreen = ev -> {
-                javafx.stage.Screen best = javafx.stage.Screen.getPrimary();
-                double px = ev.getScreenX(), py = ev.getScreenY();
-                double bestArea = -1.0;
-                for (javafx.stage.Screen s : javafx.stage.Screen.getScreens()) {
-                    javafx.geometry.Rectangle2D vb = s.getVisualBounds();
-                    double ox = Math.max(0, Math.min(vb.getMaxX(), px) - Math.max(vb.getMinX(), px));
-                    double oy = Math.max(0, Math.min(vb.getMaxY(), py) - Math.max(vb.getMinY(), py));
-                    double area = ox * oy;
-                    if (area > bestArea) { bestArea = area; best = s; }
-                }
-                return best;
-            };
-            Runnable applySnapCue = () -> root.setStyle(snapping[0]
-                    ? "-fx-border-color: #ff7a1f transparent transparent transparent; -fx-border-width: 6 0 0 0;"
-                    : "");
-
-            // Edge overscroll: if the pointer gets pinned at an OUTER edge of the whole desktop (no monitor
-            // beyond), keep sliding the window out past that edge while the button is held. The cursor can't
-            // leave the display, but the window can -- so it can be parked fully below/above/side of a screen
-            // with nothing there. Pull it back by dragging inward (or just release).
-            final double OVER_SPEED = 520;             // px/sec pushed out while pinned at an edge
-            final double[] overDir = {0, 0};           // slide speed per axis (px/sec)
-            AnimationTimer[] overTimer = new AnimationTimer[1];
-            Runnable startOver = () -> {
-                if (overTimer[0] != null) return;
-                long[] prev = {0};
-                overTimer[0] = new AnimationTimer() {
-                    @Override public void handle(long now) {
-                        if (prev[0] == 0) prev[0] = now;
-                        double dt = (now - prev[0]) / 1_000_000_000.0;
-                        prev[0] = now;
-                        win.setX(win.getX() + overDir[0] * dt);
-                        win.setY(win.getY() + overDir[1] * dt);
+            // Double-click on the title bar / header toggles between maximized and the window's last
+            // restored size -- the same gesture every desktop OS uses.
+            sc.addEventFilter(javafx.scene.input.MouseEvent.MOUSE_CLICKED, e -> {
+                if (e.getButton() != javafx.scene.input.MouseButton.PRIMARY) return;
+                if (e.getClickCount() < 2) return;
+                if (win.isFullScreen()) return;
+                double[] p = new double[2];
+                readLocal.accept(e, p);
+                if (p[1] > headerBottom.getAsDouble()) return; // only the title bar double-click toggles
+                if (!win.isMaximized()) {
+                    prevBounds[0] = win.getX(); prevBounds[1] = win.getY();
+                    prevBounds[2] = win.getWidth(); prevBounds[3] = win.getHeight();
+                    win.setMaximized(true);
+                } else {
+                    win.setMaximized(false);
+                    if (prevBounds[2] > 0) {
+                        win.setWidth(prevBounds[2]); win.setHeight(prevBounds[3]);
+                        win.setX(prevBounds[0]); win.setY(prevBounds[1]);
                     }
-                };
-                overTimer[0].start();
-            };
-            Runnable stopOver = () -> {
-                if (overTimer[0] != null) {
-                    try { overTimer[0].stop(); } catch (IllegalStateException ignored) {}
-                    overTimer[0] = null;
                 }
-            };
-            java.util.function.Consumer<javafx.scene.input.MouseEvent> edgeOver = e -> {
-                double mnx = Double.MAX_VALUE, mxx = -Double.MAX_VALUE,
-                       mny = Double.MAX_VALUE, mxy = -Double.MAX_VALUE;
-                for (javafx.stage.Screen s : javafx.stage.Screen.getScreens()) {
-                    javafx.geometry.Rectangle2D b = s.getBounds();
-                    mnx = Math.min(mnx, b.getMinX());  mxx = Math.max(mxx, b.getMaxX());
-                    mny = Math.min(mny, b.getMinY());  mxy = Math.max(mxy, b.getMaxY());
-                }
-                double px = e.getScreenX(), py = e.getScreenY();
-                double ex = 1.0, ey = 1.0;             // tolerance so the last desktop pixel counts as "at edge"
-                int sx = 0, sy = 0;
-                if (px <= mnx + ex) sx = -1; else if (px >= mxx - ex) sx = 1;
-                if (py >= mxy - ey) sy = 1; // bottom edge -> overscroll DOWN (drag under the screen)
-                // Top edge intentionally does NOT overscroll up -- that edge is the drag-to-top maximize zone.
-                overDir[0] = sx * OVER_SPEED;
-                overDir[1] = sy * OVER_SPEED;
-                if (sx != 0 || sy != 0) startOver.run(); else stopOver.run();
-            };
+                e.consume();
+            });
+
+            // Drag-to-top maximize helper: resolves the physical screen under the pointer, so on a
+            // multi-monitor setup (even with different sizes) snapping maximizes to the right display.
+            java.util.function.Function<javafx.scene.input.MouseEvent, javafx.stage.Screen> pointerScreen = ev ->
+                    screenAt.apply(new double[]{ev.getScreenX(), ev.getScreenY()});
+
+            // Edge overscroll is handled by startPush/checkBand above: whenever a drag puts the pointer
+            // within a few px of an edge of the screen it is on, the window keeps sliding outward past
+            // that edge while the button is held -- including off the top, once the top dwell elapses.
 
             sc.addEventFilter(javafx.scene.input.MouseEvent.MOUSE_DRAGGED, e -> {
                 if (!e.isPrimaryButtonDown()) return;
@@ -4867,39 +5142,44 @@ public class LauncherApp extends Application {
 
                     // Drag-to-top maximize: when the window's top edge reaches the top of the screen under
                     // the pointer, flag it so release fills that screen's full bounds. Dragging back down
-                    // clears the flag, so you stay in full-screen only while you hold it up there.
+                    // clears the flag, so you stay in full-screen only while you hold it up there. Once the
+                    // top edge has been used to slide the window OFF the top, the affordance stays muted
+                    // until the window comes back down out of the snap zone.
                     javafx.stage.Screen scr = pointerScreen.apply(e);
                     javafx.geometry.Rectangle2D vb = scr.getVisualBounds();
-                    snapping[0] = win.getY() <= vb.getMinY() + MAX_SNAP;
-                    applySnapCue.run();
+                    if (topPushed[0]) {
+                        if (win.getY() > vb.getMinY() + MAX_SNAP) topPushed[0] = false;
+                    } else {
+                        boolean snap = win.getY() <= vb.getMinY() + MAX_SNAP;
+                        if (snap != snapping[0]) { snapping[0] = snap; applySnapCue.run(); }
+                    }
 
-                    // Overscroll once the pointer is pinned at a desktop outer edge (so the window can keep
-                    // moving under a screen even though the cursor can't follow it there).
-                    edgeOver.accept(e);
+                    // Pinned at a screen edge? Keep sliding the window outward while the button is held.
+                    checkBand.run();
                 }
             });
 
             sc.addEventFilter(javafx.scene.input.MouseEvent.MOUSE_RELEASED, e -> {
-                stopOver.run(); // a release always ends any ongoing edge-overscroll
-                // Drag-to-top maximize: releasing while the window's top is pinned to the top edge fills
-                // the full screen of the monitor under the pointer (works across different-size monitors).
-                if (dragging[0] && snapping[0]) {
-                    javafx.stage.Screen scr = pointerScreen.apply(e);
-                    javafx.geometry.Rectangle2D vb = scr.getVisualBounds();
-                    win.setX(vb.getMinX());
-                    win.setY(vb.getMinY());
-                    win.setWidth(vb.getWidth());
-                    win.setHeight(vb.getHeight());
-                }
-                snapping[0] = false;
-                applySnapCue.run();
-                resizing[0] = false;
-                dragging[0] = false;
+                // Release: stop any off-edge slide and clear the drag/maximize state -- this is the one
+                // path that decides whether a drag-to-top becomes a real maximize.
+                endDrag.run();
                 double[] p = new double[2];
                 readLocal.accept(e, p);
                 zone.accept(p[0], p[1]);
                 lastY[0] = p[1];
                 updateCursor.run();
+            });
+
+            // Belt and braces: a drag can never outlive the window's own state, so an off-edge slide has
+            // no way to keep running even if the release event is ever lost (app switch, window hidden...).
+            // Hiding the maximize intent here keeps a focus change from being mistaken for a drag-to-top.
+            win.focusedProperty().addListener((obs, was, focused) -> {
+                if (!focused) { snapping[0] = false; snapEdge[0] = 0; endDrag.run(); }
+            });
+            win.addEventHandler(javafx.stage.WindowEvent.WINDOW_HIDDEN, e -> {
+                snapping[0] = false;
+                snapEdge[0] = 0;
+                endDrag.run();
             });
 
             // Keyboard nudging: with this window focused, arrow keys move it exactly in that direction --
@@ -6479,6 +6759,27 @@ public class LauncherApp extends Application {
         grid.add(useCurrentSizeBtn, 1, row++, 1, 1);
         grid.add(rememberBox, 0, row++, 2, 1);
         grid.add(fullscreenStartBox, 0, row++, 2, 1);
+
+        row++;
+        grid.add(sectionLabel("WINDOW EDGES"), 0, row++, 2, 1);
+        CheckBox edgeSnapBox = new CheckBox("Snap windows to screen edges instead of pushing them off-screen");
+        edgeSnapBox.setSelected(prefs.edgeSnapInsteadOfPark);
+        Label edgeSnapNote = new Label("ON: dragging a borderless window to the left or right edge tiles it to "
+                + "that half of the screen and the top edge maximises it -- the same edge gestures the "
+                + "desktop itself uses. OFF (default): the window keeps sliding outward so it can be parked "
+                + "partly or fully off any edge, which needs a desktop that allows windows off-screen "
+                + "(Windows, or an X11 window manager that permits it). KDE Plasma Wayland refuses to let "
+                + "any window leave the screen, so use this mode there.");
+        edgeSnapNote.getStyleClass().add("notice-label");
+        edgeSnapNote.setWrapText(true);
+        edgeSnapBox.selectedProperty().addListener((o, a, b) -> {
+            markDirty.run();
+            prefs.edgeSnapInsteadOfPark = b;
+            prefs.save();
+        });
+        grid.add(edgeSnapBox, 0, row++, 2, 1);
+        grid.add(edgeSnapNote, 0, row++, 2, 1);
+
         row++;
         grid.add(sectionLabel("SETTINGS WINDOW SIZE"), 0, row++, 2, 1);
         HBox settingsSizeBox = new HBox(6, settingsWidthField, new Label("x"), settingsHeightField);

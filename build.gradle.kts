@@ -1,3 +1,6 @@
+import java.nio.file.Files
+import java.nio.file.Path
+
 plugins {
     id("java")
     id("application")
@@ -6,7 +9,10 @@ plugins {
 }
 
 group = "com.deylauncher"
-version = "0.1.0"
+// Single source of truth for the app version. It is baked into the jar/resource that
+// AppUpdater.currentVersion() reads at runtime, so the self-updater always knows exactly
+// which version is installed -- and CI's jpackage step discovers this same fat jar by name.
+version = "0.1.3"
 
 repositories {
     mavenCentral()
@@ -28,6 +34,14 @@ dependencies {
     implementation("com.google.code.gson:gson:2.11.0")
     // WebP image support for Modrinth icons (TwelveMonkeys ImageIO)
     implementation("com.twelvemonkeys.imageio:imageio-webp:3.12.0")
+    // JNA: OPTIONAL native mouse fallback. Off-edge window parking is implemented in pure JavaFX --
+    // PointerProbe reads the global pointer with javafx.scene.robot.Robot#getMousePosition() and the
+    // drag/release events do the rest -- so this dependency is NOT required for the feature. Where the
+    // native read IS available (Windows / X11), PointerProbe additionally gets the GLOBAL primary-button
+    // state, which lets a drag that is pinned against a screen edge end on the true mouse-up even if no
+    // JavaFX release event ever arrives. Where it isn't (e.g. Wayland) NativeInput reports unsupported
+    // and PointerProbe simply stays on the pure-JavaFX tier.
+    implementation("net.java.dev.jna:jna:5.14.0")
     // HTTP client is java.net.http (built into Java 17), no extra dependency needed
     testImplementation(platform("org.junit:junit-bom:5.10.2"))
     testImplementation("org.junit.jupiter:junit-jupiter")
@@ -79,6 +93,18 @@ tasks.shadowJar {
 // If that file doesn't exist (e.g. building from source without setting this up), this is a
 // silent no-op and GitHubConfig just falls back to each user's own local override file instead.
 tasks.processResources {
+    // Single source of truth for the self-updater's version: bake project.version (above) into a
+    // tiny resource the running app reads, so AppUpdater.currentVersion() is correct in BOTH the
+    // packaged app and `./gradlew run` -- regardless of how the jar happens to be named.
+    val versionFile = file("build/generated-version/deylauncher-version.properties")
+    doFirst {
+        val p = versionFile.toPath()
+        Files.createDirectories(p.getParent())
+        Files.writeString(p, "version=${project.version}\n")
+        logger.lifecycle("DeyLauncher: embedding app version ${project.version} for the self-updater.")
+    }
+    from(versionFile)
+
     val embedSource = file("secrets/embedded-github.properties")
     if (embedSource.exists()) {
         from(embedSource) {

@@ -47,17 +47,26 @@ jobs:
           rm -rf dist
           mkdir -p dist
 
+          # Discover the fat jar the build actually produced (it carries the real version),
+          # instead of hardcoding a jar name that goes stale every time the version bumps.
+          MAIN_JAR=$(ls build/jpackage-input/DeyLauncher-*.jar 2>/dev/null | xargs -n1 basename)
+          if [ -z "$MAIN_JAR" ]; then
+            echo "No DeyLauncher fat jar found in build/jpackage-input" >&2
+            exit 1
+          fi
+          echo "Packaging main jar: $MAIN_JAR"
+
           jpackage \
             --type app-image \
             --input build/jpackage-input \
             --module-path build/jpackage-fx \
             --add-modules java.se,jdk.crypto.ec,jdk.unsupported,javafx.controls,javafx.graphics \
-            --main-jar DeyLauncher-0.1.0.jar \
+            --main-jar "$MAIN_JAR" \
             --main-class com.deylauncher.ui.LauncherApp \
             --name DeyLauncher \
             --icon src/main/resources/app-icon.png \
             --dest dist \
-            --java-options "--enable-native-access=javafx.graphics"
+            --java-options "--enable-native-access=javafx.graphics,ALL-UNNAMED"
 
       - name: Create Linux archive
         run: |
@@ -111,17 +120,26 @@ jobs:
           Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force -Path dist | Out-Null
 
+          # Discover the fat jar the build actually produced (it carries the real version),
+          # instead of hardcoding a jar name that goes stale every time the version bumps.
+          $MAIN_JAR = (Get-ChildItem build/jpackage-input -Filter 'DeyLauncher-*.jar' | Select-Object -First 1).Name
+          if (-not $MAIN_JAR) {
+            Write-Error 'No DeyLauncher fat jar found in build/jpackage-input'
+            exit 1
+          }
+          echo "Packaging main jar: $MAIN_JAR"
+
           jpackage `
             --type app-image `
             --input build/jpackage-input `
             --module-path build/jpackage-fx `
             --add-modules java.se,jdk.crypto.ec,jdk.unsupported,javafx.controls,javafx.graphics `
-            --main-jar DeyLauncher-0.1.0.jar `
+            --main-jar $MAIN_JAR `
             --main-class com.deylauncher.ui.LauncherApp `
             --name DeyLauncher `
             --icon src/main/resources/app-icon.ico `
             --dest dist `
-            --java-options '--enable-native-access=javafx.graphics'
+            --java-options '--enable-native-access=javafx.graphics,ALL-UNNAMED'
 
       - name: Create Windows archive
         shell: pwsh

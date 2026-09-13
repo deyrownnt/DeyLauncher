@@ -23,6 +23,14 @@ public class LauncherPrefs {
     public boolean rememberWindowSize = true;
     public boolean darkMode = true;
     public boolean launcherStartFullscreen = false; // the LAUNCHER's own window, not the game's
+    // Edge gesture for borderless windows (Settings > Launcher > WINDOW EDGES):
+    //   false (default) -> dragging to a screen edge keeps sliding the window outward, so it can be
+    //                      parked partly/fully off any edge (needs a desktop that allows it: Windows,
+    //                      or an X11 WM that permits off-screen windows).
+    //   true            -> the desktop's own edge gesture: the left/right edge tiles the window to that
+    //                      half of the work area and the top edge maximizes. Needed on desktops that
+    //                      refuse to let a window leave the screen at all (e.g. KDE Plasma Wayland).
+    public boolean edgeSnapInsteadOfPark = false;
 
     // The unified Settings/Account/Skins dialog's own remembered size -- separate from the
     // main launcher window's startWidth/startHeight above.
@@ -75,6 +83,7 @@ public class LauncherPrefs {
             p.rememberWindowSize = Boolean.parseBoolean(props.getProperty("rememberWindowSize", "true"));
             p.darkMode = Boolean.parseBoolean(props.getProperty("darkMode", "true"));
             p.launcherStartFullscreen = Boolean.parseBoolean(props.getProperty("launcherStartFullscreen", "false"));
+            p.edgeSnapInsteadOfPark = Boolean.parseBoolean(props.getProperty("edgeSnapInsteadOfPark", "false"));
             p.settingsWindowWidth = parseDouble(props, "settingsWindowWidth", p.settingsWindowWidth);
             p.settingsWindowHeight = parseDouble(props, "settingsWindowHeight", p.settingsWindowHeight);
             p.lastVersionId = props.getProperty("lastVersionId", p.lastVersionId);
@@ -106,6 +115,7 @@ public class LauncherPrefs {
             props.setProperty("rememberWindowSize", String.valueOf(rememberWindowSize));
             props.setProperty("darkMode", String.valueOf(darkMode));
             props.setProperty("launcherStartFullscreen", String.valueOf(launcherStartFullscreen));
+            props.setProperty("edgeSnapInsteadOfPark", String.valueOf(edgeSnapInsteadOfPark));
             props.setProperty("settingsWindowWidth", String.valueOf(settingsWindowWidth));
             props.setProperty("settingsWindowHeight", String.valueOf(settingsWindowHeight));
             props.setProperty("lastVersionId", lastVersionId == null ? "" : lastVersionId);

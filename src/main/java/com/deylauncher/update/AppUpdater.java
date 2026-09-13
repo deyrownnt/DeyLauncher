@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.Enumeration;
 import java.util.List;
 import java.util.Optional;
+import java.util.Properties;
 import java.util.function.ObjLongConsumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -52,7 +53,9 @@ public final class AppUpdater {
     public static final String REPO = "DeyLauncher";
     public static final String RELEASE_PAGE = "https://github.com/" + OWNER + "/" + REPO + "/releases";
 
-    /** Fallback version used when the running jar filename can't be read (keep in sync with build.gradle.kts). */
+    /** Fallback version used when neither an embedded version resource nor a parseable jar
+     *  filename is available (keep loosely in sync with build.gradle.kts). Kept low on purpose:
+     *  if we can't determine the running version, we'd rather prompt for an update than hide it. */
     private static final String FALLBACK_VERSION = "0.1.0";
 
     private AppUpdater() {}
@@ -140,8 +143,17 @@ public final class AppUpdater {
 
     // ----------------------------------------------------------------- VERSION
 
-    /** The version currently running, read from the shipped jar filename (DeyLauncher-0.1.0.jar). */
+    /**
+     * The version currently running. Priority:
+     *   1. the embedded {@code /deylauncher-version.properties} resource written by the build
+     *      (project.version in build.gradle.kts) -- correct in the packaged app AND in-run;
+     *   2. the shipped jar filename ({@code DeyLauncher-0.1.3.jar}) for older installs that
+     *      predate the embedded resource;
+     *   3. {@link #FALLBACK_VERSION}.
+     */
     public static String currentVersion() {
+        String embedded = readEmbeddedVersion();
+        if (embedded != null) return embedded;
         Path jar = findCodeSourceJar();
         if (jar != null) {
             Matcher m = Pattern.compile("DeyLauncher-([0-9]+(?:\\.[0-9]+){1,3})\\.jar$")
@@ -149,6 +161,20 @@ public final class AppUpdater {
             if (m.find()) return m.group(1);
         }
         return FALLBACK_VERSION;
+    }
+
+    /** Reads the version baked in by the build ({@code deylauncher-version.properties}), or null. */
+    private static String readEmbeddedVersion() {
+        try (InputStream in = AppUpdater.class.getResourceAsStream("/deylauncher-version.properties")) {
+            if (in == null) return null;
+            Properties p = new Properties();
+            p.load(in);
+            String v = p.getProperty("version");
+            if (v != null && v.matches("[0-9]+(\\.[0-9]+){1,3}")) return v.trim();
+        } catch (Exception ignored) {
+            // Missing/unparseable resource just means fall through to the jar-name / fallback logic.
+        }
+        return null;
     }
 
     private static String versionFromTag(String tag) {
@@ -292,18 +318,20 @@ public final class AppUpdater {
         }
     }
 
-    /** Writes a small restart helper that swaps the new app dir into place and relaunces the launcher. */
-    public static Path writeRestartScript(InstallLayout layout, Path stagingApp, Path stagingRoot) throws IOException {
+    /** Writes a small restart helper that swaps the new app dir into place and relaunches the launcher.
+     *  {@code pid} is the running app's process id, so the helper waits for this process to fully exit
+     *  before swapping -- otherwise the swap can fail while the old JVM still holds the install dir. */
+    public static Path writeRestartScript(InstallLayout layout, Path stagingApp, Path stagingRoot, long pid) throws IOException {
         Path upd = Path.of(System.getProperty("user.home"), ".deylauncher", "updates");
         Files.createDirectories(upd);
         Path file;
         String script;
         if (layout.windows()) {
             file = upd.resolve("dl-update.bat");
-            script = windowsScript(layout, stagingApp, stagingRoot);
+            script = windowsScript(layout, stagingApp, stagingRoot, pid);
         } else {
             file = upd.resolve("dl-update.sh");
-            script = unixScript(layout, stagingApp, stagingRoot);
+            script = unixScript(layout, stagingApp, stagingRoot, pid);
         }
         Files.writeString(file, script, StandardCharsets.UTF_8,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
@@ -311,26 +339,37 @@ public final class AppUpdater {
         return file;
     }
 
-    private static String unixScript(InstallLayout layout, Path stagingApp, Path stagingRoot) {
+    private static String unixScript(InstallLayout layout, Path stagingApp, Path stagingRoot, long pid) {
         return "#!/bin/sh\n"
-                + "set -e\n"
+                // Take the install dir out of this shell's CWD first, so the directory move below
+                // can't hit Linux's "device or resource busy" while a process is chdir'd inside it.
+                + "cd /\n"
                 + "APP_DIR=\"" + layout.installRoot() + "\"\n"
                 + "STAGING=\"" + stagingApp + "\"\n"
-                + "sleep 2\n"
-                + "if [ -d \"$APP_DIR\" ]; then\n"
-                + "  mv -f \"$APP_DIR\" \"$APP_DIR.old\"\n"
-                + "fi\n"
+                + "OLD_PID=" + pid + "\n"
+                // Wait (up to 90s) for the running launcher to actually exit before touching its files.
+                // doCleanExit() already kicked it off; without this wait the swap can race the shutdown.
+                + "i=0\n"
+                + "while kill -0 \"$OLD_PID\" 2>/dev/null && [ \"$i\" -lt 90 ]; do sleep 1; i=$((i+1)); done\n"
+                // Swap the new app dir into place, retrying briefly in case the old dir is still busy,
+                // and never letting one failed move abort the whole update (no `set -e`).
+                + "mv -f \"$APP_DIR\" \"$APP_DIR.old\" 2>/dev/null || true\n"
+                + "n=0\n"
+                + "while [ ! -d \"$APP_DIR.old\" ] && [ \"$n\" -lt 10 ]; do sleep 1; mv -f \"$APP_DIR\" \"$APP_DIR.old\" 2>/dev/null || true; n=$((n+1)); done\n"
                 + "mkdir -p \"$APP_DIR\"\n"
                 + "cp -a \"$STAGING\"/. \"$APP_DIR\"/\n"
                 + "chmod +x \"$APP_DIR/bin/DeyLauncher\" 2>/dev/null || true\n"
                 + "rm -rf \"$APP_DIR.old\"\n"
                 + "cd /tmp\n"
-                + "nohup \"$APP_DIR/bin/DeyLauncher\" >/dev/null 2>&1 &\n"
+                // Relaunch the launcher only once the swap is done (restart at the END of the update).
+                + "if [ -x \"$APP_DIR/bin/DeyLauncher\" ]; then\n"
+                + "  nohup \"$APP_DIR/bin/DeyLauncher\" >/dev/null 2>&1 &\n"
+                + "fi\n"
                 + "rm -rf \"" + stagingRoot + "\"\n"
                 + "exit 0\n";
     }
 
-    private static String windowsScript(InstallLayout layout, Path stagingApp, Path stagingRoot) {
+    private static String windowsScript(InstallLayout layout, Path stagingApp, Path stagingRoot, long pid) {
         return "@echo off\n"
                 + "setlocal\n"
                 + "set \"APP_DIR=" + layout.installRoot() + "\"\n"
