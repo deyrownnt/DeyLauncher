@@ -348,21 +348,23 @@ public final class AppUpdater {
      *  {@code pid} is the running app's process id, so the helper waits for this process to fully exit
      *  before swapping -- otherwise the swap can fail while the old JVM still holds the install dir. */
     public static Path writeRestartScript(InstallLayout layout, Path stagingApp, Path stagingRoot, long pid) throws IOException {
-        Path upd = Path.of(System.getProperty("user.home"), ".deylauncher", "updates");
+        Path upd = updatesDir();
         Files.createDirectories(upd);
-        Path file;
-        String script;
-        if (layout.windows()) {
-            file = upd.resolve("dl-update.bat");
-            script = windowsScript(layout, stagingApp, stagingRoot, pid);
-        } else {
-            file = upd.resolve("dl-update.sh");
-            script = unixScript(layout, stagingApp, stagingRoot, pid);
-        }
-        Files.writeString(file, script, StandardCharsets.UTF_8,
+        Path file = layout.windows() ? upd.resolve("dl-update.bat") : upd.resolve("dl-update.sh");
+        Files.writeString(file, restartScript(layout, stagingApp, stagingRoot, pid),
+                StandardCharsets.UTF_8,
                 StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.WRITE);
         if (!layout.windows()) file.toFile().setExecutable(true, false);
         return file;
+    }
+
+    /** The restart-helper text for this install layout: CRLF-joined for the Windows .bat (cmd.exe is
+     *  only fully reliable on CRLF, and this script jumps around with labels) and LF-joined for the
+     *  POSIX .sh. Package-private so the script-shape invariants can be unit-tested without Windows. */
+    static String restartScript(InstallLayout layout, Path stagingApp, Path stagingRoot, long pid) {
+        return layout.windows()
+                ? windowsScript(layout, stagingApp, stagingRoot, pid)
+                : unixScript(layout, stagingApp, stagingRoot, pid);
     }
 
     private static String unixScript(InstallLayout layout, Path stagingApp, Path stagingRoot, long pid) {
@@ -395,29 +397,160 @@ public final class AppUpdater {
                 + "exit 0\n";
     }
 
-    private static String windowsScript(InstallLayout layout, Path stagingApp, Path stagingRoot, long pid) {
-        return "@echo off\n"
-                + "setlocal\n"
-                + "set \"APP_DIR=" + layout.installRoot() + "\"\n"
-                + "set \"STAGING=" + stagingApp + "\"\n"
-                + "set OLD=%APP_DIR%.old\n"
-                + "set LOG=" + updatesLogPath() + "\n"
-                + "timeout /t 4 /nobreak >nul\n"
-                + "if exist \"%STAGING%\" ( xcopy \"%STAGING%\"\\* \"%APP_DIR%\"\\ /E /I /Y /Q >>\"%LOG%\" 2>&1 )\n"
-                + "if exist \"%OLD%\" rd /s /q \"%OLD%\" >nul 2>&1\n"
-                + "cd /d \"%TEMP%\"\n"
-                + "start \"\" \"%APP_DIR%\\DeyLauncher.exe\"\n"
-                + "rmdir /s /q \"" + stagingRoot + "\" >nul 2>&1\n"
-                + "exit /b 0\n";
+    /**
+     * The Windows restart helper.
+     *
+     * Windows cannot replace (or even rename) files a running process still holds open: while the old
+     * launcher is alive it keeps DeyLauncher.exe, app\DeyLauncher.cfg, app\*.jar and
+     * runtime\bin\server\jvm.dll locked, so a copy attempted too early fails with "Access is denied" --
+     * and since the old files were never replaced, the relaunched exe reports the SAME version, which
+     * looks exactly like "the update did nothing". So this helper POLLS THE OLD PID (the Windows
+     * counterpart of the .sh helper's {@code kill -0} loop) instead of sleeping a fixed 4 seconds:
+     * doCleanExit() publishes OFFLINE presence over the network and can wait up to 35s PER running
+     * server before it even reaches System.exit(0).
+     *
+     * It also refuses to leave a half-applied install behind: the old app dir is moved aside first, the
+     * new one is robocopy'd into a fresh directory, the version-bearing jar is verified, and any failure
+     * restores the previous install -- then whatever is at <installRoot>\DeyLauncher.exe is relaunched,
+     * so the user is never left without a launcher. Every step goes to ~/.deylauncher/updates/update.log.
+     */
+    static String windowsScript(InstallLayout layout, Path stagingApp, Path stagingRoot, long pid) {
+        // CRLF matters here: cmd.exe is only fully reliable on CRLF line endings and this script jumps
+        // around with labels -- an LF-only .bat can make a goto miss its own target.
+        List<String> s = new ArrayList<>();
+        s.add("@echo off");
+        s.add("setlocal");
+        setVar(s, "APP_DIR", layout.installRoot().toString());
+        setVar(s, "STAGING", stagingApp.toString());
+        setVar(s, "STAGING_ROOT", stagingRoot.toString());
+        setVar(s, "OLD", "%APP_DIR%.old");
+        setVar(s, "LOG", updatesLogPath());
+        setVar(s, "RESULT", updateResultPath());
+        setVar(s, "OLD_PID", Long.toString(pid));
+        setVar(s, "WAITED", "0");
+        logLine(s, "DeyLauncher update: waiting for pid %OLD_PID% to exit");
+
+        // Windows refuses to rename or delete a directory that is a live process's CURRENT directory,
+        // and the launcher is started from its own folder -- leave it before touching anything.
+        s.add("cd /d \"%TEMP%\"");
+
+        // 1) Wait for the running launcher to really exit, polling the pid (up to ~2 minutes).
+        //    `ping` is the 1-second sleep: `timeout` aborts immediately when it has no console
+        //    (redirected stdin), which silently skipped even the delay it was there to provide.
+        s.add("rem -- step 1: wait for the running launcher to exit --");
+        s.add(":waitpid");
+        s.add("tasklist /FI \"PID eq %OLD_PID%\" /NH 2>nul | find /I \"%OLD_PID%\" >nul");
+        s.add("if errorlevel 1 goto exited");
+        s.add("set /a WAITED+=1");
+        s.add("if %WAITED% GEQ 120 goto stillalive");
+        s.add("ping -n 2 127.0.0.1 >nul 2>&1");
+        s.add("goto waitpid");
+        s.add("");
+        s.add(":stillalive");
+        logLine(s, "WARNING: pid %OLD_PID% is still running -- trying anyway");
+        s.add("");
+        s.add(":exited");
+        logLine(s, "pid %OLD_PID% exited after %WAITED%s");
+
+        // 2) Sanity-check the extracted update: the version-bearing jar name is read out of the staging
+        //    dir so that the same name can then be asserted in the install dir, after the copy.
+        s.add("rem -- step 2: check the extracted update --");
+        s.add("if not exist \"%STAGING%\\DeyLauncher.exe\" goto badstaging");
+        s.add("if not exist \"%STAGING%\\app\" goto badstaging");
+        setVar(s, "EXPECT_JAR", "");
+        s.add("for %%J in (\"%STAGING%\\app\\DeyLauncher-*.jar\") do set \"EXPECT_JAR=%%~nxJ\"");
+        s.add("if \"%EXPECT_JAR%\"==\"\" goto badstaging");
+        logLine(s, "new build is %EXPECT_JAR%");
+
+        // 3) Move the old install aside (retrying: antivirus/Explorer can hold the folder for a moment)
+        //    and copy the new one into a clean directory. If the move never succeeds, mirror over the
+        //    top instead -- /MIR also drops files the new version no longer ships, which the plain
+        //    xcopy this replaced never did.
+        s.add("rem -- step 3: swap in the new install --");
+        s.add("if exist \"%OLD%\" rd /s /q \"%OLD%\" >nul 2>&1");
+        s.add("set /a MOVED=0");
+        s.add(":movetry");
+        s.add("move \"%APP_DIR%\" \"%OLD%\" >nul 2>&1");
+        s.add("if exist \"%OLD%\\DeyLauncher.exe\" goto moved");
+        s.add("set /a MOVED+=1");
+        s.add("if %MOVED% GEQ 30 goto inplace");
+        s.add("ping -n 2 127.0.0.1 >nul 2>&1");
+        s.add("goto movetry");
+        s.add("");
+        s.add(":moved");
+        logLine(s, "old install moved aside after %MOVED%s");
+        s.add("robocopy \"%STAGING%\" \"%APP_DIR%\" /E /R:3 /W:1 /NFL /NDL /NJH /NJS /NP >>\"%LOG%\" 2>&1");
+        s.add("if errorlevel 8 goto rollback");
+        s.add("goto verify");
+        s.add("");
+        s.add(":inplace");
+        logLine(s, "could not move the install dir -- mirroring in place");
+        s.add("robocopy \"%STAGING%\" \"%APP_DIR%\" /MIR /R:3 /W:1 /NFL /NDL /NJH /NJS /NP >>\"%LOG%\" 2>&1");
+        s.add("if errorlevel 8 goto rollback");
+
+        // 4) Verify that the files carrying the version actually landed, then clean up and relaunch.
+        s.add("");
+        s.add(":verify");
+        s.add("if not exist \"%APP_DIR%\\DeyLauncher.exe\" goto rollback");
+        s.add("if not exist \"%APP_DIR%\\app\\%EXPECT_JAR%\" goto rollback");
+        s.add("if not exist \"%APP_DIR%\\runtime\" goto rollback");
+        logLine(s, "update applied and verified -- %EXPECT_JAR%");
+        s.add("rd /s /q \"%OLD%\" >nul 2>&1");
+        s.add("rd /s /q \"%STAGING_ROOT%\" >nul 2>&1");
+        s.add(">>\"%RESULT%\" echo OK %date% %time% -- installed %EXPECT_JAR%");
+        s.add("goto relaunch");
+        s.add("");
+        s.add(":rollback");
+        logLine(s, "ERROR: new build could not be applied -- restoring the old one");
+        s.add("rd /s /q \"%APP_DIR%\" >nul 2>&1");
+        s.add("if exist \"%OLD%\" move \"%OLD%\" \"%APP_DIR%\" >nul 2>&1");
+        s.add(">>\"%RESULT%\" echo FAILED %date% %time% -- nothing was applied, see %LOG%");
+        s.add("goto relaunchfail");
+        s.add("");
+        s.add(":badstaging");
+        logLine(s, "ERROR: the extracted update is not a complete app-image -- nothing changed");
+        s.add(">>\"%RESULT%\" echo FAILED %date% %time% -- the downloaded archive was incomplete");
+        s.add("goto relaunchfail");
+        s.add("");
+        s.add(":relaunch");
+        s.add("start \"\" /D \"%APP_DIR%\" \"%APP_DIR%\\DeyLauncher.exe\"");
+        s.add("endlocal");
+        s.add("exit /b 0");
+        s.add("");
+        s.add(":relaunchfail");
+        s.add("start \"\" /D \"%APP_DIR%\" \"%APP_DIR%\\DeyLauncher.exe\"");
+        s.add("endlocal");
+        s.add("exit /b 1");
+        return String.join("\r\n", s) + "\r\n";
+    }
+
+    /** Appends one timestamped line to the helper's log: {@code >>"%LOG%" echo [date time] text}. */
+    private static void logLine(List<String> s, String text) {
+        s.add(">>\"%LOG%\" echo [%date% %time%] " + text);
+    }
+
+    /** Appends {@code set "name=value"} -- cmd's quoted form, which tolerates spaces in the value. */
+    private static void setVar(List<String> s, String name, String value) {
+        s.add("set \"" + name + "=" + value + "\"");
+    }
+
+    private static Path updatesDir() {
+        return Path.of(System.getProperty("user.home"), ".deylauncher", "updates");
     }
 
     private static String updatesLogPath() {
-        return Path.of(System.getProperty("user.home"), ".deylauncher", "updates", "update.log").toString();
+        return updatesDir().resolve("update.log").toString();
+    }
+
+    /** Where the helper records how the swap went, so an update that could not be applied stops being
+     *  silent (the launcher can read this back on the next start). */
+    private static String updateResultPath() {
+        return updatesDir().resolve("update-result.txt").toString();
     }
 
     /** Launches the restart helper detached, so it survives this process exiting. */
     public static Process launchHelper(Path script, boolean windows) throws IOException {
-        Path log = Path.of(System.getProperty("user.home"), ".deylauncher", "updates", "update.log");
+        Path log = updatesDir().resolve("update.log");
         Files.createDirectories(log.getParent());
         ProcessBuilder pb;
         if (windows) {
