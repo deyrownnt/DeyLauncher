@@ -87,8 +87,9 @@ public class ModrinthClient {
         }
     }
 
-    /** Scales a BufferedImage down to {@code maxSide} (keeping aspect) when it's larger; returns it as-is otherwise. */
-    private static java.awt.image.BufferedImage scaleTo(java.awt.image.BufferedImage src, int maxSide) {
+    /** Scales a BufferedImage down to {@code maxSide} (keeping aspect) when it's larger; returns it as-is otherwise.
+     *  Public so the modpack code normalises pack icons the exact same way (see PackIcons). */
+    public static java.awt.image.BufferedImage scaleTo(java.awt.image.BufferedImage src, int maxSide) {
         int w = src.getWidth();
         int h = src.getHeight();
         if (w <= maxSide && h <= maxSide) return src;

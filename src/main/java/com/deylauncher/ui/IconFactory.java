@@ -35,6 +35,7 @@ public final class IconFactory {
         SEARCH,
         ADD,
         FILTER,
+        MODPACK,
         SERVER
     }
 
@@ -70,6 +71,9 @@ public final class IconFactory {
             case SEARCH -> "M15.5 15.5a3.5 3.5 0 1 1-7-7a3.5 3.5 0 0 0-7-7 3.5 3.5 0 1 0 7 7z";
             case ADD -> "M5 11h14v2h-14zM11 5v14h2v-14z";
             case FILTER -> "M4.25 5.61C6.27 8.2 10 13 10 13v6c0 .55.45 1 1 1h2c.55 0 1-.45 1-1v-6s3.72-4.8 5.74-7.39c.51-.66.04-1.61-.79-1.61H5.04c-.83 0-1.3.95-.79 1.61z";
+            // An isometric "modpack" box: a lid (top face) plus the two side faces, with a thin
+            // centre seam so it reads as a package rather than a solid cube at 17-20px.
+            case MODPACK -> "M12 2 L3 6.5 L12 11 L21 6.5 Z M3 7.6 L11.4 11.8 L11.4 20.4 L3 16.2 Z M12.6 11.8 L21 7.6 L21 16.2 L12.6 20.4 Z";
             case SERVER -> "M21 12a9 9 0 1 0-18 0a9 9 0 0 1 18 0zM7.5 12h9M12 3v18";
         };
     }

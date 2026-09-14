@@ -180,6 +180,20 @@
 .theme-dark .account-skin-tabs .tab:selected .tab-label, .theme-dark .settings-tabs .tab:selected .tab-label { -fx-text-fill: #ff7a1f; }
 .theme-dark .account-skin-tabs .tab-content-area, .theme-dark .settings-tabs .tab-content-area { -fx-background-color: #0d0d0f; }
 
+/* JavaFX's built-in modena.css paints a BLUE focus ring (.focus-indicator, -fx-focus-color
+   #039ED3 + its faint 13%-alpha twin) around the selected tab's label whenever the TabPane has
+   focus -- i.e. right after you click a subtab. Its selector is very specific, so it survived
+   every rule above and read as a blue glow around the tab text. Neutralize it for our two tab
+   panes only (keeping :focused in the selector so it still out-specifies modena); we deliberately
+   do NOT touch -fx-focus-color globally, which would also kill the focus rings of the text
+   fields/checkboxes/combo boxes living inside these tabs. */
+.theme-dark .settings-tabs:focused > .tab-header-area > .headers-region > .tab:selected .focus-indicator,
+.theme-dark .account-skin-tabs:focused > .tab-header-area > .headers-region > .tab:selected .focus-indicator,
+.theme-dark .settings-tabs .focus-indicator,
+.theme-dark .account-skin-tabs .focus-indicator {
+    -fx-border-color: transparent; -fx-border-width: 0; -fx-background-color: transparent;
+}
+
 /* The tab-overflow arrows that appear when a dialog is too small for every tab to fit -- these
    default to JavaFX's blue/Caspian look, so restyle them in the three-color theme. */
 .theme-dark .account-skin-tabs .tab-header-area .control-buttons-tab,
@@ -482,6 +496,15 @@
 .theme-light .account-skin-tabs .tab .tab-label, .theme-light .settings-tabs .tab .tab-label { -fx-text-fill: #6b6c72; -fx-font-weight: bold; }
 .theme-light .account-skin-tabs .tab:selected .tab-label, .theme-light .settings-tabs .tab:selected .tab-label { -fx-text-fill: #e8690f; }
 .theme-light .account-skin-tabs .tab-content-area, .theme-light .settings-tabs .tab-content-area { -fx-background-color: #f6f6f7; }
+
+/* Remove modena's blue .focus-indicator ring around the selected subtab label -- see the matching
+   comment in the dark theme above (same override, kept in sync for both themes). */
+.theme-light .settings-tabs:focused > .tab-header-area > .headers-region > .tab:selected .focus-indicator,
+.theme-light .account-skin-tabs:focused > .tab-header-area > .headers-region > .tab:selected .focus-indicator,
+.theme-light .settings-tabs .focus-indicator,
+.theme-light .account-skin-tabs .focus-indicator {
+    -fx-border-color: transparent; -fx-border-width: 0; -fx-background-color: transparent;
+}
 
 /* Tab-overflow arrows, restyled from JavaFX's default blue/Caspian look. */
 .theme-light .account-skin-tabs .tab-header-area .control-buttons-tab,
