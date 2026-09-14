@@ -59,9 +59,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.List;
+import com.google.gson.Gson;
 
 /**
  * Phase 3: the real window. Still wired to offline test mode underneath
@@ -89,6 +91,7 @@ public class LauncherApp extends Application {
     private Label accountStatusNotice;
     private FriendsService friendsService; // null until github.properties/embedded config is set -- see GitHubConfig
     private DeyCapesService deyCapesService; // null until github config is set -- Dey capes are a github-backed feature
+    private com.deylauncher.optionskits.OptionsKitsRepository optionsKitsRepository; // null until github config is set
     private FriendsCache friendsCache;
     private FriendNotesStore friendNotes; // per-friend personal notes, saved only on this PC
     private ServerStore serverStore;
@@ -207,6 +210,8 @@ public class LauncherApp extends Application {
         GitHubConfig githubConfig = GitHubConfig.load();
         this.friendsService = githubConfig.isConfigured() ? new FriendsService(githubConfig) : null;
         this.deyCapesService = githubConfig.isConfigured() ? new DeyCapesService(githubConfig) : null;
+        this.optionsKitsRepository = githubConfig.isConfigured()
+                ? new com.deylauncher.optionskits.OptionsKitsRepository(githubConfig) : null;
 
         // Best-effort: seed the github repo's capes catalog + texture folder the first time
         // the app opens with github configured, so Dey capes exist even on a fresh repo.
@@ -584,9 +589,41 @@ public class LauncherApp extends Application {
             prefs.save();
         }
         publishOfflineOnExit();
+        stopAllRunningServersBlocking();
         stage.close();
         Platform.exit();
         System.exit(0); // guarantee real process death even if a background thread is still running
+    }
+
+    /**
+     * Sends "stop" to every server this session started and waits (bounded) for each to exit,
+     * instead of System.exit(0) immediately falling through and letting the JVM shutdown tear
+     * down the child Minecraft process mid-save. A killed-mid-save world can leave
+     * world/dimensions/.../world_gen_settings.dat half-written, which is what produces
+     * "Unable to read or access the world gen settings file!" / "Overworld settings missing"
+     * the *next* time that server starts -- even though the server itself is fine and this
+     * only happens intermittently (only on the runs where the launcher got closed while it was
+     * still up). ServerProcessManager.stop() already does the graceful "stop" command + wait;
+     * this just makes sure doCleanExit() actually calls it for every still-running server
+     * before tearing down the JVM, instead of only doing so via the Stop button.
+     */
+    private void stopAllRunningServersBlocking() {
+        if (runningServers.isEmpty()) return;
+        List<ServerProcessManager> toStop = new ArrayList<>(runningServers.values());
+        runningServers.clear();
+        List<Thread> stoppers = new ArrayList<>();
+        for (ServerProcessManager pm : toStop) {
+            Thread t = new Thread(pm::stop, "server-stop-on-exit");
+            t.start();
+            stoppers.add(t);
+        }
+        for (Thread t : stoppers) {
+            try {
+                t.join(35_000); // a little past ServerProcessManager's own 30s graceful-stop timeout
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }
     }
 
     // ---- Self-updater (GitHub releases) ----
@@ -4730,6 +4767,377 @@ public class LauncherApp extends Application {
         refresh.run();
         win.showAndWait();
     }
+
+    /**
+     * "Option Kits": named, iconable snapshots of an instance's options.txt (video settings,
+     * keybinds, language, etc.) that can be saved, re-applied to ANY version/loader, downloaded as
+     * a standalone .json, or dragged back in. Kits live in the shared GitHub-backed store (see
+     * OptionsKitsRepository) under the active account's uuid, same backend Friends/DeyCapes use --
+     * so they follow the account across machines, not just this install. Free (offline) accounts
+     * get 1 slot; real (online) accounts get 5, matching OptionsKitsRepository's limits.
+     */
+    private void openOptionsKitsDialog() {
+        if (optionsKitsRepository == null) {
+            log("Option Kits needs GitHub sync configured for this build -- see GITHUB_SETUP.md.");
+            return;
+        }
+        PlayerIdentity activeIdentity = identityStore.getActive();
+        if (activeIdentity == null) {
+            log("Set up an account first (Account button) before saving Option Kits.");
+            return;
+        }
+        final String uuid = activeIdentity.uuid;
+        final int limit = activeIdentity.accountType == AccountType.ONLINE
+                ? com.deylauncher.optionskits.OptionsKitsRepository.ONLINE_ACCOUNT_LIMIT
+                : com.deylauncher.optionskits.OptionsKitsRepository.OFFLINE_ACCOUNT_LIMIT;
+
+        VBox rowsBox = new VBox(10);
+        ScrollPane scroll = new ScrollPane(rowsBox);
+        scroll.setFitToWidth(true);
+        scroll.getStyleClass().add("mods-scroll");
+        VBox.setVgrow(scroll, Priority.ALWAYS);
+
+        Label dropZone = new Label(
+                "Drag & drop a kit .json file anywhere in this window to import it, or save your "
+                        + "current options below");
+        dropZone.setGraphic(icon(IconFactory.Icon.DOWNLOAD, 20));
+        dropZone.setGraphicTextGap(8);
+        dropZone.getStyleClass().add("drop-zone");
+        dropZone.setMaxWidth(Double.MAX_VALUE);
+        dropZone.setAlignment(Pos.CENTER);
+
+        Label quotaLabel = new Label();
+        quotaLabel.getStyleClass().add("notice-label");
+
+        Button saveCurrentBtn = new Button("+  Save Current Options As Kit");
+        saveCurrentBtn.getStyleClass().add("pill-button");
+        saveCurrentBtn.setMaxWidth(Double.MAX_VALUE);
+
+        Label statusLabel = new Label();
+        statusLabel.getStyleClass().add("notice-label");
+        statusLabel.setWrapText(true);
+
+        Runnable[] refreshHolder = new Runnable[1];
+        Runnable refresh = () -> {
+            rowsBox.getChildren().clear();
+            statusLabel.setText("Loading...");
+            Task<List<com.deylauncher.optionskits.OptionsKit>> loadTask = new Task<>() {
+                @Override protected List<com.deylauncher.optionskits.OptionsKit> call() throws Exception {
+                    return optionsKitsRepository.listFor(uuid);
+                }
+            };
+            loadTask.setOnSucceeded(e -> {
+                statusLabel.setText("");
+                List<com.deylauncher.optionskits.OptionsKit> kits = loadTask.getValue();
+                quotaLabel.setText(kits.size() + " / " + limit + " kits used"
+                        + (activeIdentity.accountType == AccountType.OFFLINE
+                        ? " (offline accounts get 1 -- sign in with a real account for 5)" : ""));
+                saveCurrentBtn.setDisable(kits.size() >= limit);
+                if (kits.isEmpty()) {
+                    Label empty = new Label("No saved kits yet -- save your current options above, "
+                            + "or drag a kit .json file into this window.");
+                    empty.getStyleClass().add("notice-label");
+                    rowsBox.getChildren().add(empty);
+                } else {
+                    for (var kit : kits) rowsBox.getChildren().add(buildOptionsKitRow(kit, uuid, refreshHolder[0]));
+                }
+            });
+            loadTask.setOnFailed(e -> statusLabel.setText("Couldn't load kits: "
+                    + loadTask.getException().getMessage()));
+            new Thread(loadTask, "options-kits-load").start();
+        };
+        refreshHolder[0] = refresh;
+
+        saveCurrentBtn.setOnAction(e -> promptSaveCurrentOptionsAsKit(uuid, limit, refresh, statusLabel));
+
+        VBox content = new VBox(12, dropZone, quotaLabel, saveCurrentBtn, statusLabel, scroll);
+        content.setPadding(new Insets(20));
+        content.getStyleClass().add("mods-dialog-content");
+        VBox.setVgrow(scroll, Priority.ALWAYS);
+
+        installOptionsKitDropTarget(content, uuid, limit, refresh, statusLabel);
+        installOptionsKitDropTarget(rowsBox, uuid, limit, refresh, statusLabel);
+        installOptionsKitDropTarget(scroll, uuid, limit, refresh, statusLabel);
+
+        Stage win = buildModsWindowStage("Option Kits", content);
+        modsWindowOwner.set(win);
+        refresh.run();
+        win.showAndWait();
+    }
+
+    /** One saved kit's row: icon, name (+ version label), Apply / Rename / Icon / Download / Delete. */
+    private HBox buildOptionsKitRow(com.deylauncher.optionskits.OptionsKit kit, String uuid, Runnable refresh) {
+        StackPane iconTile = serverIconTile(kit.name == null ? "Kit" : kit.name, null, 40);
+        if (kit.iconBase64 != null && !kit.iconBase64.isBlank()) {
+            try {
+                byte[] bytes = Base64.getDecoder().decode(kit.iconBase64);
+                Image img = new Image(new java.io.ByteArrayInputStream(bytes), 40, 40, true, true);
+                showServerIcon(iconTile, img);
+            } catch (Exception ignored) {
+            }
+        }
+
+        Label name = new Label(kit.name == null ? "Untitled Kit" : kit.name);
+        name.getStyleClass().add("mod-name");
+        Label sub = new Label(kit.crossVersion || kit.minecraftVersion == null
+                ? "Cross-version" : kit.minecraftVersion);
+        sub.getStyleClass().add("notice-label");
+        VBox textBox = new VBox(2, name, sub);
+
+        Region spacer = new Region();
+        HBox.setHgrow(spacer, Priority.ALWAYS);
+
+        Button applyBtn = new Button("Apply");
+        applyBtn.getStyleClass().add("pill-button");
+        applyBtn.setOnAction(e -> applyOptionsKit(kit));
+
+        Button renameBtn = new Button("Rename");
+        renameBtn.getStyleClass().add("pill-button");
+        renameBtn.setOnAction(e -> {
+            TextInputDialog dialog = new TextInputDialog(kit.name == null ? "" : kit.name);
+            dialog.setHeaderText("Rename kit");
+            dialog.setContentText("New name:");
+            dialog.showAndWait().ifPresent(newName -> {
+                if (newName == null || newName.isBlank()) return;
+                mutateOptionsKit(uuid, kit.id, k -> k.name = newName.trim(), refresh);
+            });
+        });
+
+        Button iconBtn = new Button("Icon");
+        iconBtn.getStyleClass().add("pill-button");
+        iconBtn.setOnAction(e -> {
+            FileChooser chooser = new FileChooser();
+            chooser.setTitle("Choose a kit icon");
+            chooser.getExtensionFilters().add(new FileChooser.ExtensionFilter(
+                    "Images", "*.png", "*.jpg", "*.jpeg"));
+            java.io.File picked = chooser.showOpenDialog(modsWindowOwner.get());
+            if (picked == null) return;
+            try {
+                // Same square-crop-and-scale approach as writeServerIcon64, just kept in memory
+                // (base64) instead of written to disk -- avoids pulling in the javafx.swing module
+                // (not on this project's javafx { modules = ... } list) just to resize an icon.
+                java.awt.image.BufferedImage src = javax.imageio.ImageIO.read(picked);
+                if (src == null) throw new java.io.IOException("Unrecognized image format");
+                int side = Math.max(1, Math.min(src.getWidth(), src.getHeight()));
+                int sx = (src.getWidth() - side) / 2;
+                int sy = (src.getHeight() - side) / 2;
+                java.awt.image.BufferedImage scaled = new java.awt.image.BufferedImage(
+                        64, 64, java.awt.image.BufferedImage.TYPE_INT_ARGB);
+                java.awt.Graphics2D g = scaled.createGraphics();
+                g.setRenderingHint(java.awt.RenderingHints.KEY_INTERPOLATION,
+                        java.awt.RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+                g.drawImage(src, 0, 0, 64, 64, sx, sy, sx + side, sy + side, null);
+                g.dispose();
+                var out = new java.io.ByteArrayOutputStream();
+                javax.imageio.ImageIO.write(scaled, "png", out);
+                String b64 = Base64.getEncoder().encodeToString(out.toByteArray());
+                mutateOptionsKit(uuid, kit.id, k -> k.iconBase64 = b64, refresh);
+            } catch (Exception ex) {
+                log("Couldn't set kit icon: " + ex.getMessage());
+            }
+        });
+
+        Button downloadBtn = new Button("Download");
+        downloadBtn.getStyleClass().add("pill-button");
+        downloadBtn.setOnAction(e -> {
+            FileChooser chooser = new FileChooser();
+            chooser.setTitle("Save kit as...");
+            String safeName = (kit.name == null ? "kit" : kit.name).replaceAll("[^a-zA-Z0-9_-]", "_");
+            chooser.setInitialFileName(safeName + ".json");
+            chooser.getExtensionFilters().add(new FileChooser.ExtensionFilter("Option Kit", "*.json"));
+            java.io.File target = chooser.showSaveDialog(modsWindowOwner.get());
+            if (target == null) return;
+            try {
+                Files.writeString(target.toPath(), new Gson().toJson(kit));
+            } catch (Exception ex) {
+                log("Couldn't save kit file: " + ex.getMessage());
+            }
+        });
+
+        Button deleteBtn = new Button("Delete");
+        deleteBtn.getStyleClass().add("pill-button");
+        deleteBtn.setOnAction(e -> {
+            Alert confirm = new Alert(Alert.AlertType.CONFIRMATION,
+                    "Delete \"" + kit.name + "\"? This can't be undone.", ButtonType.YES, ButtonType.NO);
+            confirm.showAndWait().ifPresent(bt -> {
+                if (bt != ButtonType.YES) return;
+                Task<Void> task = new Task<>() {
+                    @Override protected Void call() throws Exception {
+                        optionsKitsRepository.sync(uuid, "Delete option kit " + kit.name, list -> {
+                            list.removeIf(k -> k.id.equals(kit.id));
+                            return list;
+                        });
+                        return null;
+                    }
+                };
+                task.setOnSucceeded(ev -> refresh.run());
+                task.setOnFailed(ev -> log("Couldn't delete kit: " + task.getException().getMessage()));
+                new Thread(task, "options-kit-delete").start();
+            });
+        });
+
+        HBox row = new HBox(10, iconTile, textBox, spacer, applyBtn, renameBtn, iconBtn, downloadBtn, deleteBtn);
+        row.setAlignment(Pos.CENTER_LEFT);
+        row.getStyleClass().add("mod-row");
+        return row;
+    }
+
+    /** Read-modify-write helper for a single field change on one kit, in the background. */
+    private void mutateOptionsKit(String uuid, String kitId,
+                                   java.util.function.Consumer<com.deylauncher.optionskits.OptionsKit> mutator,
+                                   Runnable refresh) {
+        Task<Void> task = new Task<>() {
+            @Override protected Void call() throws Exception {
+                optionsKitsRepository.sync(uuid, "Update option kit " + kitId, list -> {
+                    for (var k : list) {
+                        if (k.id.equals(kitId)) {
+                            mutator.accept(k);
+                            k.updatedAt = System.currentTimeMillis();
+                        }
+                    }
+                    return list;
+                });
+                return null;
+            }
+        };
+        task.setOnSucceeded(e -> refresh.run());
+        task.setOnFailed(e -> log("Couldn't update kit: " + task.getException().getMessage()));
+        new Thread(task, "options-kit-update").start();
+    }
+
+    /** Writes a kit's saved options.txt over the CURRENTLY SELECTED version/loader's instance --
+     *  cross-version by design (see OptionsKit's class doc): options.txt keys are stable enough
+     *  across releases that restricting this would just make the feature less useful. */
+    private void applyOptionsKit(com.deylauncher.optionskits.OptionsKit kit) {
+        try {
+            byte[] raw = Base64.getDecoder().decode(kit.optionsTxtBase64);
+            java.nio.file.Path instanceDir = currentInstanceDir();
+            Files.createDirectories(instanceDir);
+            Files.write(instanceDir.resolve("options.txt"), raw);
+            log("Applied \"" + kit.name + "\" to " + versionBox.getValue() + " (" + modLoaderBox.getValue()
+                    + "). Restart the game if it's already running for it to take effect.");
+        } catch (Exception ex) {
+            log("Couldn't apply kit: " + ex.getMessage());
+        }
+    }
+
+    /** Prompts for a name + cross-version choice, reads the current instance's options.txt, and
+     *  saves it as a new kit -- enforcing the account-tier slot limit up front with a clear message
+     *  rather than letting the sync fail unexplained. */
+    private void promptSaveCurrentOptionsAsKit(String uuid, int limit, Runnable refresh, Label statusLabel) {
+        java.nio.file.Path optionsFile = currentInstanceDir().resolve("options.txt");
+        if (!Files.exists(optionsFile)) {
+            statusLabel.setText("No options.txt yet for " + versionBox.getValue() + " ("
+                    + modLoaderBox.getValue() + ") -- launch it at least once first so it has settings to save.");
+            return;
+        }
+        TextInputDialog nameDialog = new TextInputDialog(versionBox.getValue() + " settings");
+        nameDialog.setHeaderText("Save current options as a kit");
+        nameDialog.setContentText("Kit name:");
+        nameDialog.showAndWait().ifPresent(name -> {
+            if (name == null || name.isBlank()) return;
+            Alert crossVersionAsk = new Alert(Alert.AlertType.CONFIRMATION,
+                    "Should this kit be labeled cross-version (works the same everywhere), or tagged "
+                            + "to " + versionBox.getValue() + " specifically? Either way it can be applied to "
+                            + "any version/loader later -- this only changes the label shown in the list.",
+                    ButtonType.YES, ButtonType.NO);
+            crossVersionAsk.setHeaderText("Cross-version kit?");
+            ((Button) crossVersionAsk.getDialogPane().lookupButton(ButtonType.YES)).setText("Cross-version");
+            ((Button) crossVersionAsk.getDialogPane().lookupButton(ButtonType.NO)).setText("Tag to this version");
+            crossVersionAsk.showAndWait().ifPresent(bt -> {
+                boolean crossVersion = bt == ButtonType.YES;
+                try {
+                    byte[] raw = Files.readAllBytes(optionsFile);
+                    String b64 = Base64.getEncoder().encodeToString(raw);
+                    String versionLabel = versionBox.getValue() + "-" + modLoaderBox.getValue();
+                    saveNewOptionsKit(uuid, limit, name.trim(), versionLabel, crossVersion, b64, refresh, statusLabel);
+                } catch (Exception ex) {
+                    statusLabel.setText("Couldn't read options.txt: " + ex.getMessage());
+                }
+            });
+        });
+    }
+
+    private void saveNewOptionsKit(String uuid, int limit, String name, String versionLabel,
+                                    boolean crossVersion, String optionsTxtBase64, Runnable refresh,
+                                    Label statusLabel) {
+        statusLabel.setText("Saving...");
+        Task<Void> task = new Task<>() {
+            @Override protected Void call() throws Exception {
+                optionsKitsRepository.sync(uuid, "Save option kit " + name, list -> {
+                    if (list.size() >= limit) {
+                        throw new RuntimeException("You're at your " + limit + "-kit limit for this account -- "
+                                + "delete one first, or sign in with a real account for more slots.");
+                    }
+                    list.add(new com.deylauncher.optionskits.OptionsKit(
+                            name, null, versionLabel, crossVersion, optionsTxtBase64));
+                    return list;
+                });
+                return null;
+            }
+        };
+        task.setOnSucceeded(e -> {
+            statusLabel.setText("");
+            refresh.run();
+        });
+        task.setOnFailed(e -> statusLabel.setText(task.getException().getMessage()));
+        new Thread(task, "options-kit-save").start();
+    }
+
+    /** Drag & drop a kit .json anywhere in the Option Kits window to import it (respecting the
+     *  account's slot limit, same as saving a new one). */
+    private void installOptionsKitDropTarget(Node target, String uuid, int limit, Runnable refresh,
+                                              Label statusLabel) {
+        target.setOnDragOver(e -> {
+            if (e.getDragboard().hasFiles()) e.acceptTransferModes(javafx.scene.input.TransferMode.COPY);
+            e.consume();
+        });
+        target.setOnDragDropped(e -> {
+            var files = e.getDragboard().getFiles();
+            boolean handled = false;
+            if (files != null) {
+                for (var f : files) {
+                    if (!f.getName().toLowerCase().endsWith(".json")) continue;
+                    handled = true;
+                    try {
+                        String json = Files.readString(f.toPath());
+                        com.deylauncher.optionskits.OptionsKit imported =
+                                new Gson().fromJson(json, com.deylauncher.optionskits.OptionsKit.class);
+                        if (imported == null || imported.optionsTxtBase64 == null) {
+                            statusLabel.setText("That file doesn't look like a kit export.");
+                            continue;
+                        }
+                        imported.id = java.util.UUID.randomUUID().toString(); // never collide with an existing id
+                        statusLabel.setText("Importing...");
+                        Task<Void> task = new Task<>() {
+                            @Override protected Void call() throws Exception {
+                                optionsKitsRepository.sync(uuid, "Import option kit " + imported.name, list -> {
+                                    if (list.size() >= limit) {
+                                        throw new RuntimeException("You're at your " + limit
+                                                + "-kit limit for this account -- delete one first.");
+                                    }
+                                    list.add(imported);
+                                    return list;
+                                });
+                                return null;
+                            }
+                        };
+                        task.setOnSucceeded(ev -> {
+                            statusLabel.setText("");
+                            refresh.run();
+                        });
+                        task.setOnFailed(ev -> statusLabel.setText(task.getException().getMessage()));
+                        new Thread(task, "options-kit-import").start();
+                    } catch (Exception ex) {
+                        statusLabel.setText("Couldn't import that file: " + ex.getMessage());
+                    }
+                }
+            }
+            e.setDropCompleted(handled);
+            e.consume();
+        });
+    }
+
 /** Lives only for the (blocking) openModsDialog() call, so the file chooser can center on it. */
     private final java.util.concurrent.atomic.AtomicReference<javafx.stage.Window> modsWindowOwner =
             new java.util.concurrent.atomic.AtomicReference<>();
@@ -6958,6 +7366,15 @@ public class LauncherApp extends Application {
         softwareGlHint.setWrapText(true);
         softwareGlHint.getStyleClass().add("settings-hint-label");
 
+        Button optionsKitsBtn = new Button();
+        setButtonIcon(optionsKitsBtn, IconFactory.Icon.SETTINGS, "Option Kits");
+        optionsKitsBtn.getStyleClass().add("pill-button");
+        optionsKitsBtn.setOnAction(e -> openOptionsKitsDialog());
+        Label optionsKitsHint = new Label("Save and swap between full options.txt presets -- "
+                + "per-version or cross-version -- instead of hand-editing settings every time you switch.");
+        optionsKitsHint.setWrapText(true);
+        optionsKitsHint.getStyleClass().add("settings-hint-label");
+
         GridPane grid = new GridPane();
         grid.setHgap(12);
         grid.setVgap(18);
@@ -6974,6 +7391,9 @@ public class LauncherApp extends Application {
         grid.add(sectionLabel("COMPATIBILITY"), 0, 6, 2, 1);
         grid.add(softwareGlBox, 0, 7, 2, 1);
         grid.add(softwareGlHint, 0, 8, 2, 1);
+        grid.add(sectionLabel("OPTION KITS"), 0, 9, 2, 1);
+        grid.add(optionsKitsBtn, 0, 10, 2, 1);
+        grid.add(optionsKitsHint, 0, 11, 2, 1);
         return grid;
     }
 
