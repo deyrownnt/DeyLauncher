@@ -18,6 +18,7 @@ import com.deylauncher.modloader.IrisInstaller;
 import com.deylauncher.modloader.DeyCapesInstaller;
 import com.deylauncher.modloader.ModPairResolver;
 import com.deylauncher.modloader.ModsUtil;
+import com.deylauncher.modpack.*;
 import com.deylauncher.server.*;
 import com.deylauncher.update.AppUpdater;
 import com.deylauncher.platform.PointerProbe;
@@ -80,6 +81,7 @@ public class LauncherApp extends Application {
     private ComboBox<String> versionBox;
     private ComboBox<String> modLoaderBox;
     private Button modsBtn;
+    private Button modpackBtn;   // icon button beside the DEY/VANILLA switch -- the modpack menu
     private Button playButton;
     private WaveLaunchBar launchProgress;
     private Scene scene;
@@ -239,6 +241,10 @@ public class LauncherApp extends Application {
         // Scene root is a StackPane so the update/loading overlay can cover the whole window.
         windowStack = new StackPane(root);
         windowStack.getStyleClass().add("window-stack");
+
+        // A modpack file/folder can be dropped anywhere in the launcher window: that opens the
+        // "Install Modpack" window already pointed at it (the drag & drop half of the feature).
+        installModpackDropTarget(windowStack);
 
         if (firstLaunch) {
             javafx.geometry.Rectangle2D bounds =
@@ -3516,7 +3522,27 @@ public class LauncherApp extends Application {
         };
         renderAddonsHolder[0] = renderAddons;
 
-        VBox dropZone = new VBox(new Label("Drop " + folderKind + " .jar files here"));
+        // ---- Modpacks: install a whole pack's server-side files in one go ----
+        // A server only ever wants the part of a pack it can run: the mods/ (or plugins/) folder it
+        // actually reads, plus config/. ModpackInstaller.installForServer enforces exactly that, and
+        // skips every file the pack marks client-only.
+        Button addPackBtn = new Button();
+        setButtonIcon(addPackBtn, IconFactory.Icon.MODPACK, "Add Modpack");
+        addPackBtn.getStyleClass().add("pill-button");
+        Label packStatus = new Label();
+        packStatus.getStyleClass().add("notice-label");
+        packStatus.setWrapText(true);
+        addPackBtn.setOnAction(e -> {
+            FileChooser chooser = new FileChooser();
+            chooser.setTitle("Select a modpack for this server");
+            chooser.getExtensionFilters().addAll(
+                    new FileChooser.ExtensionFilter("Modpacks (.mrpack / .zip)", "*.mrpack", "*.zip"),
+                    new FileChooser.ExtensionFilter("All files", "*.*"));
+            java.io.File picked = chooser.showOpenDialog(shellWindowOwner("server-" + server.id));
+            if (picked != null) installServerModpack(server, picked.toPath(), packStatus, renderAddons);
+        });
+
+        VBox dropZone = new VBox(new Label("Drop " + folderKind + " .jar files here, or a modpack (.mrpack / .zip)"));
         dropZone.setAlignment(Pos.CENTER);
         dropZone.getStyleClass().add("drop-zone");
         dropZone.setPrefHeight(70);
@@ -3528,15 +3554,23 @@ public class LauncherApp extends Application {
         dropZone.setOnDragExited(e -> dropZone.getStyleClass().remove("drop-zone-active"));
         dropZone.setOnDragDropped(e -> {
             var files = e.getDragboard().getFiles();
+            boolean addedJar = false;
             if (files != null) {
                 for (var f : files) {
-                    try {
-                        addonsManager.addFile(f.toPath());
-                    } catch (Exception ignored) {
+                    Path p = f.toPath();
+                    if (p.toString().toLowerCase().endsWith(".jar")) {
+                        try {
+                            addonsManager.addFile(p);
+                            addedJar = true;
+                        } catch (Exception ignored) {
+                        }
+                    } else if (ModpackFormat.installable(p)) {
+                        // A whole pack: install its server half in the background (it may download).
+                        installServerModpack(server, p, packStatus, renderAddons);
                     }
                 }
             }
-            renderAddons.run();
+            if (addedJar) renderAddons.run();
             e.setDropCompleted(true);
         });
 
@@ -3589,10 +3623,66 @@ public class LauncherApp extends Application {
         searchRow.setAlignment(Pos.CENTER_LEFT);
 
         renderAddons.run();
-        box.getChildren().addAll(heading, dropZone,
+        box.getChildren().addAll(heading, dropZone, addPackBtn, packStatus,
                 sectionLabel("SEARCH ONLINE"), searchRow, searchStatus, resultsBox,
                 listBox);
         return scroll;
+    }
+
+    /**
+     * Installs the SERVER half of a modpack into an owned server -- the Addons tab's "Add Modpack"
+     * button, and the same code path when a pack is dropped on that tab's drop zone.
+     *
+     * Only what this server can actually use is installed (its own mods/ or plugins/ folder, plus
+     * config/), and the pack's own env block is honoured, so a client-only mod can never land on a
+     * server that can't run it. A pack built for another loader or another Minecraft version is
+     * refused with the reason: a server runs exactly one loader and one version, so installing anyway
+     * would be a silent no-op at best and a startup crash at worst.
+     */
+    private void installServerModpack(ServerInstance server, Path pack, Label packStatus, Runnable renderAddons) {
+        String addonFolder = ServerAddonsManager.folderNameFor(server.type);
+        if (addonFolder == null) {
+            packStatus.setText("Switch this server to Fabric, Forge or Purpur first -- a Vanilla server "
+                    + "has no mods/ or plugins/ folder for a pack to install into.");
+            return;
+        }
+        packStatus.setText("Reading " + (pack.getFileName() == null ? pack : pack.getFileName()) + "...");
+        Task<ModpackInstaller.Result> task = new Task<>() {
+            @Override
+            protected ModpackInstaller.Result call() throws Exception {
+                ModpackInfo info = ModpackReader.read(pack);
+                String problem = info.blockingProblem();
+                if (problem != null) throw new IllegalStateException(problem);
+                if (info.loaderDeclared() && !info.launcherLoader().equalsIgnoreCase(server.type.displayName())) {
+                    throw new IllegalStateException("this pack is built for " + info.launcherLoader()
+                            + ", but this server runs " + server.type.displayName()
+                            + " -- change the server type on the Settings tab first, or use a pack built for "
+                            + server.type.displayName() + ".");
+                }
+                if (info.knowsMinecraftVersion() && server.minecraftVersion != null
+                        && !ModrinthClient.matchesMinecraftVersion(info.mcVersion(), server.minecraftVersion)) {
+                    throw new IllegalStateException("this pack is for Minecraft " + info.mcVersion()
+                            + ", but this server runs Minecraft " + server.minecraftVersion + ".");
+                }
+                return new ModpackInstaller().installForServer(info, serverStore.serverDir(server.id),
+                        addonFolder, null);
+            }
+        };
+        task.setOnSucceeded(ev -> Platform.runLater(() -> {
+            ModpackInstaller.Result result = task.getValue();
+            packStatus.setText("Modpack installed into this server's " + addonFolder + "/ folder: "
+                    + result.summary() + (result.errors().isEmpty()
+                    ? "" : " -- " + result.errors().size() + " file(s) failed, see the launcher log"));
+            if (!result.errors().isEmpty()) {
+                log("Server modpack files that failed:\n  " + String.join("\n  ", result.errors()));
+            }
+            renderAddons.run();
+        }));
+        task.setOnFailed(ev -> Platform.runLater(() -> {
+            Throwable ex = task.getException();
+            packStatus.setText("Couldn't install that modpack: " + (ex == null ? "unknown error" : ex.getMessage()));
+        }));
+        new Thread(task, "server-modpack-install").start();
     }
 
     /**
@@ -4378,15 +4468,51 @@ public class LauncherApp extends Application {
         HBox modeToggleRow = new HBox(4, vanillaModeBtn, deyModeBtn);
         modeToggleRow.getStyleClass().add("mode-toggle-group");
         modeToggleRow.setAlignment(Pos.CENTER);
+        modeToggleRow.setMaxWidth(Double.MAX_VALUE);
+        // At a raised text scale (Settings > Launcher) the two labels used to collapse into "...".
+        // Reason: a Button's MINIMUM width is only the width of the ellipsis (see JavaFX's
+        // LabeledSkinBase), so an HBox may shrink "VANILLA"/"DEY" down to nothing but dots.
+        // USE_PREF_SIZE pins the minimum to the row's preferred (full-text) width, so the labels
+        // always fit -- at any text scale and with any font.
+        modeToggleRow.setMinWidth(Region.USE_PREF_SIZE);
+        // ...and let the switch stretch across the whole row instead of sitting in the middle as a
+        // small fixed block: both pills get wider, so each label has room to breathe beside the
+        // modpack icon button.
+        HBox.setHgrow(modeToggleRow, Priority.ALWAYS);
+
+        // The modpack button, sitting directly beside the DEY / VANILLA switch (as asked): it opens
+        // the modpack menu -- add one from disk, drop one in, or jump to an installed pack.
+        modpackBtn = new Button();
+        setButtonIconOnly(modpackBtn, IconFactory.Icon.MODPACK);
+        modpackBtn.getStyleClass().add("icon-button");
+        modpackBtn.setTooltip(new Tooltip("Modpacks -- add one, or drag & drop a .mrpack / .zip"));
+        modpackBtn.setOnAction(e -> showModpackMenu());
+
+        HBox modeRow = new HBox(6, modeToggleRow, modpackBtn);
+        modeRow.setAlignment(Pos.CENTER);
+        // Same guard one level up: the fixed-size modpack icon button must never eat into the
+        // switch's full-label width.
+        modeRow.setMinWidth(Region.USE_PREF_SIZE);
 
         versionTileList = new VBox(10);
         versionTileList.getStyleClass().add("tile-list");
 
-        VBox left = new VBox(18, modeToggleRow, versionTileList);
+        VBox left = new VBox(18, modeRow, versionTileList);
         left.getStyleClass().add("side-panel");
         left.setPadding(new Insets(20));
-        left.setPrefWidth(240);
-        left.setMinWidth(210);
+        // Width floor, invisible (0 tall, just reserves horizontal room): keeps the sidebar at the
+        // familiar 240px at 100% UI/text scale -- 200px tile column + the panel's 20px padding on
+        // each side -- while still letting it grow past that when a label genuinely needs the room.
+        Region sidebarWidthFloor = new Region();
+        sidebarWidthFloor.setPrefWidth(200);
+        sidebarWidthFloor.setPrefHeight(0);
+        left.getChildren().add(sidebarWidthFloor);
+        // The sidebar is exactly as wide as its widest child -- the VANILLA/DEY switch, or a
+        // "VANILLA All Versions"-style tile label -- and can never be squeezed below that. The old
+        // hard 240px (210px minimum) was narrower than those labels at a raised text scale, which
+        // is what truncated them to "..." instead of widening the column.
+        left.setPrefWidth(Region.USE_COMPUTED_SIZE);
+        left.setMinWidth(Region.USE_PREF_SIZE);
 
         // ---- Right column ----
         mainHeadingLabel = new Label("Minecraft");
@@ -4455,6 +4581,12 @@ public class LauncherApp extends Application {
 
         setMode(prefs.lastDeyMode); // reopen in whichever mode you last played (DEY by default)
         restoreLastPlayedVersion();
+
+        // Keep the modpack button showing the active pack's own icon as the selection changes (icon
+        // compatibility: a pack you installed looks like itself right in the launcher).
+        versionBox.valueProperty().addListener((o, a, b) -> refreshModpackButtonIcon(b, modLoaderBox.getValue()));
+        modLoaderBox.valueProperty().addListener((o, a, b) -> refreshModpackButtonIcon(versionBox.getValue(), b));
+        refreshModpackButtonIcon(versionBox.getValue(), modLoaderBox.getValue());
         return main;
     }
 
@@ -4486,6 +4618,7 @@ public class LauncherApp extends Application {
                     "Clean, unmodified loaders -- pick Vanilla, Fabric, or Forge yourself.");
         }
         rebuildVersionTiles();
+        refreshModpackButtonIcon(versionBox.getValue(), modLoaderBox.getValue());
     }
 
     /** Rebuilds the left-column filter tiles for the current mode and selects the first one. */
@@ -4621,6 +4754,552 @@ public class LauncherApp extends Application {
         box.getStyleClass().add("log-section");
         VBox.setVgrow(box, Priority.ALWAYS);
         return box;
+    }
+
+    // ---- Modpacks: the icon button beside DEY/VANILLA, the installer window, and drag & drop ----
+
+    /** The modpack menu (a themed Popup, like the online-player suggestions -- the launcher has no
+     *  MenuButton anywhere, and this keeps one consistent surface). Lists the two ways to add a pack,
+     *  then every pack already installed, so you can jump straight back into one. */
+    private void showModpackMenu() {
+        Popup popup = new Popup();
+        popup.setAutoHide(true);
+        VBox box = new VBox(8);
+        box.setPadding(new Insets(12));
+        box.getStyleClass().addAll("root-pane", darkMode ? "theme-dark" : "theme-light", "suggest-pop");
+        box.getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
+        box.getStylesheets().add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
+        box.setPrefWidth(300);
+
+        Button addBtn = new Button("Add modpack (.mrpack / .zip)");
+        addBtn.getStyleClass().addAll("pill-button", "suggest-item");
+        addBtn.setMaxWidth(Double.MAX_VALUE);
+        addBtn.setAlignment(Pos.CENTER_LEFT);
+        addBtn.setGraphic(icon(IconFactory.Icon.ADD, 16));
+        addBtn.setGraphicTextGap(8);
+        addBtn.setOnAction(e -> {
+            popup.hide();
+            chooseModpackFileAndInstall();
+        });
+
+        Button dropBtn = new Button("Drag & drop a modpack");
+        dropBtn.getStyleClass().addAll("pill-button", "suggest-item");
+        dropBtn.setMaxWidth(Double.MAX_VALUE);
+        dropBtn.setAlignment(Pos.CENTER_LEFT);
+        dropBtn.setGraphic(icon(IconFactory.Icon.DOWNLOAD, 16));
+        dropBtn.setGraphicTextGap(8);
+        dropBtn.setOnAction(e -> {
+            popup.hide();
+            openModpackInstaller(null);
+        });
+
+        box.getChildren().addAll(addBtn, dropBtn, sectionLabel("INSTALLED MODPACKS"));
+
+        List<ModpackMeta> installed = ModpackMeta.listInstalled(gameFiles.root);
+        if (installed.isEmpty()) {
+            box.getChildren().add(suggestHint("No modpacks installed yet."));
+        } else {
+            for (ModpackMeta meta : installed) box.getChildren().add(modpackMenuRow(meta, popup));
+        }
+
+        popup.getContent().add(box);
+        var bounds = modpackBtn.localToScreen(modpackBtn.getBoundsInLocal());
+        if (bounds != null) popup.show(modpackBtn, bounds.getMinX(), bounds.getMaxY() + 6);
+    }
+
+    /** One installed pack in the modpack menu, with the pack's own icon. Clicking it selects that
+     *  pack's Minecraft version + loader in the launcher, which is what makes it "the pack you play". */
+    private Button modpackMenuRow(ModpackMeta meta, Popup popup) {
+        StringBuilder detail = new StringBuilder();
+        if (meta.mcVersion != null && !meta.mcVersion.isBlank()) detail.append("Minecraft ").append(meta.mcVersion);
+        if (meta.loader != null && !meta.loader.isBlank() && !meta.loader.equals("Vanilla")) {
+            if (detail.length() > 0) detail.append("  ·  ");
+            detail.append(meta.loader);
+        }
+        Button row = new Button(meta.name + (detail.length() == 0 ? "" : "  ·  " + detail));
+        row.getStyleClass().addAll("pill-button", "suggest-item");
+        row.setMaxWidth(Double.MAX_VALUE);
+        row.setAlignment(Pos.CENTER_LEFT);
+        row.setGraphic(modIconNode(meta.iconPath == null ? null : Path.of(meta.iconPath), 36));
+        row.setGraphicTextGap(10);
+        row.setTooltip(new Tooltip("Play this modpack"));
+        row.setOnAction(e -> {
+            popup.hide();
+            if (deyMode) setMode(false); // a pack is a VANILLA-mode setup; DEY would inject its own mods
+            if (!selectVersionAndLoader(meta.mcVersion, meta.loader)) {
+                log("Couldn't switch to \"" + meta.name + "\" -- Minecraft " + meta.mcVersion
+                        + " isn't in the launcher's version list yet.");
+            }
+        });
+        return row;
+    }
+
+    /** File picker for a pack file (folder picks go through drag & drop), then the installer window. */
+    private void chooseModpackFileAndInstall() {
+        FileChooser chooser = new FileChooser();
+        chooser.setTitle("Select a modpack");
+        chooser.getExtensionFilters().addAll(
+                new FileChooser.ExtensionFilter("Modpacks (.mrpack / .zip)", "*.mrpack", "*.zip"),
+                new FileChooser.ExtensionFilter("All files", "*.*"));
+        java.io.File picked = chooser.showOpenDialog(stage);
+        if (picked != null) openModpackInstaller(picked.toPath());
+    }
+
+    /**
+     * The "Install Modpack" window: drop a pack (or browse / paste a Modrinth link), see exactly what
+     * it is -- icon, name, Minecraft version, loader, file counts -- then install it into the matching
+     * instance folder. Built like every other DeyLauncher window (borderless, themed, draggable,
+     * resizable) so it feels native to the app rather than like an OS dialog.
+     */
+    private void openModpackInstaller(Path preselected) {
+        Label dropZone = new Label("Drop a modpack anywhere in this window -- .mrpack, .zip, or an extracted instance folder");
+        dropZone.setGraphic(icon(IconFactory.Icon.MODPACK, 22));
+        dropZone.setGraphicTextGap(10);
+        dropZone.getStyleClass().add("drop-zone");
+        dropZone.setMaxWidth(Double.MAX_VALUE);
+        dropZone.setAlignment(Pos.CENTER);
+        dropZone.setPrefHeight(92);
+        dropZone.setWrapText(true);
+
+        TextField urlField = new TextField();
+        urlField.setPromptText("...or paste a Modrinth modpack link / slug");
+        urlField.getStyleClass().add("input-field");
+        HBox.setHgrow(urlField, Priority.ALWAYS);
+        Button fetchBtn = new Button();
+        setButtonIcon(fetchBtn, IconFactory.Icon.DOWNLOAD, "Get");
+        fetchBtn.getStyleClass().add("pill-button");
+        Button browseBtn = new Button();
+        setButtonIcon(browseBtn, IconFactory.Icon.FOLDER, "Browse...");
+        browseBtn.getStyleClass().add("pill-button");
+        HBox pickRow = new HBox(10, urlField, fetchBtn, browseBtn);
+        pickRow.setAlignment(Pos.CENTER_LEFT);
+
+        Label status = new Label("Pick a pack above, drop one anywhere in this window, or paste a Modrinth link.");
+        status.getStyleClass().add("notice-label");
+        status.setWrapText(true);
+
+        VBox preview = new VBox(12);
+        preview.getStyleClass().add("mod-row");
+        preview.setVisible(false);
+        preview.setManaged(false);
+
+        ProgressBar bar = new ProgressBar(0);
+        bar.setMaxWidth(Double.MAX_VALUE);
+        bar.getStyleClass().add("play-progress");
+        bar.setVisible(false);
+        bar.setManaged(false);
+
+        Button installBtn = new Button();
+        setButtonIcon(installBtn, IconFactory.Icon.DOWNLOAD, "INSTALL");
+        installBtn.getStyleClass().add("settings-apply-button");
+        installBtn.setMaxWidth(Double.MAX_VALUE);
+        installBtn.setDisable(true);
+
+        ModpackInfo[] ready = new ModpackInfo[1];
+        Stage[] winHolder = new Stage[1];
+
+        VBox content = new VBox(14, dropZone, pickRow, status, preview, bar, installBtn);
+        content.setPadding(new Insets(20));
+        content.getStyleClass().add("mods-dialog-content");
+
+        Runnable clear = () -> {
+            ready[0] = null;
+            installBtn.setDisable(true);
+            installBtn.getStyleClass().remove("settings-apply-button-ready");
+            preview.getChildren().clear();
+            preview.setVisible(false);
+            preview.setManaged(false);
+            bar.setVisible(false);
+            bar.setManaged(false);
+        };
+
+        // Reading a pack never touches the UI thread, and never blocks the window: parse + icon
+        // resolution happen in the background, then the preview is filled in on the FX thread.
+        java.util.function.Consumer<Path> load = path -> {
+            clear.run();
+            status.setText("Reading " + (path.getFileName() == null ? path : path.getFileName()) + "...");
+            Task<ModpackInfo> task = new Task<>() {
+                @Override
+                protected ModpackInfo call() throws Exception {
+                    ModpackInfo info = ModpackReader.read(path);
+                    Path icon = PackIcons.resolve(info, gameFiles.root); // cosmetic -- null is fine
+                    return icon == null ? info : info.withIcon(icon);
+                }
+            };
+            task.setOnSucceeded(ev -> Platform.runLater(
+                    () -> showModpackPreview(ready, preview, status, installBtn, task.getValue())));
+            task.setOnFailed(ev -> Platform.runLater(() -> {
+                Throwable ex = task.getException();
+                status.setText("Couldn't read that pack: " + (ex == null ? "unknown error" : ex.getMessage()));
+            }));
+            new Thread(task, "modpack-read").start();
+        };
+
+        browseBtn.setOnAction(e -> {
+            FileChooser chooser = new FileChooser();
+            chooser.setTitle("Select a modpack");
+            chooser.getExtensionFilters().addAll(
+                    new FileChooser.ExtensionFilter("Modpacks (.mrpack / .zip)", "*.mrpack", "*.zip"),
+                    new FileChooser.ExtensionFilter("All files", "*.*"));
+            java.io.File picked = chooser.showOpenDialog(winHolder[0] != null ? winHolder[0] : stage);
+            if (picked != null) load.accept(picked.toPath());
+        });
+
+        fetchBtn.setOnAction(e -> {
+            String text = urlField.getText() == null ? "" : urlField.getText().trim();
+            if (text.isBlank()) {
+                status.setText("Paste a Modrinth modpack link or slug first, then press Get.");
+                return;
+            }
+            status.setText("Fetching " + text + " from Modrinth...");
+            Task<Path> fetch = new Task<>() {
+                @Override
+                protected Path call() throws Exception {
+                    return downloadModrinthPack(text);
+                }
+            };
+            fetch.setOnSucceeded(ev -> load.accept(fetch.getValue()));
+            fetch.setOnFailed(ev -> Platform.runLater(() -> {
+                Throwable ex = fetch.getException();
+                status.setText("Couldn't fetch that pack: " + (ex == null ? "unknown error" : ex.getMessage()));
+            }));
+            new Thread(fetch, "modpack-fetch").start();
+        });
+        urlField.setOnAction(ev -> fetchBtn.fire());
+
+        installBtn.setOnAction(e -> {
+            ModpackInfo info = ready[0];
+            if (info == null) return;
+            String mc = resolveModpackVersion(info);
+            String loader = resolveModpackLoader(info);
+            if (mc == null || mc.isBlank()) {
+                status.setText("Pick a Minecraft version in the launcher first, then install this pack.");
+                return;
+            }
+            Path instanceDir = ModpackMeta.instanceDirFor(gameFiles.root, mc, loader);
+            installBtn.setDisable(true);
+            installBtn.getStyleClass().remove("settings-apply-button-ready");
+            bar.setVisible(true);
+            bar.setManaged(true);
+            bar.setProgress(0);
+            status.setText("Installing " + info.name() + " into Minecraft " + mc + " (" + loader
+                    + ") -- " + info.downloads().size() + " file(s) to download, "
+                    + info.bundled().size() + " bundled in the pack...");
+            Task<ModpackInstaller.Result> task = new Task<>() {
+                @Override
+                protected ModpackInstaller.Result call() throws Exception {
+                    // onProgress fires once per file (not per byte), so a runLater per step is cheap.
+                    return new ModpackInstaller().installForClient(info, instanceDir,
+                            f -> Platform.runLater(() -> bar.setProgress(f)));
+                }
+            };
+            task.setOnSucceeded(ev -> Platform.runLater(() -> finishModpackInstall(
+                    task.getValue(), info, mc, loader, instanceDir, status, bar, installBtn)));
+            task.setOnFailed(ev -> Platform.runLater(() -> {
+                Throwable ex = task.getException();
+                bar.setVisible(false);
+                bar.setManaged(false);
+                installBtn.setDisable(false);
+                status.setText("Install failed: " + (ex == null ? "unknown error" : ex.getMessage()));
+                log("Modpack install failed: " + (ex == null ? "unknown error" : ex.getMessage()));
+            }));
+            new Thread(task, "modpack-install").start();
+        });
+
+        // Dropping a pack anywhere in this window loads it (the same "drop anywhere" feel as the Mods
+        // window), and the whole content area highlights while a drag is over it.
+        content.setOnDragOver(e -> {
+            if (e.getDragboard().hasFiles()) e.acceptTransferModes(TransferMode.COPY);
+            e.consume();
+        });
+        content.setOnDragEntered(e -> content.getStyleClass().add("drop-zone-active"));
+        content.setOnDragExited(e -> content.getStyleClass().remove("drop-zone-active"));
+        content.setOnDragDropped(e -> {
+            var files = e.getDragboard().getFiles();
+            boolean handled = false;
+            if (files != null) {
+                for (var f : files) {
+                    Path p = f.toPath();
+                    if (ModpackFormat.installable(p)) {
+                        load.accept(p);
+                        handled = true;
+                        break;
+                    }
+                }
+            }
+            content.getStyleClass().remove("drop-zone-active");
+            if (!handled) {
+                status.setText("That drop isn't a modpack -- expected a .mrpack, a pack .zip, or an instance folder.");
+            }
+            e.setDropCompleted(handled);
+            e.consume();
+        });
+
+        Stage win = buildBorderlessStage("Install Modpack", content, stage, Modality.NONE,
+                560, 500, 800, 700);
+        winHolder[0] = win;
+        win.centerOnScreen();
+        win.show();
+        win.toFront();
+        if (preselected != null) load.accept(preselected);
+    }
+
+    /** Fills the installer's preview card from a parsed pack, and enables INSTALL only when the pack
+     *  can actually be launched here (supported loader + a Minecraft version the launcher knows). */
+    private void showModpackPreview(ModpackInfo[] ready, VBox preview, Label status, Button installBtn, ModpackInfo info) {
+        ready[0] = info;
+        preview.getChildren().clear();
+
+        Node tile = modIconNode(info.iconPath(), 64);
+
+        VBox text = new VBox(4);
+        Label name = new Label(info.name()
+                + (info.version() == null || info.version().isBlank() ? "" : "  " + info.version()));
+        name.getStyleClass().add("mod-name");
+        name.setWrapText(true);
+        Label meta = new Label(info.format().displayName()
+                + (info.knowsMinecraftVersion() ? "  ·  Minecraft " + info.mcVersion() : "  ·  no Minecraft version declared")
+                + "  ·  " + (info.loaderName() == null ? "Vanilla" : info.loaderName())
+                + (info.loaderVersion() == null || info.loaderVersion().isBlank() ? "" : " " + info.loaderVersion()));
+        meta.getStyleClass().add("mod-filename");
+        meta.setWrapText(true);
+        Label counts = new Label(info.downloads().size() + " file(s) to download  ·  "
+                + info.bundled().size() + " bundled in the pack"
+                + (info.unresolvedCount() > 0 ? "  ·  " + info.unresolvedCount() + " can't be fetched automatically" : ""));
+        counts.getStyleClass().add("mod-filename");
+        counts.setWrapText(true);
+        text.getChildren().addAll(name, meta, counts);
+        if (info.note() != null && !info.note().isBlank()) {
+            Label note = new Label(info.note());
+            note.getStyleClass().add("settings-hint-label");
+            note.setWrapText(true);
+            text.getChildren().add(note);
+        }
+        HBox.setHgrow(text, Priority.ALWAYS);
+        HBox row = new HBox(14, tile, text);
+        row.setAlignment(Pos.CENTER_LEFT);
+        preview.getChildren().add(row);
+        preview.setVisible(true);
+        preview.setManaged(true);
+
+        // Why this pack can't be installed, if it can't. A pack naming a Minecraft version the
+        // launcher's manifest doesn't have yet is blocked too: it couldn't be launched afterwards.
+        String problem = info.blockingProblem();
+        if (problem == null && info.knowsMinecraftVersion() && allVersions.size() > 1
+                && findVersionEntry(info.mcVersion()) == null) {
+            problem = "Minecraft " + info.mcVersion() + " isn't in the launcher's version list, so this "
+                    + "pack couldn't be launched after installing it.";
+        }
+
+        String mc = resolveModpackVersion(info);
+        String loader = resolveModpackLoader(info);
+        if (problem == null) {
+            installBtn.setDisable(false);
+            if (!installBtn.getStyleClass().contains("settings-apply-button-ready")) {
+                installBtn.getStyleClass().add("settings-apply-button-ready");
+            }
+            status.setText(info.knowsMinecraftVersion()
+                    ? "Ready to install into Minecraft " + mc + " (" + loader + ")."
+                    : "This pack doesn't name a Minecraft version, so it installs into the version and "
+                      + "loader currently selected in the launcher: " + mc + " (" + loader + ").");
+        } else {
+            installBtn.setDisable(true);
+            installBtn.getStyleClass().remove("settings-apply-button-ready");
+            status.setText(problem);
+        }
+    }
+
+    /**
+     * Reports a finished install, then points the launcher straight at the pack (VANILLA mode +
+     * the pack's version/loader) so pressing PLAY starts it -- and logs every file that failed, so a
+     * partial install is never silently passed off as a complete one.
+     */
+    private void finishModpackInstall(ModpackInstaller.Result result, ModpackInfo info, String mc,
+                                      String loader, Path instanceDir, Label status, ProgressBar bar,
+                                      Button installBtn) {
+        bar.setProgress(1);
+        installBtn.setDisable(false);
+        status.setText(info.name() + " installed: " + result.summary()
+                + (result.errors().isEmpty() ? "" : " (" + result.errors().size() + " file(s) failed -- see the log)"));
+
+        // A modpack is a plain (VANILLA-mode) version + loader setup. DEY mode would add its own
+        // curated Sodium/Iris/Fabric API on top, which is not what the pack author intended.
+        if (deyMode) setMode(false);
+        boolean selected = selectVersionAndLoader(mc, loader);
+        refreshModpackButtonIcon(mc, loader);
+        log("Modpack \"" + info.name() + "\" installed into " + instanceDir + " -- " + result.summary());
+        if (!selected) {
+            log("Minecraft " + mc + " isn't selectable in the Version dropdown yet -- pick it there once it appears.");
+        }
+        if (!result.errors().isEmpty()) {
+            StringBuilder failed = new StringBuilder();
+            int shown = 0;
+            for (String err : result.errors()) {
+                if (shown++ >= 8) {
+                    failed.append("  ...and ").append(result.errors().size() - 8).append(" more\n");
+                    break;
+                }
+                failed.append("  ").append(err).append('\n');
+            }
+            log("Modpack files that couldn't be installed:\n" + failed);
+        }
+
+        StringBuilder alert = new StringBuilder();
+        alert.append(info.name()).append(" is installed into Minecraft ").append(mc);
+        if (loader != null && !loader.isBlank()) alert.append(" (").append(loader).append(")");
+        alert.append(".\n\n").append(result.summary()).append('\n');
+        if (info.note() != null && !info.note().isBlank()) alert.append('\n').append(info.note());
+        if (!result.errors().isEmpty()) {
+            alert.append("\n\nFile(s) that failed:\n")
+                    .append(String.join("\n", result.errors().subList(0, Math.min(8, result.errors().size()))));
+        }
+        alert.append("\n\nPress PLAY to start the pack.");
+        new Alert(Alert.AlertType.INFORMATION, alert.toString(), ButtonType.OK).showAndWait();
+    }
+
+    /** The Minecraft version a pack installs into: its own when it declares one, otherwise whatever is
+     *  selected in the launcher (the useful behaviour for a pack with no metadata of its own). */
+    private String resolveModpackVersion(ModpackInfo info) {
+        if (info.knowsMinecraftVersion()) return info.mcVersion();
+        return versionBox.getValue();
+    }
+
+    /** The loader a pack installs into: its own when it declares one, otherwise the launcher's own
+     *  current LOADER selection. */
+    private String resolveModpackLoader(ModpackInfo info) {
+        if (info.loaderDeclared()) return info.launcherLoader();
+        String selected = modLoaderBox.getValue();
+        return selected == null || selected.isBlank() ? "Vanilla" : selected;
+    }
+
+    private VersionManifest.VersionEntry findVersionEntry(String id) {
+        if (id == null) return null;
+        for (VersionManifest.VersionEntry v : allVersions) {
+            if (v.id().equals(id)) return v;
+        }
+        return null;
+    }
+
+    /**
+     * Selects a Minecraft version + loader in the launcher's controls -- used after installing a pack
+     * and when clicking one in the modpack menu. Picks the version tile whose filter actually covers
+     * that version (falling back to the "All Versions" tile), then returns whether the version really
+     * ended up selected (it won't be there at all if the manifest hasn't loaded / doesn't have it).
+     */
+    private boolean selectVersionAndLoader(String mcVersion, String loader) {
+        if (mcVersion == null || mcVersion.isBlank()) return false;
+        VersionPreset[] presets = deyMode ? DEY_PRESETS : VANILLA_PRESETS;
+        int chosen = -1, allVersionsTile = -1;
+        for (int i = 0; i < presets.length && i < versionTileList.getChildren().size(); i++) {
+            if (presets[i].kind() == FilterKind.ALL) allVersionsTile = i;
+            if (presetCouldMatch(presets[i], mcVersion)) {
+                chosen = i;
+                break;
+            }
+        }
+        if (chosen < 0) chosen = allVersionsTile;
+        if (chosen < 0 || !(versionTileList.getChildren().get(chosen) instanceof Button tile)) return false;
+        selectVersionTile(presets[chosen], tile, mcVersion);
+        if (loader != null && !loader.isBlank() && modLoaderBox.getItems().contains(loader)) {
+            modLoaderBox.setValue(loader);
+        }
+        return mcVersion.equals(versionBox.getValue());
+    }
+
+    /**
+     * Shows the ACTIVE pack's own icon on the modpack button (falling back to the generic box glyph),
+     * so the launcher visibly reflects the pack you're about to play -- icon compatibility in the one
+     * place you always see, right next to the DEY / VANILLA switch.
+     */
+    private void refreshModpackButtonIcon(String mcVersion, String loader) {
+        if (modpackBtn == null) return;
+        Path icon = null;
+        if (mcVersion != null && !mcVersion.isBlank()) {
+            ModpackMeta meta = ModpackMeta.read(ModpackMeta.instanceDirFor(gameFiles.root, mcVersion, loader));
+            if (meta != null && meta.iconPath != null && !meta.iconPath.isBlank()) {
+                Path candidate = Path.of(meta.iconPath);
+                if (Files.exists(candidate)) icon = candidate;
+            }
+        }
+        if (icon != null) {
+            try {
+                ImageView iv = new ImageView(new Image(icon.toUri().toString()));
+                iv.setFitWidth(24);
+                iv.setFitHeight(24);
+                iv.setPreserveRatio(true);
+                iv.setSmooth(true);
+                modpackBtn.setGraphic(iv);
+                modpackBtn.setText("");
+                modpackBtn.setGraphicTextGap(0);
+                return;
+            } catch (Exception ignored) {
+                // Unreadable icon -- fall through to the generic glyph.
+            }
+        }
+        setButtonIconOnly(modpackBtn, IconFactory.Icon.MODPACK);
+    }
+
+    /** Downloads a Modrinth modpack's .mrpack from a pasted link/slug, returning where it landed. */
+    private Path downloadModrinthPack(String urlOrSlug) throws Exception {
+        String slug = urlOrSlug.trim();
+        int marker = slug.indexOf("modrinth.com/modpack/");
+        if (marker >= 0) {
+            slug = slug.substring(marker + "modrinth.com/modpack/".length());
+        } else if (slug.contains("/")) {
+            slug = slug.substring(slug.lastIndexOf('/') + 1);
+        }
+        slug = slug.split("[?#]")[0].trim();
+        if (slug.isBlank()) throw new IOException("Paste a Modrinth modpack link or slug first.");
+
+        ModrinthClient client = new ModrinthClient();
+        var versions = client.versions(slug); // newest first, as Modrinth returns them
+        if (versions.isEmpty()) throw new IOException("Modrinth has no versions for \"" + slug + "\".");
+        Path dir = gameFiles.root.resolve("modpacks").resolve("downloads");
+        for (var version : versions) {
+            for (var file : version.files()) {
+                if (file.filename() != null && file.filename().toLowerCase().endsWith(".mrpack")) {
+                    return client.download(file.url(), file.filename(), dir);
+                }
+            }
+        }
+        throw new IOException("That Modrinth project has no .mrpack file to download.");
+    }
+
+    /**
+     * Lets a modpack be dropped anywhere in the launcher window: a .mrpack / pack .zip / extracted
+     * instance folder opens the installer already pointed at it. Anything else is reported in the log
+     * rather than silently ignored.
+     */
+    private void installModpackDropTarget(Node node) {
+        node.setOnDragOver(e -> {
+            if (e.getDragboard().hasFiles()) e.acceptTransferModes(TransferMode.COPY);
+            e.consume();
+        });
+        node.setOnDragDropped(e -> {
+            var files = e.getDragboard().getFiles();
+            boolean handled = false;
+            if (files != null) {
+                for (var f : files) {
+                    Path p = f.toPath();
+                    if (ModpackFormat.installable(p)) {
+                        openModpackInstaller(p);
+                        handled = true;
+                        break;
+                    }
+                }
+                if (!handled) {
+                    log("That drop isn't a modpack -- expected a .mrpack, a pack .zip, or an instance folder.");
+                }
+            }
+            e.setDropCompleted(handled);
+            e.consume();
+        });
+    }
+
+    /** The window a shell key's controls should parent their dialogs to, falling back to the launcher. */
+    private Stage shellWindowOwner(String key) {
+        Stage w = shellWindows.get(key);
+        return (w != null && w.isShowing()) ? w : stage;
     }
 
     // ---- Mods dialog: drag-and-drop add, enable/disable toggle, delete ----
@@ -7751,14 +8430,34 @@ public class LauncherApp extends Application {
                 if (modLoader.equals("Fabric")) {
                     updateMessage("Installing Fabric...");
                     FabricInstaller fabric = new FabricInstaller(manifest, files.root);
-                    String loaderVersion = fabric.latestLoaderVersion(entry.id());
-                    if (loaderVersion == null) throw new IllegalStateException(
-                            "Fabric has no build for " + entry.id() + " yet.");
-                    versionJson = fabric.install(entry.id(), loaderVersion);
+                    // A modpack pins the exact loader build it was made for (see ModpackMeta), and
+                    // using it is what makes a pack run exactly as its author intended. If that build
+                    // can't be installed any more, fall back to the newest stable one instead of
+                    // failing the launch.
+                    String pinnedFabric = ModpackMeta.pinnedLoaderVersion(files.root, entry.id(), "Fabric");
+                    versionJson = null;
+                    if (pinnedFabric != null) {
+                        try {
+                            updateMessage("Installing the modpack's Fabric " + pinnedFabric + "...");
+                            versionJson = fabric.install(entry.id(), pinnedFabric);
+                        } catch (Exception pinnedFailed) {
+                            updateMessage("The modpack's pinned Fabric build isn't available -- using the newest stable one...");
+                        }
+                    }
+                    if (versionJson == null) {
+                        String loaderVersion = fabric.latestLoaderVersion(entry.id());
+                        if (loaderVersion == null) throw new IllegalStateException(
+                                "Fabric has no build for " + entry.id() + " yet.");
+                        versionJson = fabric.install(entry.id(), loaderVersion);
+                    }
                 } else if (modLoader.equals("Forge")) {
                     updateMessage("Installing Forge (this runs Forge's own installer, may take a minute)...");
                     ForgeInstaller forge = new ForgeInstaller(manifest, files.root);
-                    String forgeVersion = forge.recommendedOrLatestVersion(entry.id());
+                    // Same idea as Fabric above: a pack's own Forge build wins, otherwise the
+                    // recommended/latest one. (Forge's installer is far too slow to retry blindly, so
+                    // a pinned-but-broken build surfaces its own error rather than being retried here.)
+                    String forgeVersion = ModpackMeta.pinnedLoaderVersion(files.root, entry.id(), "Forge");
+                    if (forgeVersion == null) forgeVersion = forge.recommendedOrLatestVersion(entry.id());
                     if (forgeVersion == null) throw new IllegalStateException(
                             "Forge has no build for " + entry.id() + " yet.");
                     versionJson = forge.install(entry.id(), forgeVersion, javaBinary.toString());

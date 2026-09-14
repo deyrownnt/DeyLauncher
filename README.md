@@ -181,6 +181,78 @@ Minecraft 1.21.1 + Forge
 
 do not share their installed mods.
 
+## Modpacks
+
+The modpack button sits directly beside the `DEY / VANILLA` switch on the Home page. It opens a menu:
+
+- **Add modpack** — pick a `.mrpack` / `.zip`, or paste a Modrinth modpack link (it fetches the pack for you)
+- **Drag & drop a modpack** — opens the installer window with a drop zone
+- **Installed modpacks** — every pack you've installed, with its own icon; clicking one selects the
+  Minecraft version and loader it needs
+
+A modpack can also simply be dropped anywhere in the launcher window, which opens the installer with
+that pack already loaded.
+
+### Supported pack formats
+
+| Inside the pack | Comes from |
+| --- | --- |
+| `modrinth.index.json` | Modrinth `.mrpack` (downloaded, hash-verified) — the fully supported format |
+| `manifest.json` | CurseForge export (installs its `overrides/`, see the note below) |
+| `mmc-pack.json` | MultiMC / Prism Launcher exported instance |
+| `instance.json` | ATLauncher pack |
+| *(a plain folder)* | an already-extracted instance directory (its `mods/`, `config/`, … are copied) |
+
+### Where a pack is installed
+
+Client packs go into the same instance folder Play already uses, so a pack is launchable immediately:
+
+```text
+~/.deylauncher/instances/<minecraft-version>-<loader>/
+```
+
+An `mrpack`'s files are downloaded and checked against the hashes the pack itself ships, then its
+`overrides/` are unpacked. The installer also writes:
+
+```text
+modpack.json   which pack this instance is (name, version, loader, loader version, icon)
+icon.png       the pack's own icon
+```
+
+`modpack.json` is what makes the pack fully compatible rather than "close enough": the launcher reuses
+the **exact loader build the pack pinned** (e.g. `fabric-loader 0.15.11`) instead of grabbing the newest
+one. Installing a pack also switches to the VANILLA mode, because DEY mode would add its own curated
+mods on top of the pack.
+
+### Icons
+
+A pack's icon is read from the pack itself (`icon.png` / `pack.png` / `logo.png`, including a MultiMC
+`minecraft/icon.png`), or — for an `.mrpack`, which carries no image — looked up on Modrinth by name.
+It is normalised to a 256px PNG and cached:
+
+```text
+~/.deylauncher/modpacks/icons/
+```
+
+and the active pack's icon is shown on the modpack button, so the launcher visibly reflects the pack
+you're about to play.
+
+### Modpacks on a server
+
+Server Management → **Addons** → **Add Modpack** (or drop a pack on that tab's drop zone) installs the
+server half of a pack. Only files a server can actually use are taken — its own `mods/` (Fabric/Forge)
+or `plugins/` (Purpur) folder, plus `config/` — and a client-only entry is never copied. A pack built
+for a different loader or Minecraft version is refused with the reason, since a server runs exactly one
+of each.
+
+### Known limits
+
+- CurseForge manifests list their files as project/file ids only, and resolving those needs a CurseForge
+  API key the launcher doesn't ship. Such a pack's `overrides/` install normally; the rest is reported
+  in the install preview instead of being silently skipped.
+- NeoForge and Quilt packs are refused with a clear message — DeyLauncher only installs Vanilla, Fabric
+  and Forge.
+
 ## Accounts and profiles
 
 DeyLauncher stores persistent account information separately from the short-lived authentication session used to launch the game.
