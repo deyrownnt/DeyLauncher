@@ -12,6 +12,12 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * Minimal Minecraft "Server List Ping" (SLP) client -- the same handshake the game itself uses to
@@ -43,6 +49,40 @@ public final class ServerStatusPing {
     }
 
     private ServerStatusPing() {}
+
+    /** Daemon threads only, so an abandoned/hung probe (see {@link #ping(String, int)}) can never
+     *  keep the JVM alive or block application shutdown. */
+    private static final ExecutorService PROBE_POOL = Executors.newCachedThreadPool(new ThreadFactory() {
+        @Override public Thread newThread(Runnable r) {
+            Thread t = new Thread(r, "server-ping-probe");
+            t.setDaemon(true);
+            return t;
+        }
+    });
+
+    /**
+     * Runs {@code task} with a hard wall-clock cap, returning {@link Status#offline()} instead of
+     * blocking forever if it's exceeded. This exists because the individual timeouts inside a probe
+     * (socket connect/read, the SRV lookup) only bound their own step -- hostname resolution done by
+     * {@code new InetSocketAddress(host, port)} has NO timeout of its own and can hang indefinitely
+     * on a slow/broken resolver, which used to leave the status badge stuck on "Checking..." forever
+     * even though every socket-level timeout was respected. Wrapping the whole probe closes that gap.
+     * The worker thread is abandoned (not join()'d) on timeout since a blocked DNS call generally
+     * can't be interrupted -- it's a daemon thread and pool-owned, so it can't leak past JVM exit.
+     */
+    private static Status withHardTimeout(int timeoutMs, java.util.function.Supplier<Status> task) {
+        Future<Status> future = PROBE_POOL.submit(task::get);
+        try {
+            // Generous multiplier: covers a full SRV lookup (~4s worst case) plus connect + read,
+            // on top of the caller's own per-step timeout.
+            return future.get(timeoutMs * 3L + 4000L, TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            return Status.offline();
+        } catch (Exception e) {
+            return Status.offline();
+        }
+    }
 
     /**
      * Parses a user-entered server address into host + port. Tolerates the shapes users actually
@@ -151,10 +191,12 @@ public final class ServerStatusPing {
 
     /** Probes {@code rawAddress} with {@code timeoutMs} for both connect and read. Never throws. */
     public static Status ping(String rawAddress, int timeoutMs) {
-        Address a = parseAddress(rawAddress);
-        if (a.host().isEmpty()) return Status.offline();
-        a = resolveSrv(a, hasExplicitPort(rawAddress)); // honor _minecraft._tcp SRV when relevant
-        return ping(a.host(), a.port(), timeoutMs);
+        return withHardTimeout(timeoutMs, () -> {
+            Address a = parseAddress(rawAddress);
+            if (a.host().isEmpty()) return Status.offline();
+            a = resolveSrv(a, hasExplicitPort(rawAddress)); // honor _minecraft._tcp SRV when relevant
+            return pingInternal(a.host(), a.port(), timeoutMs);
+        });
     }
 
     /** Same as {@link #ping(String, int)} but retries on a miss before giving up. A single probe can
@@ -172,8 +214,16 @@ public final class ServerStatusPing {
         return last;
     }
 
-    /** Probes {@code host:port}. Never throws -- any failure yields {@link Status#offline()}. */
+    /** Probes {@code host:port}, guarded by the same hard wall-clock cap as {@link #ping(String, int)}
+     *  (hostname resolution here has no timeout of its own either). Never throws. */
     public static Status ping(String host, int port, int timeoutMs) {
+        return withHardTimeout(timeoutMs, () -> pingInternal(host, port, timeoutMs));
+    }
+
+    /** Unguarded probe -- only called from within {@link #withHardTimeout}. Never throws on its own,
+     *  but hostname resolution inside the Socket connect can still block without bound, which is
+     *  exactly what the wrapping timeout exists to catch. */
+    private static Status pingInternal(String host, int port, int timeoutMs) {
         try (Socket socket = new Socket()) {
             socket.connect(new InetSocketAddress(host, port), timeoutMs);
             socket.setSoTimeout(timeoutMs);

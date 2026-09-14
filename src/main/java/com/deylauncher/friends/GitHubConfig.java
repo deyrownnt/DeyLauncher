@@ -38,9 +38,11 @@ public class GitHubConfig {
     public final String capesOwnedPath;
     /** Folder in the repo holding the cape PNG textures (default "capes"). */
     public final String capesDir;
+    /** Shared "who owns which saved options kits" table (default "options-kits.json"). */
+    public final String optionsKitsPath;
 
     private GitHubConfig(String token, String owner, String repo, String friendsPath,
-                         String capesPath, String capesOwnedPath, String capesDir) {
+                         String capesPath, String capesOwnedPath, String capesDir, String optionsKitsPath) {
         this.token = token;
         this.owner = owner;
         this.repo = repo;
@@ -48,6 +50,7 @@ public class GitHubConfig {
         this.capesPath = capesPath;
         this.capesOwnedPath = capesOwnedPath;
         this.capesDir = capesDir;
+        this.optionsKitsPath = optionsKitsPath;
     }
 
     public boolean isConfigured() {
@@ -66,7 +69,8 @@ public class GitHubConfig {
         GitHubConfig embedded = loadFromClasspath("/embedded-github.properties");
         if (embedded != null && embedded.isConfigured()) return embedded;
 
-        return new GitHubConfig(null, null, null, "friends.json", "capes.json", "capes-owned.json", "capes");
+        return new GitHubConfig(null, null, null, "friends.json", "capes.json", "capes-owned.json",
+                "capes", "options-kits.json");
     }
 
     private static GitHubConfig loadFrom(Path file) {
@@ -101,7 +105,8 @@ public class GitHubConfig {
                 props.getProperty("friendsPath", "friends.json"),
                 props.getProperty("capesPath", "capes.json"),
                 props.getProperty("capesOwnedPath", "capes-owned.json"),
-                props.getProperty("capesDir", "capes")
+                props.getProperty("capesDir", "capes"),
+                props.getProperty("optionsKitsPath", "options-kits.json")
         );
     }
 }

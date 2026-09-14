@@ -12,7 +12,7 @@ group = "com.deylauncher"
 // Single source of truth for the app version. It is baked into the jar/resource that
 // AppUpdater.currentVersion() reads at runtime, so the self-updater always knows exactly
 // which version is installed -- and CI's jpackage step discovers this same fat jar by name.
-version = "0.1.3"
+version = "0.1.4"
 
 repositories {
     mavenCentral()
@@ -22,6 +22,22 @@ java {
     toolchain {
         languageVersion.set(JavaLanguageVersion.of(17))
     }
+}
+
+// Without this, javac reads .java files using the *platform default* charset instead of the
+// charset they're actually saved in (UTF-8). On Linux CI runners the platform default already
+// happens to be UTF-8, so it's easy to miss -- but on Windows (JDK 17 predates JEP 400's
+// UTF-8-by-default, which only landed in JDK 18) the default is the machine's ANSI codepage
+// (e.g. Windows-1252), so any non-ASCII literal baked into source (the "·" separator dot in
+// server/profile labels, the "▸" arrow, etc.) gets silently mis-decoded at compile time and
+// bakes a mangled character into the compiled class -- which then shows up wrong at runtime on
+// every device running that particular build, since the corruption happened once, at compile
+// time, not per-machine at render time. This is exactly the class of bug the Circle-based
+// status dots (see LauncherApp#statusLabel/#badgeLabel) were fixed to avoid for glyphs -- this
+// setting is the equivalent fix for plain text literals: force UTF-8 on every JavaCompile task,
+// on every OS, so what's saved in the source is what actually ends up in the jar.
+tasks.withType<JavaCompile>().configureEach {
+    options.encoding = "UTF-8"
 }
 
 javafx {
