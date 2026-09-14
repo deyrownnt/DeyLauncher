@@ -759,6 +759,24 @@ public class LauncherApp extends Application {
                 });
                 return;
             }
+            // The restart helper copies into the install folder AFTER the launcher exits, so a folder
+            // this user cannot write to (e.g. the zip was unzipped into Program Files) would otherwise
+            // fail completely silently -- the old build just relaunches with the same version. Probe it
+            // here so the user gets a real explanation instead of a no-op update.
+            try {
+                Path writeProbe = layout.installRoot().resolve(".deylauncher-write-test");
+                Files.writeString(writeProbe, "ok");
+                Files.deleteIfExists(writeProbe);
+            } catch (Exception notWritable) {
+                Platform.runLater(() -> {
+                    updateBtn.setDisable(false);
+                    updateBtn.setVisible(true);
+                    updateStatus.setText("Cannot write to " + layout.installRoot()
+                            + " -- move DeyLauncher to a folder you own (or run it as administrator) to update.");
+                    revealUpdateClose();
+                });
+                return;
+            }
             Platform.runLater(() -> updateStatus.setText("Extracting update..."));
             Path staging = Files.createTempDirectory("DeyLauncher-extract");
             Path stagingApp = AppUpdater.extractTo(downloaded, staging, layout.windows());

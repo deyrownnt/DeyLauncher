@@ -3,8 +3,14 @@ package com.deylauncher.update;
 import org.junit.jupiter.api.Test;
 
 import java.io.InputStream;
+import java.nio.file.Path;
 import java.util.Properties;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -60,5 +66,83 @@ class AppUpdaterTest {
         } catch (Exception ex) {
             fail("reading embedded version failed: " + ex);
         }
+    }
+
+    // ---- the restart helpers themselves ---------------------------------------
+    // The Windows updater used to sleep a fixed 4 seconds and then xcopy over the top, which lost the
+    // race against a still-running launcher (Windows keeps the exe, the app jar and jvm.dll locked) and
+    // then silently relaunched the unchanged build. These lock in the shape of the fixed helper.
+
+    private static AppUpdater.InstallLayout windowsLayout() {
+        return new AppUpdater.InstallLayout(Path.of("C:\\Users\\Test\\Apps\\DeyLauncher"),
+                Path.of("C:\\Users\\Test\\Apps\\DeyLauncher\\DeyLauncher.exe"), true);
+    }
+
+    @Test
+    void windowsRestartScriptWaitsForTheOldProcessInsteadOfSleepingBlindly() {
+        String s = AppUpdater.restartScript(windowsLayout(),
+                Path.of("C:\\Temp\\dl-extract\\DeyLauncher"), Path.of("C:\\Temp\\dl-extract"), 4321L);
+        assertTrue(s.contains("set \"OLD_PID=4321\""), s);
+        assertTrue(s.contains("tasklist /FI \"PID eq %OLD_PID%\""), s);
+        assertTrue(s.contains("if errorlevel 1 goto exited"), s);
+        assertFalse(s.contains("timeout /t"),
+                "a fixed sleep is exactly the Windows bug being fixed:\n" + s);
+    }
+
+    @Test
+    void windowsRestartScriptLeavesTheInstallDirBeforeMovingIt() {
+        String s = AppUpdater.restartScript(windowsLayout(),
+                Path.of("C:\\Temp\\dl-extract\\DeyLauncher"), Path.of("C:\\Temp\\dl-extract"), 7L);
+        int cd = s.indexOf("cd /d \"%TEMP%\"");
+        int move = s.indexOf("move \"%APP_DIR%\" \"%OLD%\"");
+        assertTrue(cd >= 0, "the helper must leave the install dir, since Windows refuses to rename a live CWD:\n" + s);
+        assertTrue(move > cd, "the cd must come BEFORE the install dir is moved:\n" + s);
+    }
+
+    @Test
+    void windowsRestartScriptBacksUpVerifiesAndRollsBack() {
+        String s = AppUpdater.restartScript(windowsLayout(),
+                Path.of("C:\\Temp\\dl-extract\\DeyLauncher"), Path.of("C:\\Temp\\dl-extract"), 7L);
+        assertTrue(s.contains("robocopy \"%STAGING%\" \"%APP_DIR%\" /E"), s);
+        assertTrue(s.contains("robocopy \"%STAGING%\" \"%APP_DIR%\" /MIR"), s);
+        assertTrue(s.contains("if errorlevel 8 goto rollback"), s);
+        assertTrue(s.contains("%APP_DIR%\\app\\%EXPECT_JAR%"), s);
+        assertTrue(s.contains("if exist \"%OLD%\" move \"%OLD%\" \"%APP_DIR%\""), s);
+        assertTrue(s.contains("start \"\" /D \"%APP_DIR%\" \"%APP_DIR%\\DeyLauncher.exe\""), s);
+    }
+
+    @Test
+    void windowsRestartScriptOnlyJumpsToLabelsThatExist() {
+        String s = AppUpdater.restartScript(windowsLayout(),
+                Path.of("C:\\Temp\\dl-extract\\DeyLauncher"), Path.of("C:\\Temp\\dl-extract"), 7L);
+        // Catches both the bare `goto X` and the conditional `if ... goto X` forms, and also flags a
+        // label nothing jumps to -- a typo in either direction would silently break the update.
+        Set<String> targets = new TreeSet<>();
+        Matcher jumps = Pattern.compile("(?<![A-Za-z0-9_])goto +([A-Za-z0-9_]+)").matcher(s);
+        while (jumps.find()) targets.add(jumps.group(1));
+        Set<String> labels = new TreeSet<>();
+        for (String line : s.split("\r\n")) {
+            if (line.startsWith(":") && line.length() > 1) labels.add(line.substring(1).trim());
+        }
+        assertFalse(targets.isEmpty(), "no goto statements found -- did the script shape change?\n" + s);
+        assertEquals(labels, targets, "every goto needs a label, and every label a goto:\n" + s);
+    }
+
+    @Test
+    void windowsRestartScriptUsesCrlfLineEndings() {
+        String s = AppUpdater.restartScript(windowsLayout(),
+                Path.of("C:\\Temp\\dl-extract\\DeyLauncher"), Path.of("C:\\Temp\\dl-extract"), 7L);
+        assertTrue(s.contains("\r\n"), "cmd.exe wants CRLF:\n" + s);
+        assertFalse(Pattern.compile("(?<!\r)\n").matcher(s).find(),
+                "every LF must be part of a CRLF pair:\n" + s);
+    }
+
+    @Test
+    void unixRestartScriptStillWaitsOnThePidWithLfEndings() {
+        AppUpdater.InstallLayout linux = new AppUpdater.InstallLayout(Path.of("/opt/DeyLauncher"),
+                Path.of("/opt/DeyLauncher/bin/DeyLauncher"), false);
+        String s = AppUpdater.restartScript(linux, Path.of("/tmp/dl/DeyLauncher"), Path.of("/tmp/dl"), 99L);
+        assertTrue(s.contains("kill -0 \"$OLD_PID\""), s);
+        assertFalse(s.contains("\r\n"), "the .sh helper must stay LF-only:\n" + s);
     }
 }
