@@ -988,7 +988,15 @@ public class LauncherApp extends Application {
 
         Label heading = new Label("Friends");
         heading.getStyleClass().add("card-heading");
-        friendsPageContent.getChildren().add(heading);
+        Button refreshFriendsBtn = refreshIconButton("Refresh friends", () -> {
+            refreshFriendsAsync(active);
+            publishPresenceQuietly(); // a manual refresh is also a good moment to re-announce presence
+        });
+        Region headingSpacer = new Region();
+        HBox.setHgrow(headingSpacer, Priority.ALWAYS);
+        HBox headingRow = new HBox(12, heading, headingSpacer, refreshFriendsBtn);
+        headingRow.setAlignment(Pos.CENTER_LEFT);
+        friendsPageContent.getChildren().add(headingRow);
 
         TextField addField = new TextField();
         addField.setPromptText("Friend's DeyLauncher username");
@@ -1843,9 +1851,11 @@ public class LauncherApp extends Application {
         createServerBtn.getStyleClass().add("play-button");
         createServerBtn.setOnAction(e -> openCreateServerDialog());
 
+        Button refreshServersBtn = refreshIconButton("Refresh servers", this::renderServersPageContent);
+
         Region headerSpacer = new Region();
         HBox.setHgrow(headerSpacer, Priority.ALWAYS);
-        HBox headerRow = new HBox(12, heading, headerSpacer, filterToggle, addServerBtn, createServerBtn);
+        HBox headerRow = new HBox(12, heading, headerSpacer, refreshServersBtn, filterToggle, addServerBtn, createServerBtn);
         headerRow.setAlignment(Pos.CENTER_LEFT);
         serversPageContent.getChildren().addAll(headerRow, sortBar);
 
@@ -8676,6 +8686,32 @@ public class LauncherApp extends Application {
         button.setGraphic(icon(icon, 17));
         button.setText("");
         button.setGraphicTextGap(0);
+    }
+
+    /**
+     * The compact icon-only refresh button used in the Friends and Servers headers.
+     *
+     * The glyph is an IconFactory SVG path rather than a "\u21BB" / emoji character, so it draws
+     * from the same vector data on every Windows and Linux machine instead of depending on whichever
+     * symbol font happens to be installed (a missing glyph would render as a tofu box). Clicking
+     * spins it once so a refresh that finds nothing new still gives visible feedback.
+     */
+    private Button refreshIconButton(String tooltip, Runnable action) {
+        Button btn = new Button();
+        btn.getStyleClass().add("pill-button");
+        setButtonIconOnly(btn, IconFactory.Icon.REFRESH);
+        btn.setTooltip(new Tooltip(tooltip));
+        btn.setOnAction(e -> {
+            Node graphic = btn.getGraphic();
+            if (graphic != null) {
+                RotateTransition spin = new RotateTransition(Duration.millis(520), graphic);
+                spin.setByAngle(360);
+                spin.setInterpolator(Interpolator.EASE_BOTH);
+                spin.play();
+            }
+            action.run();
+        });
+        return btn;
     }
 
     /** Opens a URL in the user's default browser via JavaFX HostServices (same as the sign-in links). */
