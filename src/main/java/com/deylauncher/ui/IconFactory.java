@@ -36,7 +36,8 @@ public final class IconFactory {
         ADD,
         FILTER,
         MODPACK,
-        SERVER
+        SERVER,
+        REFRESH
     }
 
     public static Node create(Icon icon, double size) {
@@ -75,6 +76,11 @@ public final class IconFactory {
             // centre seam so it reads as a package rather than a solid cube at 17-20px.
             case MODPACK -> "M12 2 L3 6.5 L12 11 L21 6.5 Z M3 7.6 L11.4 11.8 L11.4 20.4 L3 16.2 Z M12.6 11.8 L21 7.6 L21 16.2 L12.6 20.4 Z";
             case SERVER -> "M21 12a9 9 0 1 0-18 0a9 9 0 0 1 18 0zM7.5 12h9M12 3v18";
+            // A circular arrow: a near-full ring drawn as an arc plus a solid arrow head, all in
+            // one filled path so it needs no stroke settings and no font -- the same reason every
+            // other icon here is a vector instead of a "\u21BB"/emoji glyph that may be missing
+            // on a given Windows or Linux box.
+            case REFRESH -> "M12 5V2L7.5 6.5 12 11V8a5 5 0 1 1-5 5H4a8 8 0 1 0 8-8z";
         };
     }
 }
