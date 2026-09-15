@@ -80,6 +80,7 @@ public class Main {
         // --- launch ---
         Path gameDir = files.root.resolve("instances").resolve(entry.id());
         Files.createDirectories(gameDir);
+        com.deylauncher.launch.SharedSaves.ensureShared(files.root, gameDir);
 
         var settings = GameLauncher.LaunchSettings.defaults(); // RAM 1-4GB, 854x480 windowed
         GameLauncher launcher = new GameLauncher();

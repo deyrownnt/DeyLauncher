@@ -57,8 +57,13 @@ public class LauncherPrefs {
 
     // Friends / presence (Account tab, Settings > Launcher)
     public boolean invisibleMode = false;         // broadcast OFFLINE to friends even while actually online
-    public boolean shareServerAddress = false;    // whether the current server address is published to friends.json at all
-    public String myServerAddress = "";            // auto-filled with the last remote server you joined (see LauncherApp.rememberCurrentlyJoined); still editable as an override
+    public boolean shareServerAddress = false;    // whether the server you're on is published to friends.json at all (pure opt-in -- the launcher never turns this on itself)
+    /** Legacy field from the builds that auto-filled this with the last server you joined and then
+     *  republished it as live presence (which is why a stale "playing on ..." could stick around
+     *  forever). Presence is now built from the live game session only -- see
+     *  LauncherApp.currentPresence -- and any leftover value here is cleared once at startup, so the
+     *  field is kept purely so older prefs files still load. */
+    public String myServerAddress = "";
 
     private static Path file() {
         return Path.of(System.getProperty("user.home"), ".deylauncher", "launcher.properties");

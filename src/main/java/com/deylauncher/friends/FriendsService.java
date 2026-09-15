@@ -48,9 +48,19 @@ public class FriendsService {
 
     /** Registers/updates the caller's own entry and publishes current presence in the same write.
      *  {@code serverName}/{@code serverIconUrl} describe the server currently being shared (so friends
-     *  see where you're playing by name), or null for the generic manual-address case. */
+     *  see where you're playing by name), or null for the generic manual-address case.
+     *
+     *  <p>Kept for callers that have no play state to report; it forwards to the overload below with a
+     *  null (unknown) state, which renders exactly like an entry written by an older build. */
     public void publishPresence(String myUuid, String myUsername, String status, String serverAddress,
                                 String serverName, String serverIconUrl) throws Exception {
+        publishPresence(myUuid, myUsername, status, serverAddress, serverName, serverIconUrl, null);
+    }
+
+    /** Same as above, plus the live {@link PlayState} so friends can tell "on a server" apart from
+     *  "in the launcher" / "single player" instead of inferring it from an address. */
+    public void publishPresence(String myUuid, String myUsername, String status, String serverAddress,
+                                String serverName, String serverIconUrl, PlayState playState) throws Exception {
         repo.sync("presence update", data -> {
             var me = data.getOrCreate(myUuid, myUsername);
             me.status = status;
@@ -58,6 +68,9 @@ public class FriendsService {
             me.serverAddress = serverAddress; // null clears it -- e.g. sharing turned off in Settings
             me.currentServerName = serverName;
             me.currentServerIconUrl = serverIconUrl;
+            // null/UNKNOWN leaves the field off the wire entirely, so "we don't know" and "an older
+            // build wrote this entry" are indistinguishable to readers -- which is the point.
+            me.playState = (playState == null || playState == PlayState.UNKNOWN) ? null : playState.wire;
             return data;
         });
     }

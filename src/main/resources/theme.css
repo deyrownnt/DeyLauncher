@@ -166,6 +166,32 @@
 .theme-dark .badge-online { -fx-text-fill: #ff7a1f; -fx-background-color: rgba(255,122,31,0.15); -fx-background-radius: 20; -fx-padding: 4 12; -fx-font-weight: bold; -fx-font-size: 12px; }
 .theme-dark .badge-offline { -fx-text-fill: #f5f5f6; -fx-background-color: #2a2b30; -fx-background-radius: 20; -fx-padding: 4 12; -fx-font-weight: bold; -fx-font-size: 12px; }
 
+/* ---- "Appear offline" card (Account tab) ----------------------------------------------------
+   Gold is reserved for this one control: it decides what EVERY friend sees about you, so it is
+   deliberately louder than the plain checkboxes around it, and turns fully gold while it is ON. */
+.theme-dark .gold-card {
+    -fx-background-color: #17181b; -fx-background-radius: 12;
+    -fx-border-color: rgba(242,193,78,0.30); -fx-border-width: 1; -fx-border-radius: 12;
+    -fx-padding: 12 14 12 14;
+}
+.theme-dark .gold-card-on {
+    -fx-border-color: #f2c14e;
+    -fx-effect: dropshadow(gaussian, rgba(242,193,78,0.35), 14, 0, 0, 2);
+}
+.theme-dark .gold-card-title { -fx-text-fill: #f5f5f6; -fx-font-weight: bold; -fx-font-size: 14px; }
+.theme-dark .gold-card-on .gold-card-title { -fx-text-fill: #f2c14e; }
+.theme-dark .gold-card-note { -fx-text-fill: #9a9ba3; -fx-font-size: 13px; -fx-wrap-text: true; }
+.theme-dark .gold-switch {
+    -fx-background-color: #202126; -fx-background-radius: 20; -fx-border-color: #4a4b52;
+    -fx-border-radius: 20; -fx-text-fill: #9a9ba3; -fx-font-weight: bold; -fx-font-size: 12px;
+    -fx-padding: 5 18; -fx-cursor: hand;
+}
+.theme-dark .gold-switch:hover { -fx-border-color: #f2c14e; -fx-text-fill: #f5f5f6; }
+.theme-dark .gold-switch:selected {
+    -fx-background-color: linear-gradient(to bottom, #f7cf6b, #dfa82a);
+    -fx-border-color: #f2c14e; -fx-text-fill: #1b1b1e;
+}
+
 .theme-dark .account-skin-tabs .tab-header-area .tab-header-background,
 .theme-dark .settings-tabs .tab-header-area .tab-header-background { -fx-background-color: transparent; }
 .theme-dark .account-skin-tabs .tab-header-area,
@@ -482,6 +508,30 @@
 
 .theme-light .badge-online { -fx-text-fill: #e8690f; -fx-background-color: rgba(255,122,31,0.12); -fx-background-radius: 20; -fx-padding: 4 12; -fx-font-weight: bold; -fx-font-size: 12px; }
 .theme-light .badge-offline { -fx-text-fill: #17181b; -fx-background-color: #e2e2e4; -fx-background-radius: 20; -fx-padding: 4 12; -fx-font-weight: bold; -fx-font-size: 12px; }
+
+/* ---- "Appear offline" card (Account tab): the same gold, tuned for the light theme ---- */
+.theme-light .gold-card {
+    -fx-background-color: #fffaf0; -fx-background-radius: 12;
+    -fx-border-color: rgba(201,153,42,0.40); -fx-border-width: 1; -fx-border-radius: 12;
+    -fx-padding: 12 14 12 14;
+}
+.theme-light .gold-card-on {
+    -fx-border-color: #c9992a;
+    -fx-effect: dropshadow(gaussian, rgba(201,153,42,0.30), 14, 0, 0, 2);
+}
+.theme-light .gold-card-title { -fx-text-fill: #17181b; -fx-font-weight: bold; -fx-font-size: 14px; }
+.theme-light .gold-card-on .gold-card-title { -fx-text-fill: #a67c14; }
+.theme-light .gold-card-note { -fx-text-fill: #6b6c72; -fx-font-size: 13px; -fx-wrap-text: true; }
+.theme-light .gold-switch {
+    -fx-background-color: #ffffff; -fx-background-radius: 20; -fx-border-color: #d8d8dc;
+    -fx-border-radius: 20; -fx-text-fill: #6b6c72; -fx-font-weight: bold; -fx-font-size: 12px;
+    -fx-padding: 5 18; -fx-cursor: hand;
+}
+.theme-light .gold-switch:hover { -fx-border-color: #c9992a; -fx-text-fill: #17181b; }
+.theme-light .gold-switch:selected {
+    -fx-background-color: linear-gradient(to bottom, #f7cf6b, #dfa82a);
+    -fx-border-color: #c9992a; -fx-text-fill: #1b1b1e;
+}
 
 .theme-light .account-skin-tabs .tab-header-area .tab-header-background,
 .theme-light .settings-tabs .tab-header-area .tab-header-background { -fx-background-color: transparent; }

@@ -38,6 +38,10 @@ public class FriendsData {
         /** Optional image URL for the server currently being shared (many self-hosted servers have
          *  no hosted icon, in which case this stays null and the profile shows a generated tile). */
         public String currentServerIconUrl;
+        /** What the owner's launcher is actually doing right now -- one of {@link PlayState}'s wire
+         *  values, or absent/null for entries written by older builds or in invisible mode. Rendered
+         *  via {@link PlayState#fromWire(String)} so an unknown/absent value can never break a client. */
+        public String playState;
         /** Socials the user chose to publish on their friend profile, edited in Account settings. */
         public List<Social> socials = new ArrayList<>();
         /** Servers this user owns in DeyLauncher (name + how to reach them), published for their profile. */

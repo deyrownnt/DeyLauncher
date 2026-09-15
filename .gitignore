@@ -5,8 +5,11 @@ build/
 # DeyLauncher build output
 dist/
 
-# Embedded GitHub credentials
+# Embedded GitHub credentials -- NEVER commit a token
 secrets/
+
+# Local AI-assistant chat history (tooling, not source)
+.aider*
 
 # IDE
 .idea/
@@ -16,4 +19,3 @@ secrets/
 # OS files
 .DS_Store
 Thumbs.db
-.aider*
