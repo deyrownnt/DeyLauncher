@@ -10,6 +10,8 @@ import com.deylauncher.launch.GameFiles;
 import com.deylauncher.launch.GameLauncher;
 import com.deylauncher.launch.JavaRuntimeManager;
 import com.deylauncher.launch.LaunchDiagnostics;
+import com.deylauncher.launch.ServerAddressMatch;
+import com.deylauncher.launch.ServerSessionTracker;
 import com.deylauncher.modloader.FabricInstaller;
 import com.deylauncher.modloader.FabricApiInstaller;
 import com.deylauncher.modloader.ForgeInstaller;
@@ -114,6 +116,18 @@ public class LauncherApp extends Application {
     private static final long PRESENCE_HEARTBEAT_MS = 60_000L;
     private static final String PRESENCE_GRACEFUL_MARKER = "presence-graceful.txt";
     private volatile boolean appRunning = true;
+
+    // ---- Live play state: what friends are told we're doing, derived ONLY from a game process this
+    // launcher itself launched (see ServerSessionTracker). Deliberately NOT persisted anywhere -- an
+    // address remembered on disk used to be republished forever, so friends kept seeing "playing on
+    // <server>" from a launcher with no game open at all, and a single-player session looked the same
+    // as being on that server. Written on the FX thread (applySessionEvent), read from the presence
+    // heartbeat thread.
+    private volatile PlayState livePlayState = PlayState.IN_LAUNCHER;
+    private volatile String liveServerAddress;  // non-null only while livePlayState == SERVER
+    private volatile String liveServerName;     // friendly name resolved when the join was announced
+    /** How often a live game session checks whether a pending "leave" has timed out (see ServerSessionTracker.poll). */
+    private static final long PRESENCE_TICK_MS = 2_000L;
 
     // Dots currently being wave-pulsed (see WavePulse) -- unregistered when the containing page
     // re-renders so the animation engine never animates detached nodes.
@@ -275,6 +289,11 @@ public class LauncherApp extends Application {
         syncPlayCardFromActiveIdentity();
         refreshAccountButton();
         restoreOnlineSessionAsync();
+        // One-time cleanup for installs whose prefs still carry the address older builds auto-saved
+        // and republished forever. Deliberately unconditional and early: it is about our own prefs
+        // file, so it must not depend on the friends service being available (startPresenceTasks
+        // returns early without one), and it has to run before anything can publish presence.
+        clearLegacyAutoSavedAddress();
         publishPresenceQuietly();
         startPresenceTasks();
         checkForUpdatesAsync();
@@ -343,23 +362,60 @@ public class LauncherApp extends Application {
     }
 
     /**
+     * One presence payload: exactly what friends should be told for the CURRENT moment. Built from
+     * the live game session (and the user's sharing/invisible choices) -- never from anything saved
+     * on disk, see {@link #currentPresence()}.
+     */
+    private record PresencePayload(String status, PlayState playState, String address, String name) {}
+
+    /**
+     * What friends should see right now, derived from live state only:
+     * <ul>
+     *   <li>invisible mode -&gt; OFFLINE with no state at all (nothing about where we are leaks);</li>
+     *   <li>a game we launched, on a server we're sharing -&gt; SERVER + address + friendly name;</li>
+     *   <li>a game we launched, on a server with sharing off -&gt; SERVER with no address (friends know
+     *       you're on a server, just not which one);</li>
+     *   <li>a game we launched, in a single-player world -&gt; SINGLE_PLAYER, never a server;</li>
+     *   <li>no game process of ours -&gt; IN_LAUNCHER.</li>
+     * </ul>
+     */
+    private PresencePayload currentPresence() {
+        if (prefs.invisibleMode) return new PresencePayload("OFFLINE", null, null, null);
+        PlayState state = livePlayState;
+        String address = null;
+        String name = null;
+        if (state == PlayState.SERVER && prefs.shareServerAddress) {
+            address = liveServerAddress;
+            name = liveServerName;
+        }
+        return new PresencePayload("ONLINE", state, address, name);
+    }
+
+    /**
      * Publishes current presence in the background -- never blocks the UI, never shows an error
      * dialog on failure (friends.json being briefly unreachable shouldn't interrupt anything else).
-     * Called on startup, on invisible-mode toggle, and whenever the Friends page opens.
+     * Called on startup, on invisible-mode toggle, on every live session change (see
+     * applySessionEvent) and whenever the Friends page opens.
+     *
+     * <p>Note there is deliberately NO persisted "last server" involved any more: this used to send
+     * an address auto-saved in launcher.properties, which is why a stale one could be re-announced
+     * every 60 seconds forever, even with Minecraft closed or in a single-player world.
      */
     private void publishPresenceQuietly() {
+        publishPresence(currentPresence());
+    }
+
+    /** Sends one already-computed presence payload, off the FX thread, swallowing failures. */
+    private void publishPresence(PresencePayload payload) {
         if (friendsService == null) return;
         PlayerIdentity active = identityStore.getActive();
         if (active == null) return;
-        String status = prefs.invisibleMode ? "OFFLINE" : "ONLINE";
-        String address = (prefs.shareServerAddress && !prefs.invisibleMode
-                && prefs.myServerAddress != null && !prefs.myServerAddress.isBlank())
-                ? prefs.myServerAddress.trim() : null;
         Task<Void> task = new Task<>() {
             @Override
             protected Void call() {
                 try {
-                    friendsService.publishPresence(active.uuid, active.username, status, address);
+                    friendsService.publishPresence(active.uuid, active.username, payload.status(),
+                            payload.address(), payload.name(), null, payload.playState());
                 } catch (Exception ignored) {
                     // Best-effort -- a failed presence update isn't worth interrupting anything for.
                 }
@@ -370,36 +426,48 @@ public class LauncherApp extends Application {
     }
 
     /**
-     * Publishes presence with this server's live address while it runs (only if the owner turned
-     * on "Allow friends to join" for it), so online friends see it under "Friends Playing Now" and
-     * can join straight in. On stop / when disabled, falls back to the manual Settings address.
+     * One-time cleanup for installs coming from a build that auto-saved the server you last joined
+     * into launcher.properties and republished it as live presence. That value is no longer read at
+     * all (see currentPresence), so leaving it behind would only be confusing -- drop it once, and
+     * leave the user's own "share my server address" choice untouched.
+     */
+    private void clearLegacyAutoSavedAddress() {
+        if (prefs.myServerAddress == null || prefs.myServerAddress.isBlank()) return;
+        String stale = prefs.myServerAddress.trim();
+        prefs.myServerAddress = "";
+        prefs.save();
+        log("Cleared an old auto-saved server address (" + stale + ") -- friends now only ever see "
+                + "where you are while you're actually in a server.");
+    }
+
+    /**
+     * Publishes presence for a server THIS install hosts: while it runs and the owner allowed friends
+     * to join, its live (tunnel or LAN) address is advertised, so online friends see it under
+     * "Friends Playing Now" and can join straight in. When it isn't running (or isn't joinable),
+     * presence falls back to whatever the live game session says -- NOT to an address saved on disk,
+     * which is what used to keep announcing a long-gone server after the game had stopped.
      */
     private void publishPresenceWithServer(ServerInstance server, boolean running) {
         if (friendsService == null) return;
-        PlayerIdentity active = identityStore.getActive();
-        if (active == null) return;
-        String status = prefs.invisibleMode ? "OFFLINE" : "ONLINE";
-        String address;
-        if (!prefs.invisibleMode && running && server.allowFriendsJoin) {
-            PlayitTunnel tunnel = serverTunnels.get(server.id);
-            String pub = tunnel != null ? tunnel.publicAddress() : null;
-            address = (pub != null && !pub.isBlank()) ? pub : (localIpAddress() + ":" + server.port);
-        } else {
-            address = (prefs.shareServerAddress && prefs.myServerAddress != null && !prefs.myServerAddress.isBlank())
-                    ? prefs.myServerAddress.trim() : null;
+        PresencePayload live = currentPresence();
+        // null playState means invisible mode (currentPresence turned the whole payload into OFFLINE),
+        // so there is nothing to advertise -- just publish that.
+        boolean advertise = !prefs.invisibleMode && running && server.allowFriendsJoin
+                && live.playState() != null;
+        // Where the user actually IS beats where they're hosting: if the game we launched is already
+        // connected to a server, that is the truthful presence (the local server is just something
+        // they own), so it wins over advertising the hosted address.
+        if (advertise && live.playState() == PlayState.SERVER && live.address() != null) {
+            advertise = false;
         }
-        Task<Void> task = new Task<>() {
-            @Override
-            protected Void call() {
-                try {
-                    friendsService.publishPresence(active.uuid, active.username, status, address,
-                            running ? server.name : null, null);
-                } catch (Exception ignored) {
-                }
-                return null;
-            }
-        };
-        new Thread(task, "presence-publish").start();
+        if (!advertise) {
+            publishPresence(live);
+            return;
+        }
+        PlayitTunnel tunnel = serverTunnels.get(server.id);
+        String pub = tunnel != null ? tunnel.publicAddress() : null;
+        String address = (pub != null && !pub.isBlank()) ? pub : (localIpAddress() + ":" + server.port);
+        publishPresence(new PresencePayload(live.status(), PlayState.SERVER, address, server.name));
     }
 
     /**
@@ -1122,10 +1190,22 @@ public class LauncherApp extends Application {
                 name.setCursor(javafx.scene.Cursor.HAND);
                 name.setOnMouseClicked(ev -> openFriendProfile(friend.uuid, friend.username));
 
+                // What they're doing right now (playing on <server> / single player / in the launcher),
+                // so the list itself says it without having to open each profile. An OFFLINE friend says
+                // exactly that -- this used to print "Online" for every offline entry regardless of the
+                // published status, which is what made an invisible-mode account look online to everyone.
+                String statusText = online ? describePlayState(playStateOf(entry, true), entry) : "Offline";
+
                 Region spacer = new Region();
                 HBox.setHgrow(spacer, Priority.ALWAYS);
 
-                HBox row = new HBox(10, avatarView, dot, name, spacer);
+                HBox row = new HBox(10, avatarView, dot, name);
+                if (statusText != null && !statusText.isBlank()) {
+                    Label playLbl = new Label(statusText);
+                    playLbl.getStyleClass().add("notice-label");
+                    row.getChildren().add(playLbl);
+                }
+                row.getChildren().add(spacer);
                 row.setAlignment(Pos.CENTER_LEFT);
                 row.getStyleClass().add("mod-row");
 
@@ -1161,6 +1241,47 @@ public class LauncherApp extends Application {
                 && (System.currentTimeMillis() - entry.lastSeen) < PRESENCE_STALE_MS;
     }
 
+    /**
+     * What to SHOW for a friend: null when they're offline (nothing to describe), else their published
+     * play state. Entries written by an older build carry no {@code playState} -- those are rendered the
+     * legacy way, where a published address still means "on a server", so nothing regresses for friends
+     * who haven't updated yet.
+     */
+    private PlayState playStateOf(FriendsData.UserEntry entry, boolean online) {
+        if (!online || entry == null) return null;
+        PlayState state = PlayState.fromWire(entry.playState);
+        if (state == PlayState.UNKNOWN && entry.serverAddress != null && !entry.serverAddress.isBlank()) {
+            return PlayState.SERVER;
+        }
+        return state;
+    }
+
+    /**
+     * One short line saying what a friend is doing right now, for the friends list / profile header,
+     * or {@code null} when there is nothing worth adding.
+     *
+     * <p>{@code null} means "not online" (see playStateOf) and must never render as "Online": that
+     * generic fallback is how an invisible-mode account leaked its real state -- it publishes OFFLINE,
+     * but every friend's list still printed "Online" next to the dim offline dot. "Online" is now only
+     * printed for someone who really is online yet published no play state at all.
+     */
+    private String describePlayState(PlayState state, FriendsData.UserEntry entry) {
+        if (state == null) return null;                  // offline: the dot and the badge already say so
+        if (state == PlayState.UNKNOWN) return "Online"; // online, but their build published no state
+        return switch (state) {
+            case SERVER -> {
+                String address = entry != null ? entry.serverAddress : null;
+                if (address == null || address.isBlank()) yield "On a server (address not shared)";
+                String name = (entry.currentServerName != null && !entry.currentServerName.isBlank())
+                        ? entry.currentServerName : resolveServerDisplay(address);
+                yield "Playing on " + name;
+            }
+            case SINGLE_PLAYER -> "Playing single player";
+            case IN_LAUNCHER -> "In the launcher";
+            case UNKNOWN -> null; // handled above; listed so a new state can never fall through silently
+        };
+    }
+
     /** Unregisters every dot this page is wave-pulsing (called before a re-render). */
     private void clearWavePulseDots() {
         for (Node n : wavePulseDots) WavePulse.instance().unregister(n);
@@ -1171,32 +1292,51 @@ public class LauncherApp extends Application {
      * Turns a raw "host:port" server address into a friendly display for friends: if it matches one
      * of MY added/external servers (or a locally-hosted server), show that server's name, else fall
      * back to the bare address. Used with the SERVER icon so friends recognise where you're playing.
+     *
+     * <p>Candidates are SCORED rather than first-match-wins (see {@link ServerAddressMatch}): an exact
+     * host:port hit always beats a same-host-different-or-default-port one, and among equally good
+     * hits the most recently joined server wins. Matching on the host alone while walking the list in
+     * order is what made a friend on one server show up under the name of a *different* bookmark on
+     * the same host -- e.g. "the first server I ever added".
      */
     private String resolveServerDisplay(String address) {
         if (address == null || address.isBlank()) return address;
         String a = address.trim();
-        String host = a;
-        int colon = a.lastIndexOf(':');
-        if (colon > 0) host = a.substring(0, colon).trim();
+        String best = null;
+        int bestScore = ServerAddressMatch.SCORE_NONE;
+        long bestJoinedAt = Long.MIN_VALUE;
         for (var srv : addedServersStore.list()) {
-            if (matchesAddress(srv.address(), a)) return srv.name();
-        }
-        for (var srv : serverStore.listAll()) {
-            if (matchesAddress("localhost:" + srv.port, a) || matchesAddress(localIpAddress() + ":" + srv.port, a)) {
-                return srv.name;
+            int score = ServerAddressMatch.score(srv.address(), a);
+            if (score > bestScore || (score > ServerAddressMatch.SCORE_NONE && score == bestScore
+                    && srv.lastJoinedAt > bestJoinedAt)) {
+                bestScore = score;
+                best = srv.name();
+                bestJoinedAt = srv.lastJoinedAt;
             }
         }
-        return a;
+        // Resolved once instead of once per candidate: localIpAddress() walks the network
+        // interfaces (and can attempt a local-hostname lookup), so calling it inside the loop was
+        // needless I/O on a path that runs every time a friend's address is resolved.
+        String localIp = localIpAddress();
+        for (var srv : serverStore.listAll()) {
+            int score = Math.max(ServerAddressMatch.score("localhost:" + srv.port, a),
+                    ServerAddressMatch.score(localIp + ":" + srv.port, a));
+            if (score > bestScore || (score > ServerAddressMatch.SCORE_NONE && score == bestScore
+                    && srv.lastJoinedAt > bestJoinedAt)) {
+                bestScore = score;
+                best = srv.name;
+                bestJoinedAt = srv.lastJoinedAt;
+            }
+        }
+        return bestScore > ServerAddressMatch.SCORE_NONE && best != null ? best : a;
     }
 
-    private boolean matchesAddress(String candidate, String address) {
-        if (candidate == null || address == null) return false;
-        String c = candidate.trim();
-        String a = address.trim();
-        if (c.equalsIgnoreCase(a)) return true;
-        String ch = c.contains(":") ? c.substring(0, c.lastIndexOf(':')).toLowerCase() : c.toLowerCase();
-        String ah = a.contains(":") ? a.substring(0, a.lastIndexOf(':')).toLowerCase() : a.toLowerCase();
-        return ch.equals(ah); // same host, default port implied
+    /**
+     * True when a friend could actually reach this address (i.e. it isn't loopback or this machine).
+     * The rule itself lives in {@link ServerAddressMatch#isShareable}, so it stays unit-testable.
+     */
+    private boolean isShareableServerAddress(String address) {
+        return ServerAddressMatch.isShareable(address, localIpAddress());
     }
 
     /**
@@ -1317,6 +1457,17 @@ public class LauncherApp extends Application {
         Label statusLbl = new Label(online ? "Online" : "Offline");
         statusLbl.getStyleClass().add(online ? "badge-online" : "badge-offline");
         HBox nameRow = new HBox(10, nameLbl, statusLbl);
+        // One extra line saying WHAT they're doing: playing on <server> / single player / in the
+        // launcher. Published by their own launcher's live game session (see PlayState), not guessed
+        // from an address.
+        if (online) {
+            String playText = describePlayState(playStateOf(entry, true), entry);
+            if (playText != null && !playText.isBlank()) {
+                Label playLbl = new Label(playText);
+                playLbl.getStyleClass().add("notice-label");
+                nameRow.getChildren().add(playLbl);
+            }
+        }
         nameRow.setAlignment(Pos.CENTER_LEFT);
         HBox header = new HBox(14, avatarWrap, nameRow);
         header.setAlignment(Pos.CENTER_LEFT);
@@ -1374,16 +1525,59 @@ public class LauncherApp extends Application {
         root.getChildren().addAll(notesArea, notesRow);
         return root;
     }
+    /**
+     * The profile's "what are they doing" card, driven by the published play state rather than by the
+     * mere presence of an address:
+     * <ul>
+     *   <li>{@code SERVER} with a shared address -&gt; server tile + name + a glowing Join button;</li>
+     *   <li>{@code SERVER} with sharing off -&gt; says they're on a server, without naming it;</li>
+     *   <li>{@code SINGLE_PLAYER} / {@code IN_LAUNCHER} -&gt; says so (nothing to join);</li>
+     *   <li>no state at all (older build) -&gt; an address still means "on a server", exactly as before.</li>
+     * </ul>
+     */
     private Node buildNowPlayingSection(FriendsData.UserEntry entry, boolean online) {
         VBox box = new VBox(10);
         box.getStyleClass().add("profile-now-section");
-        String address = (online && entry != null) ? entry.serverAddress : null;
+        // An offline friend -- including one in invisible mode, which publishes OFFLINE -- gets said
+        // plainly, so nothing about where they are can leak through their profile.
+        if (!online) {
+            return noticeText("Offline right now, so there is nothing to show.");
+        }
+        PlayState state = playStateOf(entry, online);
+        if (state == null || state == PlayState.UNKNOWN) {
+            return noticeText("Online, with nothing shared right now.");
+        }
+        if (state == PlayState.SINGLE_PLAYER) {
+            box.getChildren().add(playStateRow("Single player",
+                    "Playing single player -- a local world, not a server."));
+            return box;
+        }
+        if (state == PlayState.IN_LAUNCHER) {
+            box.getChildren().add(playStateRow("In the launcher",
+                    "In DeyLauncher, not in a game right now."));
+            return box;
+        }
+        // SERVER: only an actually shared address can be shown/joined.
+        String address = (entry != null) ? entry.serverAddress : null;
         if (address == null || address.isBlank()) {
-            return noticeText("Not playing on a shared server right now.");
+            box.getChildren().add(playStateRow("On a server",
+                    "Playing on a server, with the address not shared."));
+            return box;
         }
         String displayName = (entry.currentServerName != null && !entry.currentServerName.isBlank())
                 ? entry.currentServerName : resolveServerDisplay(address);
-        Node tile = serverTile(displayName, entry.currentServerIconUrl, 40);
+        // The icon itself is never published to friends.json (only name/address are) -- so unless
+        // some other client set currentServerIconUrl, fetch the real favicon ourselves the same
+        // way an Added Server row does, caching it under the address so it's instant next time.
+        Node tile;
+        if (entry.currentServerIconUrl != null && !entry.currentServerIconUrl.isBlank()) {
+            tile = serverTile(displayName, entry.currentServerIconUrl, 40);
+        } else {
+            Path iconCache = serverIconCachePath(address);
+            StackPane iconTile = serverIconTile(displayName, Files.exists(iconCache) ? iconCache : null, 40);
+            if (!Files.exists(iconCache)) pingForIconAsync(address, iconTile, iconCache, 40);
+            tile = iconTile;
+        }
         Label placeLabel = new Label("Currently playing");
         placeLabel.getStyleClass().add("notice-label");
         Label srvName = new Label(displayName);
@@ -1399,6 +1593,16 @@ public class LauncherApp extends Application {
         row.setAlignment(Pos.CENTER_LEFT);
         box.getChildren().add(row);
         return box;
+    }
+
+    /** A quiet two-line "what they're doing" block for play states with nothing to join. */
+    private Node playStateRow(String title, String note) {
+        Label head = new Label(title);
+        head.getStyleClass().add("mod-name");
+        Label detail = new Label(note);
+        detail.getStyleClass().add("notice-label");
+        detail.setWrapText(true);
+        return new VBox(4, head, detail);
     }
 
     private java.util.List<String> mutualFriendNames(String myUuid, FriendsData.UserEntry entry, FriendsService.FriendsView view) {
@@ -1740,6 +1944,37 @@ public class LauncherApp extends Application {
         t.start();
     }
 
+    /**
+     * Grabs a server's favicon purely for display -- no status badge involved -- so a friend's
+     * "Now Playing" tile (profile popup or the Friends Playing Now list) can show a real icon even
+     * for a server we've never added ourselves. currentServerIconUrl is never actually published
+     * by this launcher (friends.json only carries name/address, see publishPresence/currentPresence),
+     * so without this the tile always fell back to a plain letter avatar. Drops the result if the
+     * tile isn't on screen any more (popup closed / row re-rendered) instead of touching a stale node.
+     */
+    private void pingForIconAsync(String address, StackPane iconTile, Path cache, double size) {
+        if (address == null || address.isBlank() || iconTile == null || cache == null) return;
+        Task<ServerStatusPing.Status> task = new Task<>() {
+            @Override protected ServerStatusPing.Status call() {
+                return ServerStatusPing.pingWithRetry(address, 2500, 1);
+            }
+        };
+        task.setOnSucceeded(e -> {
+            if (iconTile.getScene() == null) return; // popup closed / row gone -- drop the result
+            ServerStatusPing.Status st = task.getValue();
+            if (st.online() && st.faviconDataUri() != null) {
+                cacheFavicon(st.faviconDataUri(), cache);
+                try {
+                    showServerIcon(iconTile, new Image(cache.toUri().toString(), size, size, true, true));
+                } catch (Exception ignored) {
+                }
+            }
+        });
+        Thread t = new Thread(task, "profile-server-icon-ping");
+        t.setDaemon(true);
+        t.start();
+    }
+
     /** Opens a social link / email / website in the OS browser. Safe no-op if it isn't a link. */
     private void openExternal(String value) {
         if (value == null || value.isBlank()) return;
@@ -1934,7 +2169,11 @@ public class LauncherApp extends Application {
         for (var e : playing) {
             var friend = e.getKey();
             var entry = e.getValue();
-            String display = resolveServerDisplay(entry.serverAddress);
+            // Prefer the name the friend actually published for the server they're on (now set for
+            // every join, not just their own hosted servers -- see rememberCurrentlyJoined), falling
+            // back to matching the address against OUR OWN added/owned servers.
+            String display = (entry.currentServerName != null && !entry.currentServerName.isBlank())
+                    ? entry.currentServerName : resolveServerDisplay(entry.serverAddress);
 
             ImageView avatarView = new ImageView();
             avatarView.setFitWidth(28);
@@ -1955,10 +2194,17 @@ public class LauncherApp extends Application {
             wavePulseDots.add(dot);
 
             // Server icon + friendly server name so friends recognise where they'd be joining.
-            // Uses the friend's published icon when they have one, else the initials tile.
-            Node serverIcon = entry.currentServerIconUrl != null && !entry.currentServerIconUrl.isBlank()
-                    ? serverTile(display, entry.currentServerIconUrl, 28)
-                    : serverIconTile(display, null, 28);
+            // Uses the friend's published icon when they have one, else fetches the real favicon
+            // ourselves (cached to disk) instead of always falling back to a letter avatar.
+            Node serverIcon;
+            if (entry.currentServerIconUrl != null && !entry.currentServerIconUrl.isBlank()) {
+                serverIcon = serverTile(display, entry.currentServerIconUrl, 28);
+            } else {
+                Path iconCache = serverIconCachePath(entry.serverAddress);
+                StackPane iconTile = serverIconTile(display, Files.exists(iconCache) ? iconCache : null, 28);
+                if (!Files.exists(iconCache)) pingForIconAsync(entry.serverAddress, iconTile, iconCache, 28);
+                serverIcon = iconTile;
+            }
             Label serverLabel = new Label(display);
             serverLabel.getStyleClass().add("notice-label");
             HBox serverBox = new HBox(7, serverIcon, serverLabel);
@@ -4353,30 +4599,83 @@ public class LauncherApp extends Application {
     }
 
     /**
-     * Auto-remembers the address of the server we're joining so it can be shared with friends
-     * without anyone typing it in (replacing the old purely-manual Settings entry). The address is
-     * only kept if it's actually a remote server -- joining our OWN locally-hosted server
-     * (localhost / our own LAN IP) is never advertised, since no friend could reach it.
+     * Records a LIVE join into {@code target}: this install's own game process is (or, for a launch
+     * straight into a server, is about to be) on that server, and friends should see it right away.
+     *
+     * <p>Nothing here is saved to disk any more. The old version wrote the address into
+     * launcher.properties and force-enabled sharing, which is exactly why a single join could keep
+     * announcing "playing on &lt;server&gt;" forever -- including while Minecraft was closed or a
+     * single-player world was open (see currentPresence).
+     *
+     * <p>Joining our OWN locally-hosted server (localhost / our own LAN IP) still counts as being on a
+     * server, but no address is published: no friend could reach it.
      */
     private void rememberCurrentlyJoined(String target) {
         if (target == null || target.isBlank()) return;
         String trimmed = target.trim();
-        String host = trimmed;
-        int colon = trimmed.lastIndexOf(':');
-        if (colon > 0) host = trimmed.substring(0, colon).trim();
-        if (host.isEmpty()) return;
-        String lower = host.toLowerCase();
-        if (lower.equals("localhost") || lower.equals("127.0.0.1") || lower.equals("::1")) return;
-        try {
-            String local = localIpAddress();
-            if (local != null && local.equalsIgnoreCase(host)) return; // our own machine -- not joinable remotely
-        } catch (Exception ignored) {
-        }
-        prefs.myServerAddress = trimmed;
-        // Auto-enable sharing + publish right away so friends see "currently playing on <address>".
-        prefs.shareServerAddress = true;
-        prefs.save();
+        // A loopback / own-LAN server is still a server we are on, but its address is useless to a
+        // friend (they could not reach it), so the live state carries NO address for it and friends
+        // read "on a server (address not shared)" -- see the javadoc above. How friends reach a
+        // server we actually host is a different path (publishPresenceWithServer).
+        boolean shareable = isShareableServerAddress(trimmed);
+        String resolved = shareable ? resolveServerDisplay(trimmed) : null;
+        // Only publish a friendly name when it actually adds something over the raw address.
+        String friendly = (resolved != null && !resolved.equalsIgnoreCase(trimmed)) ? resolved : null;
+        setLiveServer(shareable ? trimmed : null, friendly);
+    }
+
+    /** Live session: on a multiplayer server at {@code address} (never from persisted state). */
+    private void setLiveServer(String address, String resolvedName) {
+        if (liveStateAlready(PlayState.SERVER, address, resolvedName)) return;
+        liveServerAddress = address;
+        liveServerName = resolvedName;
+        livePlayState = PlayState.SERVER;
         publishPresenceQuietly();
+    }
+
+    /** Live session: inside an integrated (single-player/LAN) world -- not a server, so no address. */
+    private void setLiveSinglePlayer() {
+        if (liveStateAlready(PlayState.SINGLE_PLAYER, null, null)) return;
+        liveServerAddress = null;
+        liveServerName = null;
+        livePlayState = PlayState.SINGLE_PLAYER;
+        publishPresenceQuietly();
+    }
+
+    /** Live session: in the launcher (or in the game's menus) -- not playing anywhere. */
+    private void setLiveInLauncher() {
+        if (liveStateAlready(PlayState.IN_LAUNCHER, null, null)) return;
+        liveServerAddress = null;
+        liveServerName = null;
+        livePlayState = PlayState.IN_LAUNCHER;
+        publishPresenceQuietly();
+    }
+
+    /**
+     * True when the live session already says exactly this. Presence writes go through the shared bot
+     * account's GitHub API, and a proxy hand-off can re-announce the same address repeatedly -- so a
+     * no-change update is skipped rather than burning a write (the heartbeat still refreshes lastSeen).
+     */
+    private boolean liveStateAlready(PlayState state, String address, String name) {
+        return livePlayState == state
+                && java.util.Objects.equals(liveServerAddress, address)
+                && java.util.Objects.equals(liveServerName, name);
+    }
+
+    /**
+     * Applies one {@link ServerSessionTracker} event for the game process this launcher started. Must
+     * run on the FX thread (the tracker is fed from the game's output thread, and this republishes
+     * presence), which is what the callers' {@code Platform.runLater} wrappers are for.
+     */
+    private void applySessionEvent(ServerSessionTracker.Event event, ServerSessionTracker tracker) {
+        switch (event) {
+            case JOINED -> rememberCurrentlyJoined(tracker.address());
+            case SINGLE_PLAYER_ENTERED -> setLiveSinglePlayer();
+            case LEFT -> setLiveInLauncher();
+            case NONE -> {
+                // Nothing for friends to see changed.
+            }
+        }
     }
 
     private void runFriendsAction(PlayerIdentity active, java.util.concurrent.Callable<FriendsService.FriendsView> action) {
@@ -4842,8 +5141,10 @@ public class LauncherApp extends Application {
     }
 
     /** One installed pack in the modpack menu, with the pack's own icon. Clicking it selects that
-     *  pack's Minecraft version + loader in the launcher, which is what makes it "the pack you play". */
-    private Button modpackMenuRow(ModpackMeta meta, Popup popup) {
+     *  pack's Minecraft version + loader in the launcher, which is what makes it "the pack you play".
+     *  A trailing delete icon button removes the pack entirely -- its modpack.json, its mods, and
+     *  every other file installed under that version+loader's instance folder. */
+    private HBox modpackMenuRow(ModpackMeta meta, Popup popup) {
         StringBuilder detail = new StringBuilder();
         if (meta.mcVersion != null && !meta.mcVersion.isBlank()) detail.append("Minecraft ").append(meta.mcVersion);
         if (meta.loader != null && !meta.loader.isBlank() && !meta.loader.equals("Vanilla")) {
@@ -4853,6 +5154,7 @@ public class LauncherApp extends Application {
         Button row = new Button(meta.name + (detail.length() == 0 ? "" : "  ·  " + detail));
         row.getStyleClass().addAll("pill-button", "suggest-item");
         row.setMaxWidth(Double.MAX_VALUE);
+        HBox.setHgrow(row, Priority.ALWAYS);
         row.setAlignment(Pos.CENTER_LEFT);
         row.setGraphic(modIconNode(meta.iconPath == null ? null : Path.of(meta.iconPath), 36));
         row.setGraphicTextGap(10);
@@ -4865,7 +5167,59 @@ public class LauncherApp extends Application {
                         + " isn't in the launcher's version list yet.");
             }
         });
-        return row;
+
+        Button deleteBtn = new Button();
+        deleteBtn.setGraphic(icon(IconFactory.Icon.TRASH, 16));
+        deleteBtn.setGraphicTextGap(0);
+        deleteBtn.getStyleClass().add("mod-delete-button");
+        deleteBtn.setTooltip(new Tooltip("Delete this modpack and its mods"));
+        deleteBtn.setOnAction(e -> {
+            Alert confirm = new Alert(Alert.AlertType.CONFIRMATION,
+                    "Delete \"" + meta.name + "\"?\nIts mods and every file installed for this modpack "
+                            + "will be removed permanently. Shared singleplayer worlds are not touched.",
+                    ButtonType.CANCEL, ButtonType.OK);
+            confirm.setHeaderText("Delete modpack");
+            var pick = confirm.showAndWait();
+            if (pick.isEmpty() || pick.get() != ButtonType.OK) return;
+            popup.hide();
+            deleteInstalledModpack(meta);
+        });
+
+        HBox rowBox = new HBox(6, row, deleteBtn);
+        rowBox.setAlignment(Pos.CENTER_LEFT);
+        rowBox.setMaxWidth(Double.MAX_VALUE);
+        return rowBox;
+    }
+
+    /** Deletes an installed modpack's entire instance folder (modpack.json, mods, config, etc.).
+     *  The instance's {@code saves/} is a link into the shared saves pool (see SharedSaves), never
+     *  the worlds themselves, so this walk deletes the link but never touches shared world data. */
+    private void deleteInstalledModpack(ModpackMeta meta) {
+        try {
+            Path instanceDir = ModpackMeta.instanceDirFor(gameFiles.root, meta.mcVersion, meta.loader);
+            deleteFileTree(instanceDir);
+            log("Deleted modpack \"" + meta.name + "\" and its mods.");
+            refreshModpackButtonIcon(versionBox.getValue(), modLoaderBox.getValue());
+        } catch (Exception ex) {
+            log("Failed to delete modpack \"" + meta.name + "\": " + ex.getMessage());
+        }
+    }
+
+    /** Recursively deletes a directory tree. Never follows symbolic links/junctions -- a linked
+     *  child (e.g. an instance's saves/ pointing at the shared saves pool) has only the link itself
+     *  removed, so files reachable solely through that link are left untouched. */
+    private void deleteFileTree(Path root) throws java.io.IOException {
+        if (!java.nio.file.Files.exists(root, java.nio.file.LinkOption.NOFOLLOW_LINKS)) return;
+        try (var stream = java.nio.file.Files.walk(root)) {
+            stream.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                try {
+                    java.nio.file.Files.delete(p);
+                } catch (java.io.IOException ignored) {
+                    // Best-effort, same as elsewhere in this codebase -- leave anything that can't
+                    // be removed (e.g. a file locked by a still-running game) rather than failing.
+                }
+            });
+        }
     }
 
     /** File picker for a pack file (folder picks go through drag & drop), then the installer window. */
@@ -5392,12 +5746,97 @@ public class LauncherApp extends Application {
         fixStatus.setVisible(false);
         fixStatus.setManaged(false);
 
+        // ---- Bulk selection: a "Select All" checkbox plus a per-row checkbox lets several mods
+        // be picked at once, revealing a toolbar to delete / enable / disable / fix / update all of
+        // them together instead of one at a time. Locked (bundled) mods are never selectable, same
+        // as they're excluded from the per-row enable/delete controls above. ----
+        java.util.Set<String> selectedFiles = new java.util.LinkedHashSet<>();
+        java.util.Set<String> problemFiles = new java.util.LinkedHashSet<>();
+        @SuppressWarnings("unchecked")
+        List<String>[] selectableFilesHolder = new List[]{ List.<String>of() };
+        Runnable[] updateSelectionUiHolder = new Runnable[1];
+
+        CheckBox selectAllBox = new CheckBox("Select All");
+        selectAllBox.getStyleClass().add("mod-checkbox");
+        selectAllBox.setVisible(false);
+        selectAllBox.setManaged(false);
+
+        Label selectedCountLabel = new Label();
+        selectedCountLabel.getStyleClass().add("notice-label");
+
+        Region selectionSpacer = new Region();
+        HBox.setHgrow(selectionSpacer, Priority.ALWAYS);
+
+        HBox selectionHeader = new HBox(12, selectAllBox, selectedCountLabel, selectionSpacer);
+        selectionHeader.setAlignment(Pos.CENTER_LEFT);
+        selectionHeader.setVisible(false);
+        selectionHeader.setManaged(false);
+
+        Button deleteSelectedBtn = new Button();
+        setButtonIcon(deleteSelectedBtn, IconFactory.Icon.TRASH, "Delete Selected");
+        deleteSelectedBtn.getStyleClass().add("pill-button");
+
+        Button applySelectedBtn = new Button("Apply Selected");
+        applySelectedBtn.getStyleClass().add("pill-button");
+        applySelectedBtn.setTooltip(new Tooltip("Enable every selected mod"));
+
+        Button unapplySelectedBtn = new Button("Unapply Selected");
+        unapplySelectedBtn.getStyleClass().add("pill-button");
+        unapplySelectedBtn.setTooltip(new Tooltip("Disable every selected mod"));
+
+        // Only shown while at least one SELECTED mod is one of the incompatible ones tracked in
+        // problemFiles (populated by refreshFixStatus below) -- "only if they have a problem".
+        Button fixSelectedBtn = new Button();
+        setButtonIcon(fixSelectedBtn, IconFactory.Icon.TOOLS, "Fix Selected");
+        fixSelectedBtn.getStyleClass().addAll("pill-button", "fix-button");
+        fixSelectedBtn.setVisible(false);
+        fixSelectedBtn.setManaged(false);
+
+        Button updateSelectedBtn = new Button("Update Selected");
+        updateSelectedBtn.getStyleClass().add("pill-button");
+        updateSelectedBtn.setTooltip(new Tooltip("Download the newest compatible version of every selected mod"));
+
+        HBox bulkActionsBar = new HBox(8, deleteSelectedBtn, applySelectedBtn, unapplySelectedBtn,
+                fixSelectedBtn, updateSelectedBtn);
+        bulkActionsBar.setAlignment(Pos.CENTER_LEFT);
+        bulkActionsBar.setVisible(false);
+        bulkActionsBar.setManaged(false);
+
+        VBox selectionBox = new VBox(8, selectionHeader, bulkActionsBar);
+
+        Runnable updateSelectionUi = () -> {
+            boolean any = !selectedFiles.isEmpty();
+            bulkActionsBar.setVisible(any);
+            bulkActionsBar.setManaged(any);
+            selectedCountLabel.setText(any ? selectedFiles.size() + " selected" : "");
+            boolean canFix = selectedFiles.stream().anyMatch(problemFiles::contains);
+            fixSelectedBtn.setVisible(canFix);
+            fixSelectedBtn.setManaged(canFix);
+
+            List<String> selectable = selectableFilesHolder[0];
+            selectAllBox.setVisible(!selectable.isEmpty());
+            selectAllBox.setManaged(!selectable.isEmpty());
+            selectionHeader.setVisible(!selectable.isEmpty());
+            selectionHeader.setManaged(!selectable.isEmpty());
+            boolean allSelected = !selectable.isEmpty() && selectedFiles.containsAll(selectable);
+            selectAllBox.setSelected(allSelected); // pure state sync -- listener below re-fires safely either way
+            selectAllBox.setIndeterminate(any && !allSelected);
+        };
+        updateSelectionUiHolder[0] = updateSelectionUi;
+
+        selectAllBox.setOnAction(e -> {
+            if (selectAllBox.isSelected()) selectedFiles.addAll(selectableFilesHolder[0]);
+            else selectedFiles.clear();
+            updateSelectionUiHolder[0].run();
+        });
+
         Runnable[] refreshHolder = new Runnable[1];
         Runnable refresh = () -> {
             rowsBox.getChildren().clear();
             try {
                 var list = mods.list();
                 java.util.Set<String> lockedFamiliesShown = new java.util.HashSet<>();
+                List<String> selectable = new ArrayList<>();
                 for (var m : list) {
                     // A real sodium-*.jar/embeddium-*.jar or fabric-api-*.jar (auto-installed
                     // for DEY, see SodiumInstaller/FabricApiInstaller) is locked from the
@@ -5425,8 +5864,13 @@ public class LauncherApp extends Application {
                             continue;
                         }
                     }
-                    rowsBox.getChildren().add(buildModRow(m, mods, refreshHolder[0], family != null));
+                    boolean locked = family != null;
+                    if (!locked) selectable.add(m.fileName());
+                    rowsBox.getChildren().add(buildModRow(m, mods, refreshHolder[0], locked,
+                            selectedFiles, updateSelectionUiHolder[0]));
                 }
+                selectableFilesHolder[0] = selectable;
+                selectedFiles.retainAll(selectable); // a selected mod that vanished (deleted/renamed) drops out
                 // Best-effort: attach Modrinth icons (+ click-through pages) to installed mods by
                 // matching their display names, in the background so the list never blocks.
                 if (!list.isEmpty()) enrichModIconsAsync(mods, list, refreshHolder[0]);
@@ -5439,7 +5883,8 @@ public class LauncherApp extends Application {
                 }
                 // Reveal/hide the Fix button based on whether any installed mod is incompatible
                 // with the currently selected Minecraft version. Runs in the background.
-                refreshFixStatus(mods, list, fixBtn, fixStatus, mcVersion);
+                refreshFixStatus(mods, list, fixBtn, fixStatus, mcVersion, problemFiles, updateSelectionUiHolder[0]);
+                updateSelectionUiHolder[0].run();
             } catch (Exception ex) {
                 log("Failed to list mods: " + ex.getMessage());
             }
@@ -5482,7 +5927,53 @@ public class LauncherApp extends Application {
 
         fixBtn.setOnAction(e -> runFixIncompatibleMods(mods, fixBtn, fixStatus, refresh, mcVersion));
 
-        VBox content = new VBox(12, dropZone, fixStatus, scroll, buttonRow);
+        deleteSelectedBtn.setOnAction(e -> {
+            if (selectedFiles.isEmpty()) return;
+            Alert confirm = new Alert(Alert.AlertType.CONFIRMATION,
+                    "Delete " + selectedFiles.size() + " selected mod(s)? This can't be undone.",
+                    ButtonType.CANCEL, ButtonType.OK);
+            confirm.setHeaderText("Delete selected mods");
+            var pick = confirm.showAndWait();
+            if (pick.isEmpty() || pick.get() != ButtonType.OK) return;
+            for (String fileName : new ArrayList<>(selectedFiles)) {
+                try {
+                    mods.delete(fileName);
+                } catch (Exception ex) {
+                    log("Failed to delete " + fileName + ": " + ex.getMessage());
+                }
+            }
+            selectedFiles.clear();
+            refresh.run();
+        });
+
+        applySelectedBtn.setOnAction(e -> {
+            for (String fileName : selectedFiles) {
+                try {
+                    mods.setEnabled(fileName, true);
+                } catch (Exception ex) {
+                    log("Failed to apply " + fileName + ": " + ex.getMessage());
+                }
+            }
+            refresh.run();
+        });
+
+        unapplySelectedBtn.setOnAction(e -> {
+            for (String fileName : selectedFiles) {
+                try {
+                    mods.setEnabled(fileName, false);
+                } catch (Exception ex) {
+                    log("Failed to unapply " + fileName + ": " + ex.getMessage());
+                }
+            }
+            refresh.run();
+        });
+
+        fixSelectedBtn.setOnAction(e -> runFixOrUpdateSelected(
+                mods, selectedFiles, problemFiles, mcVersion, true, refresh, fixSelectedBtn));
+        updateSelectedBtn.setOnAction(e -> runFixOrUpdateSelected(
+                mods, selectedFiles, problemFiles, mcVersion, false, refresh, updateSelectedBtn));
+
+        VBox content = new VBox(12, dropZone, fixStatus, selectionBox, scroll, buttonRow);
         content.setPadding(new Insets(20));
         content.getStyleClass().add("mods-dialog-content");
         VBox.setVgrow(scroll, Priority.ALWAYS);
@@ -5927,35 +6418,54 @@ public class LauncherApp extends Application {
      */
     private void refreshFixStatus(ModsManager mods, List<ModsManager.ModEntry> list,
                                   Button fixBtn, Label fixStatus, String mcVersion) {
+        refreshFixStatus(mods, list, fixBtn, fixStatus, mcVersion, new java.util.LinkedHashSet<>(), null);
+    }
+
+    /**
+     * Same compatibility scan as above, but also fills {@code problemFiles} with the filename of
+     * every non-bundled mod found incompatible with {@code mcVersion} -- the Mods window's
+     * selection toolbar uses that set to decide whether "Fix Selected" should be shown (only when
+     * the current selection actually includes at least one problem mod). {@code onDone}, if given,
+     * runs once the scan settles (success, failure, or nothing to scan) so the caller can refresh
+     * anything that depends on {@code problemFiles}.
+     */
+    private void refreshFixStatus(ModsManager mods, List<ModsManager.ModEntry> list,
+                                  Button fixBtn, Label fixStatus, String mcVersion,
+                                  java.util.Set<String> problemFiles, Runnable onDone) {
         java.util.List<ModsManager.ModEntry> candidates = list.stream()
                 .filter(m -> !isBundledFamily(m.fileName()))
                 .toList();
+        problemFiles.clear();
         if (candidates.isEmpty() || mcVersion == null || mcVersion.isBlank()) {
             hideFixControls(fixBtn, fixStatus);
+            if (onDone != null) onDone.run();
             return;
         }
-        Task<Boolean> task = new Task<>() {
+        Task<java.util.Set<String>> task = new Task<>() {
             @Override
-            protected Boolean call() {
+            protected java.util.Set<String> call() {
                 ModrinthClient client = new ModrinthClient();
+                java.util.Set<String> problems = new java.util.LinkedHashSet<>();
                 for (var m : candidates) {
                     String slug = resolveModSlug(client, mods, m);
                     if (slug == null) continue; // can't identify the project -> leave untouched
                     try {
                         var compatible = client.compatibleVersionsLenient(slug, mcVersion);
-                        if (compatible.isEmpty()) return true; // no build for this MC version -> incompatible
+                        if (compatible.isEmpty()) { problems.add(m.fileName()); continue; } // no build for this MC version -> incompatible
                         boolean installedMatches = compatible.stream()
                                 .anyMatch(v -> ModrinthClient.versionFileMatches(v, m.fileName()));
-                        if (!installedMatches) return true; // a compatible version exists but installed build is stale/wrong
+                        if (!installedMatches) problems.add(m.fileName()); // compatible version exists but installed build is stale/wrong
                     } catch (Exception ignored) {
                         // Couldn't reach Modrinth for this one -- keep checking the rest.
                     }
                 }
-                return false;
+                return problems;
             }
         };
         task.setOnSucceeded(e -> Platform.runLater(() -> {
-            boolean fix = Boolean.TRUE.equals(task.getValue());
+            java.util.Set<String> problems = task.getValue();
+            problemFiles.addAll(problems);
+            boolean fix = !problems.isEmpty();
             fixBtn.setVisible(fix);
             fixBtn.setManaged(fix);
             fixStatus.setVisible(fix);
@@ -5965,9 +6475,95 @@ public class LauncherApp extends Application {
                         + ". Click Fix Mods to convert them to a working version (or remove them if "
                         + "no compatible version exists).");
             }
+            if (onDone != null) onDone.run();
         }));
-        task.setOnFailed(e -> Platform.runLater(() -> hideFixControls(fixBtn, fixStatus)));
+        task.setOnFailed(e -> Platform.runLater(() -> {
+            hideFixControls(fixBtn, fixStatus);
+            if (onDone != null) onDone.run();
+        }));
         new Thread(task, "mod-compat-scan").start();
+    }
+
+    /**
+     * The Mods window's selection-toolbar version of the Fix action: "Fix Selected" converts only
+     * the SELECTED mods that are actually incompatible (removing any with no compatible build for
+     * the current Minecraft version); "Update Selected" grabs the newest compatible build for every
+     * selected mod that isn't already on it, but never deletes one just because Modrinth has
+     * nothing newer for it. Bundled mods are skipped even if somehow selected. Runs in the
+     * background, same pattern as {@link #runFixIncompatibleMods}.
+     */
+    private void runFixOrUpdateSelected(ModsManager mods, java.util.Set<String> selectedFiles,
+                                        java.util.Set<String> problemFiles, String mcVersion,
+                                        boolean fixOnly, Runnable refresh, Button triggerBtn) {
+        if (mcVersion == null || mcVersion.isBlank() || selectedFiles.isEmpty()) return;
+        List<String> targets = new ArrayList<>(selectedFiles);
+        java.util.Set<String> problemsSnapshot = new java.util.LinkedHashSet<>(problemFiles);
+        triggerBtn.setDisable(true);
+        Task<String> task = new Task<>() {
+            @Override
+            protected String call() {
+                ModrinthClient client = new ModrinthClient();
+                StringBuilder detail = new StringBuilder();
+                int changed = 0, removed = 0, skipped = 0;
+                try {
+                    java.util.Map<String, ModsManager.ModEntry> byFileName = new java.util.HashMap<>();
+                    for (var m : mods.list()) byFileName.put(m.fileName(), m);
+                    for (String fileName : targets) {
+                        if (fixOnly && !problemsSnapshot.contains(fileName)) { skipped++; continue; }
+                        ModsManager.ModEntry m = byFileName.get(fileName);
+                        if (m == null || isBundledFamily(m.fileName())) { skipped++; continue; }
+                        String slug = resolveModSlug(client, mods, m);
+                        if (slug == null) { skipped++; continue; }
+                        try {
+                            var compatible = client.compatibleVersionsLenient(slug, mcVersion);
+                            if (compatible.isEmpty()) {
+                                if (fixOnly) {
+                                    mods.delete(m.fileName());
+                                    removed++;
+                                    detail.append("  • Removed ").append(m.fileName())
+                                            .append(" -- no version supports ").append(mcVersion).append(".\n");
+                                } else {
+                                    skipped++;
+                                }
+                                continue;
+                            }
+                            boolean installedMatches = compatible.stream()
+                                    .anyMatch(v -> ModrinthClient.versionFileMatches(v, m.fileName()));
+                            if (installedMatches) { skipped++; continue; } // already the newest compatible build
+                            var target = compatible.get(0); // newest compatible
+                            Path downloaded = client.download(target, mods.modsDir());
+                            try { deleteJarsForSlug(mods.modsDir(), slug, downloaded); } catch (Exception ignored) {}
+                            try {
+                                if (!downloaded.getFileName().toString().equals(m.fileName())) mods.delete(m.fileName());
+                            } catch (Exception ignored) {}
+                            changed++;
+                            detail.append("  • ").append(fixOnly ? "Converted " : "Updated ")
+                                    .append(m.displayName()).append(" to version ")
+                                    .append(target.versionNumber()).append(".\n");
+                        } catch (Exception ex) {
+                            skipped++;
+                        }
+                    }
+                } catch (Exception ex) {
+                    return "ERROR\n" + ex.getMessage();
+                }
+                return "FIXED " + changed + "\nREMOVED " + removed + "\n" + detail;
+            }
+        };
+        task.setOnSucceeded(ev -> Platform.runLater(() -> {
+            triggerBtn.setDisable(false);
+            String result = task.getValue();
+            selectedFiles.clear();
+            refresh.run();
+            if (result != null && !result.startsWith("ERROR")) log(result.replace('\n', ' '));
+            new Alert(Alert.AlertType.INFORMATION, formatFixResult(result), ButtonType.OK).showAndWait();
+        }));
+        task.setOnFailed(ev -> Platform.runLater(() -> {
+            triggerBtn.setDisable(false);
+            selectedFiles.clear();
+            refresh.run();
+        }));
+        new Thread(task, fixOnly ? "mod-fix-selected" : "mod-update-selected").start();
     }
 
     /** Resolves an installed mod to its Modrinth slug: metadata id first, display-name search as a fallback. */
@@ -6770,7 +7366,29 @@ public class LauncherApp extends Application {
     /** locked=true (a real sodium-*.jar under a DEY instance) shows a lock icon and a
      * "BUNDLED" badge instead of the enable checkbox and delete button -- it's a real jar
      * like any other, just not one the player is meant to disable or remove by hand. */
-    private HBox buildModRow(ModsManager.ModEntry mod, ModsManager mods, Runnable refresh, boolean locked) {
+    private HBox buildModRow(ModsManager.ModEntry mod, ModsManager mods, Runnable refresh, boolean locked,
+                              java.util.Set<String> selectedFiles, Runnable onSelectionChange) {
+        // Bulk-selection checkbox, separate from the enable/disable checkbox below -- checking it
+        // adds this mod to the Mods window's multi-select (Delete/Apply/Unapply/Fix/Update Selected)
+        // without touching whether the mod itself is enabled. Locked (bundled) mods aren't
+        // selectable, same as they're excluded from every other per-row control.
+        Node selectBox;
+        if (locked) {
+            Region lockedSpacer = new Region();
+            lockedSpacer.setPrefWidth(18);
+            selectBox = lockedSpacer;
+        } else {
+            CheckBox pick = new CheckBox();
+            pick.getStyleClass().add("mod-checkbox");
+            pick.setSelected(selectedFiles.contains(mod.fileName()));
+            pick.setOnAction(e -> {
+                if (pick.isSelected()) selectedFiles.add(mod.fileName());
+                else selectedFiles.remove(mod.fileName());
+                if (onSelectionChange != null) onSelectionChange.run();
+            });
+            selectBox = pick;
+        }
+
         Node leading;
         if (locked) {
             Node lockIcon = icon(IconFactory.Icon.LOCK, 18);
@@ -6854,7 +7472,7 @@ public class LauncherApp extends Application {
             trailing = trailingBox;
         }
 
-        HBox row = new HBox(14, iconTile, leading, textBox, spacer, trailing);
+        HBox row = new HBox(14, selectBox, iconTile, leading, textBox, spacer, trailing);
         row.setAlignment(Pos.CENTER_LEFT);
         row.getStyleClass().add("mod-row");
         if (locked) row.getStyleClass().add("mod-row-locked");
@@ -7040,14 +7658,45 @@ public class LauncherApp extends Application {
                 content.getChildren().add(offlineNote);
             }
 
-            CheckBox invisibleBox = new CheckBox("Appear offline to friends (invisible mode)");
-            invisibleBox.setSelected(prefs.invisibleMode);
-            invisibleBox.selectedProperty().addListener((o, a, b) -> {
+            // ---- Appear offline (invisible mode) -------------------------------------------------
+            // One gold card instead of a checkbox buried in a list of account details: this single
+            // switch decides what EVERY friend sees about you, so it gets the accent and a sentence
+            // spelling out exactly what it does. Publishing OFFLINE also clears the shared address and
+            // play state in the same write (see currentPresence), so nobody keeps seeing a server the
+            // user already left, and friends who are offline can be joined by nobody.
+            ToggleButton invisibleToggle = new ToggleButton();
+            invisibleToggle.getStyleClass().add("gold-switch");
+            invisibleToggle.setSelected(prefs.invisibleMode);
+            invisibleToggle.setFocusTraversable(false);
+            Label invisibleTitle = new Label();
+            invisibleTitle.getStyleClass().add("gold-card-title");
+            Region invisibleSpacer = new Region();
+            HBox.setHgrow(invisibleSpacer, Priority.ALWAYS);
+            HBox invisibleHead = new HBox(10, invisibleTitle, invisibleSpacer, invisibleToggle);
+            invisibleHead.setAlignment(Pos.CENTER_LEFT);
+            Label invisibleNote = new Label();
+            invisibleNote.getStyleClass().add("gold-card-note");
+            invisibleNote.setWrapText(true);
+            VBox invisibleCard = new VBox(8, invisibleHead, invisibleNote);
+            invisibleCard.getStyleClass().add("gold-card");
+            Runnable syncInvisibleCard = () -> {
+                boolean hidden = prefs.invisibleMode;
+                invisibleTitle.setText(hidden ? "You appear offline" : "Appear offline");
+                invisibleToggle.setText(hidden ? "ON" : "OFF");
+                invisibleNote.setText(hidden
+                        ? "Friends see you as offline. They never see your server."
+                        : "Friends see when you're online, and what you're playing.");
+                invisibleCard.getStyleClass().remove("gold-card-on");
+                if (hidden) invisibleCard.getStyleClass().add("gold-card-on");
+            };
+            invisibleToggle.selectedProperty().addListener((o, a, b) -> {
                 prefs.invisibleMode = b;
                 prefs.save();
                 publishPresenceQuietly(); // reflect the change immediately, not just on next app start
+                syncInvisibleCard.run();
             });
-            content.getChildren().add(invisibleBox);
+            syncInvisibleCard.run();
+            content.getChildren().add(invisibleCard);
 
             // ---- Friend-profile socials (published so friends can see them on your profile) ----
             if (friendsService != null) {
@@ -8309,10 +8958,10 @@ public class LauncherApp extends Application {
         grid.add(sectionLabel("FRIENDS"), 0, row++, 2, 1);
         CheckBox shareAddressBox = new CheckBox("Share my current server address with friends");
         shareAddressBox.setSelected(prefs.shareServerAddress);
-        Label addressNote = new Label("Turned on, the address you're playing on is published to friends "
-                + "automatically -- there's nothing to type. It fills itself with the last server you "
-                + "joined (any external server such as mc.example.com:25565, or your own DEY server's "
-                + "tunnel address). Ignored entirely while invisible mode (Account tab) is on.");
+        Label addressNote = new Label("Turned on, the server you're on right now is published to friends "
+                + "automatically -- there's nothing to type. Only a live game session publishes anything: "
+                + "sitting in the launcher, or playing single player, never shows a server. Ignored "
+                + "entirely while invisible mode (Account tab) is on.");
         addressNote.getStyleClass().add("notice-label");
         addressNote.setWrapText(true);
         shareAddressBox.selectedProperty().addListener((o, a, b) -> {
@@ -8508,6 +9157,11 @@ public class LauncherApp extends Application {
                         + (modLoader.equals("Vanilla") ? "" : "-" + modLoader.toLowerCase()));
                 java.nio.file.Files.createDirectories(gameDir);
 
+                // Every DEY and VANILLA instance, any Minecraft version, shares one pool of
+                // singleplayer worlds -- see SharedSaves. Everything else about the instance
+                // (mods, config, options, etc.) stays exactly as isolated as before.
+                com.deylauncher.launch.SharedSaves.ensureShared(files.root, gameDir);
+
                 // DeyCapes mod integration: hand the github repo credentials to the installed mod so
                 // it can fetch the capes.json map + cape textures for the private repo at runtime.
                 // Only for DEY builds (the only ones that bundle DeyCapes). Best-effort.
@@ -8552,20 +9206,55 @@ public class LauncherApp extends Application {
                 report.accept(1.0); // "Minecraft open" -- bar is fully done
                 Platform.runLater(() -> launchProgress.finishLaunch());
 
+                // The live session tracker turns the game's own console output into play state (see
+                // ServerSessionTracker): it knows a proxy region hand-off is not a disconnect, that
+                // single player is not a server, and that leaving a server prints no "disconnect" line
+                // at all. quickPlayTarget (a Friends > Join, or a server card's Join) starts it off
+                // already on that server until the game's own log says otherwise.
+                ServerSessionTracker tracker = new ServerSessionTracker(session.username(), quickPlayTarget);
+                java.util.concurrent.atomic.AtomicBoolean sessionAlive = new java.util.concurrent.atomic.AtomicBoolean(true);
+                java.util.function.Consumer<ServerSessionTracker.Event> onSessionEvent = event ->
+                        Platform.runLater(() -> applySessionEvent(event, tracker));
+                // A real "Disconnect" can be followed by total log silence (verified: one line, then
+                // nothing for twelve minutes), so a line-only state machine would stay stuck on a
+                // server you already left. This light ticker lets the tracker's grace window expire.
+                Thread presenceTick = new Thread(() -> {
+                    while (sessionAlive.get() && appRunning) {
+                        try {
+                            Thread.sleep(PRESENCE_TICK_MS);
+                        } catch (InterruptedException ignored) {
+                            return;
+                        }
+                        if (!sessionAlive.get()) return;
+                        if (tracker.poll(System.currentTimeMillis()) != ServerSessionTracker.Event.NONE) {
+                            onSessionEvent.accept(ServerSessionTracker.Event.LEFT);
+                        }
+                    }
+                }, "presence-session-tick");
+                presenceTick.setDaemon(true);
+                presenceTick.start();
+
                 // Self-healing: on machines whose GPU can't provide OpenGL 3.3 (the classic Linux
                 // "GLXBadFBConfig" / "Driver does not support OpenGL 3.3" crash), retry ONCE with Mesa
                 // software rendering enabled, so the game gets a window even when the software-rendering
                 // setting was left off. Only fires when the first attempt actually died from that
                 // signature (runGameAndWait's diagnosis is null on a normal exit), and it flips the
                 // toggle only for this single retry -- it is never persisted or forced on healthy runs.
-                LaunchOutcome first = runGameAndWait(prepared, session, gameDir, settings, javaBinary, quickPlayTarget);
+                LaunchOutcome first = runGameAndWait(prepared, session, gameDir, settings, javaBinary, quickPlayTarget, tracker, onSessionEvent);
                 if (first.diagnosis() != null && !settings.softwareOpenGl()) {
                     Platform.runLater(() -> log("Retrying once with software rendering (compatibility) enabled..."));
                     GameLauncher.LaunchSettings compat = new GameLauncher.LaunchSettings(
                             settings.ramMinMb(), settings.ramMaxMb(), settings.width(), settings.height(),
                             settings.fullscreen(), true);
-                    runGameAndWait(prepared, session, gameDir, compat, javaBinary, quickPlayTarget);
+                    runGameAndWait(prepared, session, gameDir, compat, javaBinary, quickPlayTarget, tracker, onSessionEvent);
                 }
+                // The game process (whichever attempt actually ran last) has now exited, so this
+                // session is over: reset the tracker and stop advertising wherever it last was. This is
+                // the case that used to leave presence claiming a server forever, because the address
+                // was kept on disk (see rememberCurrentlyJoined's doc).
+                sessionAlive.set(false);
+                tracker.processExited();
+                Platform.runLater(LauncherApp.this::setLiveInLauncher);
                 return null;
             }
         };
@@ -8589,6 +9278,12 @@ public class LauncherApp extends Application {
             launchProgress.setManaged(false);
             launchProgress.setVisible(false);
             log("Error: " + task.getException());
+            // The launch never got anywhere (bad download, no runtime, a process that died before it
+            // could tell us anything), so the "heading to <server>" presence published just before it
+            // (see rememberCurrentlyJoined in play()) must not outlive it -- otherwise friends keep
+            // seeing a server we never actually reached until the launcher is restarted, which is the
+            // exact bug the live session state replaced.
+            setLiveInLauncher();
         });
         new Thread(task, "play-task").start();
     }
@@ -8604,9 +9299,17 @@ public class LauncherApp extends Application {
      * Launches the game and streams its output into the log, keeping a bounded recent-output tail so a
      * native/GL crash can be explained (see {@link LaunchDiagnostics}) instead of just showing the raw
      * exit code. Returns the exit code and diagnosis so the caller can decide whether to self-heal.
+     *
+     * <p>Every line is also fed to {@code tracker} (see {@link ServerSessionTracker}), and any state
+     * change it reports is handed to {@code onSessionEvent} -- which is how a server joined by hand
+     * from Minecraft's own Multiplayer screen, a proxy region hand-off, a single-player world, and a
+     * plain "Disconnect" all end up reflected in what friends see. Both parameters may be null (a
+     * caller that doesn't care about presence).
      */
     private LaunchOutcome runGameAndWait(GameFiles.PreparedVersion prepared, AuthSession session, Path gameDir,
-                                         GameLauncher.LaunchSettings s, Path javaBinary, String quickPlayTarget) throws Exception {
+                                         GameLauncher.LaunchSettings s, Path javaBinary, String quickPlayTarget,
+                                         ServerSessionTracker tracker,
+                                         java.util.function.Consumer<ServerSessionTracker.Event> onSessionEvent) throws Exception {
         Process process = new GameLauncher().launch(prepared, session, gameDir, s, javaBinary.toString(), quickPlayTarget);
 
         // Keep a bounded recent-output tail so that, if the game ends in a native/GL crash, we can
@@ -8619,6 +9322,10 @@ public class LauncherApp extends Application {
                 Platform.runLater(() -> log(finalLine));
                 recent.addLast(finalLine);
                 if (recent.size() > 120) recent.pollFirst();
+                if (tracker != null && onSessionEvent != null) {
+                    ServerSessionTracker.Event event = tracker.feed(finalLine, System.currentTimeMillis());
+                    if (event != ServerSessionTracker.Event.NONE) onSessionEvent.accept(event);
+                }
             }
         }
         int exit = process.waitFor();
