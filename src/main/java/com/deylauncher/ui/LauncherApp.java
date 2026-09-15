@@ -278,6 +278,21 @@ public class LauncherApp extends Application {
         publishPresenceQuietly();
         startPresenceTasks();
         checkForUpdatesAsync();
+        reportPreviousUpdateResult();
+    }
+
+    /** If the previous run ended in a self-update, the restart helper left a one-line verdict behind.
+     *  Show it once (and clear it) when it says the update did NOT go through -- otherwise a failed
+     *  swap just looks like the launcher coming back up on the same version for no reason, which is
+     *  indistinguishable from the update doing nothing at all. */
+    private void reportPreviousUpdateResult() {
+        String result = AppUpdater.consumeUpdateResult();
+        if (result == null || result.regionMatches(true, 0, "OK", 0, 2)) return;
+        Platform.runLater(() -> new Alert(Alert.AlertType.WARNING,
+                "The last update couldn't be applied, so DeyLauncher is still on "
+                        + AppUpdater.currentVersion() + ".\n\n" + result
+                        + "\n\nFull log: " + AppUpdater.updateLogFile(),
+                ButtonType.OK).show());
     }
 
     /**
@@ -769,10 +784,19 @@ public class LauncherApp extends Application {
             // this user cannot write to (e.g. the zip was unzipped into Program Files) would otherwise
             // fail completely silently -- the old build just relaunches with the same version. Probe it
             // here so the user gets a real explanation instead of a no-op update.
+            // The PARENT matters just as much as the install dir itself: the helper applies the update
+            // by renaming <installRoot> to <installRoot>.old and putting the new build in its place,
+            // and both of those are writes into the parent folder.
             try {
                 Path writeProbe = layout.installRoot().resolve(".deylauncher-write-test");
                 Files.writeString(writeProbe, "ok");
                 Files.deleteIfExists(writeProbe);
+                Path parent = layout.installRoot().getParent();
+                if (parent != null) {
+                    Path parentProbe = parent.resolve(".deylauncher-write-test");
+                    Files.writeString(parentProbe, "ok");
+                    Files.deleteIfExists(parentProbe);
+                }
             } catch (Exception notWritable) {
                 Platform.runLater(() -> {
                     updateBtn.setDisable(false);
@@ -784,7 +808,7 @@ public class LauncherApp extends Application {
                 return;
             }
             Platform.runLater(() -> updateStatus.setText("Extracting update..."));
-            Path staging = Files.createTempDirectory("DeyLauncher-extract");
+            Path staging = AppUpdater.createStagingRoot(layout);
             Path stagingApp = AppUpdater.extractTo(downloaded, staging, layout.windows());
             Platform.runLater(() -> updateStatus.setText("Preparing restart..."));
             Path helper = AppUpdater.writeRestartScript(layout, stagingApp, staging,

@@ -100,14 +100,40 @@ class AppUpdaterTest {
     }
 
     @Test
-    void windowsRestartScriptBacksUpVerifiesAndRollsBack() {
+    void windowsRestartScriptRenamesTheOldInstallAsideAndNeverMirrorsOverALiveOne() {
         String s = AppUpdater.restartScript(windowsLayout(),
                 Path.of("C:\\Temp\\dl-extract\\DeyLauncher"), Path.of("C:\\Temp\\dl-extract"), 7L);
+        assertTrue(s.contains("move \"%APP_DIR%\" \"%OLD%\""), s);
+        assertTrue(s.contains("move \"%STAGING%\" \"%APP_DIR%\""),
+                "the staged image should be renamed into place when it's on the same volume:\n" + s);
         assertTrue(s.contains("robocopy \"%STAGING%\" \"%APP_DIR%\" /E"), s);
-        assertTrue(s.contains("robocopy \"%STAGING%\" \"%APP_DIR%\" /MIR"), s);
-        assertTrue(s.contains("if errorlevel 8 goto rollback"), s);
+        assertFalse(s.contains("/MIR"),
+                "mirroring over a still-locked install is what half-applied the update -- "
+                        + "the new jar landed while DeyLauncher.cfg kept pointing at the old one:\n" + s);
+        assertTrue(s.contains("goto lockedout"),
+                "if the install dir can't be renamed aside, the helper must give up untouched:\n" + s);
+    }
+
+    @Test
+    void windowsRestartScriptVerifiesTheCfgAndNotJustTheJar() {
+        String s = AppUpdater.restartScript(windowsLayout(),
+                Path.of("C:\\Temp\\dl-extract\\DeyLauncher"), Path.of("C:\\Temp\\dl-extract"), 7L);
         assertTrue(s.contains("%APP_DIR%\\app\\%EXPECT_JAR%"), s);
-        assertTrue(s.contains("if exist \"%OLD%\" move \"%OLD%\" \"%APP_DIR%\""), s);
+        // app\DeyLauncher.cfg carries the classpath: a new jar next to a stale cfg still boots the
+        // OLD build, which is exactly the "updated but same version" symptom.
+        assertTrue(s.contains("find /I \"%EXPECT_JAR%\" \"%APP_DIR%\\app\\DeyLauncher.cfg\""), s);
+        assertTrue(s.contains("if errorlevel 1 goto rollback"), s);
+    }
+
+    @Test
+    void windowsRestartScriptOnlyDeletesTheInstallWhenABackupExists() {
+        String s = AppUpdater.restartScript(windowsLayout(),
+                Path.of("C:\\Temp\\dl-extract\\DeyLauncher"), Path.of("C:\\Temp\\dl-extract"), 7L);
+        int guard = s.indexOf("if not exist \"%OLD%\\DeyLauncher.exe\" goto rollbackdone");
+        int wipe = s.indexOf("rd /s /q \"%APP_DIR%\"");
+        assertTrue(guard >= 0, "rollback must check for a backup first:\n" + s);
+        assertTrue(wipe > guard, "the install dir must never be wiped without a backup to restore:\n" + s);
+        assertTrue(s.contains("move \"%OLD%\" \"%APP_DIR%\""), s);
         assertTrue(s.contains("start \"\" /D \"%APP_DIR%\" \"%APP_DIR%\\DeyLauncher.exe\""), s);
     }
 
