@@ -12,7 +12,7 @@ group = "com.deylauncher"
 // Single source of truth for the app version. It is baked into the jar/resource that
 // AppUpdater.currentVersion() reads at runtime, so the self-updater always knows exactly
 // which version is installed -- and CI's jpackage step discovers this same fat jar by name.
-version = "0.1.7"
+version = "0.1.8"
 
 repositories {
     mavenCentral()
