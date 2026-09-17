@@ -22,7 +22,12 @@ import java.util.function.Consumer;
 public class MicrosoftAuth {
 
     // Registered in Azure Portal -> App registrations -> DeyLauncher
-    private static final String CLIENT_ID = "bef65492-f622-4b08-a124-9535e7b0ffde";
+    /**
+     * This launcher's own Microsoft (Azure) application id. It is also what the game expects for the
+     * {@code --clientId ${clientid}} argument (see GameLauncher's placeholder table), so it is public
+     * on purpose: both the sign-in flow and the launch path must use the same value.
+     */
+    public static final String CLIENT_ID = "bef65492-f622-4b08-a124-9535e7b0ffde";
 
     private static final String SCOPE = "XboxLive.signin offline_access";
     private static final String DEVICE_CODE_URL =

@@ -17,7 +17,7 @@ public class ServerAddonsManager {
     /** Returns "mods", "plugins", or null if this server type has no addon support at all (Vanilla). */
     public static String folderNameFor(ServerType type) {
         return switch (type) {
-            case FABRIC, FORGE -> "mods";
+            case FABRIC, FORGE, NEOFORGE -> "mods";
             case PURPUR -> "plugins";
             case VANILLA -> null;
         };

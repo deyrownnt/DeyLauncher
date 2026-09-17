@@ -61,10 +61,25 @@ public class FriendsService {
      *  "in the launcher" / "single player" instead of inferring it from an address. */
     public void publishPresence(String myUuid, String myUsername, String status, String serverAddress,
                                 String serverName, String serverIconUrl, PlayState playState) throws Exception {
+        publishPresence(myUuid, myUsername, status, serverAddress, serverName, serverIconUrl, playState, true);
+    }
+
+    /**
+     * The full form, with control over whether this write refreshes {@code lastSeen}.
+     *
+     * <p>{@code touchLastSeen} exists purely for "Appear offline": the entry is published as OFFLINE
+     * with nothing in it, and refreshing the timestamp on every heartbeat would still tell anyone who
+     * can read the shared file that the launcher is running. Invisible mode passes false, so it writes
+     * only when the state actually changes; every normal caller passes true, which is what makes
+     * staleness (see LauncherApp's PRESENCE_STALE_MS) mean "their launcher stopped".
+     */
+    public void publishPresence(String myUuid, String myUsername, String status, String serverAddress,
+                                String serverName, String serverIconUrl, PlayState playState,
+                                boolean touchLastSeen) throws Exception {
         repo.sync("presence update", data -> {
             var me = data.getOrCreate(myUuid, myUsername);
             me.status = status;
-            me.lastSeen = System.currentTimeMillis();
+            if (touchLastSeen) me.lastSeen = System.currentTimeMillis();
             me.serverAddress = serverAddress; // null clears it -- e.g. sharing turned off in Settings
             me.currentServerName = serverName;
             me.currentServerIconUrl = serverIconUrl;

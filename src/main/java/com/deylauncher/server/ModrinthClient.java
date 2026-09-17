@@ -24,7 +24,52 @@ import java.util.List;
 public class ModrinthClient {
 
     private static final String API = "https://api.modrinth.com/v2";
-    private final HttpClient http = HttpClient.newHttpClient();
+
+    /**
+     * Modrinth rate-limits per IP with GCRA: 300 requests/minute, i.e. a steady 5/second with a
+     * 300-request burst, and it answers HTTP 429 (with Retry-After / X-Ratelimit-Reset) when you
+     * exceed it. Scanning a big modpack means one or two requests PER MOD, so hundreds of calls in a
+     * row: well past the burst. Without pacing that guaranteed a 429 partway through, which used to
+     * surface as "Couldn't fix your mods" for the whole run. So every request now goes through
+     * {@link #pace()}: one request per 200ms, i.e. exactly Modrinth's steady rate.
+     */
+    private static final long MIN_REQUEST_GAP_MS = 200;
+
+    /** How many times a rate-limited (429/503) request is retried before we give up on it. */
+    private static final int RATE_LIMIT_RETRIES = 3;
+
+    /** Upper bound on any single back-off sleep, so a long Retry-After can't hang the launcher. */
+    private static final long MAX_BACKOFF_MS = 30_000;
+
+    /** Project versions barely change, so the Fix scan / pickers can safely reuse them for a while. */
+    private static final long VERSIONS_CACHE_TTL_MS = 10 * 60 * 1000L;
+
+    /** A project's identity (slug -> project) is stable; cache it so repeat scans cost zero requests. */
+    private static final long PROJECT_CACHE_TTL_MS = 10 * 60 * 1000L;
+
+    /** How long a "not a Modrinth project" answer is remembered -- short, since it can be transient. */
+    private static final long MISS_CACHE_TTL_MS = 60 * 1000L;
+
+    private static final Object PACE_LOCK = new Object();
+    private static long lastRequestAt = 0L;
+
+    private record CachedVersions(long fetchedAt, List<ProjectVersion> versions) { }
+
+    private static final java.util.Map<String, CachedVersions> VERSIONS_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** {@code hit} is null for a remembered miss; {@code ttlMs} differs between hits and misses. */
+    private record CachedProject(long fetchedAt, long ttlMs, Hit hit) { }
+
+    private static final java.util.Map<String, CachedProject> PROJECT_CACHE =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    private final HttpClient http = HttpClient.newBuilder()
+            // Modrinth hands file downloads out through a CDN that redirects, so following redirects
+            // is required here (the JDK default, Redirect.NEVER, would just return the 302).
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .connectTimeout(java.time.Duration.ofSeconds(20))
+            .build();
 
     /** A single search result (a project). */
     public record Hit(String slug, String name, String author, int downloads, String description, String iconUrl) {}
@@ -32,9 +77,28 @@ public class ModrinthClient {
     /** A downloadable file inside a project version. */
     public record FileRef(String url, String filename, long sizeBytes) {}
 
-    /** One published version of a project, with the Minecraft versions it supports and its files. */
+    /** One published version of a project: the Minecraft versions AND loaders it supports, and its files. */
     public record ProjectVersion(String id, String name, String versionNumber,
-                                 List<String> gameVersions, List<FileRef> files) {}
+                                 List<String> gameVersions, List<String> loaders, List<FileRef> files) {
+
+        /** True when this build is published for the loader the caller runs ("Fabric"/"Forge"/...). */
+        public boolean supportsLoader(String loader) {
+            if (loader == null || loader.isBlank()) return true;
+            if (loaders == null || loaders.isEmpty()) return true; // unlabelled: don't rule it out
+            for (String l : loaders) {
+                if (l != null && l.equalsIgnoreCase(loader)) return true;
+            }
+            return false;
+        }
+
+        /** The build's first downloadable jar, or null when it ships none. */
+        public FileRef firstJar() {
+            for (FileRef f : files) {
+                if (f.filename() != null && f.filename().toLowerCase().endsWith(".jar")) return f;
+            }
+            return null;
+        }
+    }
 
     /**
      * The Modrinth project_type string for a server kind: "mod" for Fabric/Forge, "plugin" for
@@ -145,20 +209,48 @@ public class ModrinthClient {
      * {@link #firstHitByName} when the slug lookup fails or the slug points at the wrong kind.
      */
     public Hit firstHitBySlugOrName(String slug, String name, String projectType) {
-        if (slug != null && !slug.isBlank()) {
-            try {
-                JsonObject o = getJson(API + "/project/" + enc(slug));
-                String type = str(o, "project_type");
-                if (type.isBlank() || type.equalsIgnoreCase(projectType)) {
-                    return new Hit(str(o, "slug"),
-                            str(o, "title").isBlank() ? str(o, "name") : str(o, "title"),
-                            "", num(o, "downloads"), str(o, "description"), str(o, "icon_url"));
-                }
-            } catch (Exception ignored) {
-                // fall through to a name search
-            }
-        }
+        Hit exact = projectByExactSlug(slug, projectType);
+        if (exact != null) return exact;
         return firstHitByName(name, projectType);
+    }
+
+    /**
+     * The Modrinth project whose slug (or ID) is EXACTLY {@code slug} -- never a display-name search.
+     *
+     * <p>This is the difference between "attach a nice icon" and "replace or delete someone's mod jar".
+     * A fuzzy name match is fine for the former, but for the latter it is actively dangerous: a
+     * modpack's mods are frequently not on Modrinth at all (CurseForge-only, jar-in-jar, custom
+     * builds), and a wrong project would then look "incompatible" and get the working jar converted
+     * or removed. So the Fix feature only ever acts on an identity obtained from here.
+     *
+     * @return the matching project, or null when the slug isn't a Modrinth project of
+     *         {@code projectType} / the lookup fails (offline, rate-limited, no such project) -- all
+     *         of which mean the same thing to a caller: "we can't verify this mod, leave it alone".
+     */
+    public Hit projectByExactSlug(String slug, String projectType) {
+        if (slug == null || slug.isBlank()) return null;
+        String key = projectType + "/" + slug.toLowerCase();
+        CachedProject cached = PROJECT_CACHE.get(key);
+        long now = System.currentTimeMillis();
+        if (cached != null && now - cached.fetchedAt() < cached.ttlMs()) return cached.hit();
+        Hit hit = fetchProjectBySlug(slug, projectType);
+        // Cache misses too, but only briefly: a 404 is stable (the project isn't on Modrinth), while a
+        // transient failure (offline, rate limit) must not be remembered for the full TTL.
+        PROJECT_CACHE.put(key, new CachedProject(now, hit == null ? MISS_CACHE_TTL_MS : PROJECT_CACHE_TTL_MS, hit));
+        return hit;
+    }
+
+    private Hit fetchProjectBySlug(String slug, String projectType) {
+        try {
+            JsonObject o = getJson(API + "/project/" + enc(slug));
+            String type = str(o, "project_type");
+            if (!type.isBlank() && !type.equalsIgnoreCase(projectType)) return null;
+            return new Hit(str(o, "slug"),
+                    str(o, "title").isBlank() ? str(o, "name") : str(o, "title"),
+                    "", num(o, "downloads"), str(o, "description"), str(o, "icon_url"));
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     public List<Hit> search(String query, String projectType) throws Exception {
@@ -181,6 +273,15 @@ public class ModrinthClient {
      * All published versions of a project, newest first (as Modrinth returns them).
      */
     public List<ProjectVersion> versions(String slug) throws Exception {
+        // Serving repeat lookups from a short-lived cache matters here: the Fix scan visits every
+        // installed mod, and the Mods window re-runs that scan on each refresh -- while the version
+        // pickers ask for the same projects again. Since a mod's version list barely changes, this
+        // turns "hundreds of requests per interaction" into one request per project per ten minutes,
+        // which is what keeps us inside Modrinth's 300/minute budget instead of hitting a 429.
+        CachedVersions cached = VERSIONS_CACHE.get(slug);
+        if (cached != null && System.currentTimeMillis() - cached.fetchedAt() < VERSIONS_CACHE_TTL_MS) {
+            return cached.versions();
+        }
         // Modrinth renamed this route from `/project/{id}/versions` (plural) to
         // `/project/{id}/version` (singular); the old plural path now returns HTTP 404, which
         // broke every install. We call the current singular route, with a fallback to the old
@@ -195,6 +296,10 @@ public class ModrinthClient {
             if (o.has("game_versions")) {
                 for (var g : o.getAsJsonArray("game_versions")) gv.add(g.getAsString());
             }
+            List<String> loaders = new ArrayList<>();
+            if (o.has("loaders")) {
+                for (var l : o.getAsJsonArray("loaders")) loaders.add(l.getAsString());
+            }
             List<FileRef> files = new ArrayList<>();
             if (o.has("files")) {
                 for (var f : o.getAsJsonArray("files")) {
@@ -203,8 +308,9 @@ public class ModrinthClient {
                             fo.has("size") ? fo.get("size").getAsLong() : -1L));
                 }
             }
-            out.add(new ProjectVersion(str(o, "id"), str(o, "name"), str(o, "version_number"), gv, files));
+            out.add(new ProjectVersion(str(o, "id"), str(o, "name"), str(o, "version_number"), gv, loaders, files));
         }
+        VERSIONS_CACHE.put(slug, new CachedVersions(System.currentTimeMillis(), out));
         return out;
     }
 
@@ -309,12 +415,65 @@ public class ModrinthClient {
     }
 
     private com.google.gson.JsonElement get(String url) throws Exception {
-        HttpRequest req = HttpRequest.newBuilder(URI.create(url))
-                .header("User-Agent", "DeyLauncher/0.8")
-                .GET().build();
-        HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
-        if (resp.statusCode() / 100 != 2) throw new IOException("Modrinth API error: HTTP " + resp.statusCode());
-        return com.google.gson.JsonParser.parseString(resp.body());
+        for (int attempt = 0; ; attempt++) {
+            pace();
+            HttpRequest req = HttpRequest.newBuilder(URI.create(url))
+                    .header("User-Agent", "DeyLauncher/0.8")
+                    .GET().build();
+            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+            int code = resp.statusCode();
+            if (code == 429 || code == 503) {
+                // Rate limited (429) or the service is briefly unavailable (503). Both are expected
+                // while resolving a few hundred mods, so wait the amount Modrinth itself asks for and
+                // try again instead of throwing -- throwing is what used to abort an entire Fix run.
+                if (attempt >= RATE_LIMIT_RETRIES) {
+                    throw new IOException("Modrinth API error: HTTP " + code
+                            + " (rate limited -- try again in a minute)");
+                }
+                sleep(retryDelayMs(resp, attempt));
+                continue;
+            }
+            if (code / 100 != 2) throw new IOException("Modrinth API error: HTTP " + code);
+            return com.google.gson.JsonParser.parseString(resp.body());
+        }
+    }
+
+    /** Blocks (if needed) so consecutive Modrinth requests stay at their documented steady rate. */
+    private static void pace() {
+        long wait;
+        synchronized (PACE_LOCK) {
+            long now = System.currentTimeMillis();
+            wait = Math.max(0L, lastRequestAt + MIN_REQUEST_GAP_MS - now);
+            lastRequestAt = now + wait; // reserve the slot before sleeping, so parallel callers queue up
+        }
+        if (wait > 0) sleep(wait);
+    }
+
+    /** How long to back off after a 429/503: whatever the response tells us, else exponential. */
+    private static long retryDelayMs(HttpResponse<String> resp, int attempt) {
+        Long advertised = secondsHeader(resp, "Retry-After");
+        if (advertised == null) advertised = secondsHeader(resp, "X-Ratelimit-Reset");
+        if (advertised != null) return Math.min(MAX_BACKOFF_MS, advertised * 1000L + 250L);
+        return Math.min(MAX_BACKOFF_MS, 1000L << attempt); // 1s, 2s, 4s
+    }
+
+    /** A whole-seconds header value, or null when absent/unparseable (headers aren't guaranteed). */
+    private static Long secondsHeader(HttpResponse<String> resp, String name) {
+        return resp.headers().firstValue(name).map(v -> {
+            try {
+                return Long.parseLong(v.trim());
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }).orElse(null);
+    }
+
+    private static void sleep(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt(); // never swallow an interrupt
+        }
     }
 
     private static String enc(String s) {

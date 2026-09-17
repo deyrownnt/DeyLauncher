@@ -35,12 +35,43 @@ public class ModpackMeta {
     public String note;
     public long installedAt;
 
+    /**
+     * Every file this pack owns on disk (its downloads and its bundled overrides), with the URL/hash/
+     * size needed to fetch each one again. Written at install time so a LATER launch can notice a mod
+     * that has gone missing and put it back automatically -- without needing the original pack file,
+     * and without anyone downloading jars by hand. See {@link ModpackVerifier}.
+     */
+    public List<ModpackFile> files;
+
+    /**
+     * Pack files that couldn't be fetched automatically (removed upstream, or published nowhere
+     * public), by name/id. Kept so the launcher can say exactly what is missing instead of quietly
+     * launching a pack that isn't complete.
+     */
+    public List<String> unresolved;
+
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
-    /** The instance folder layout the launcher uses for a version+loader, e.g. 1.21.1-fabric. */
+    /**
+     * The instance folder layout the launcher uses for a version+loader, e.g. 1.21.1-fabric.
+     *
+     * <p>Refuses an empty Minecraft version on purpose. {@code resolve("")} returns the SAME path in
+     * Java, so a blank version would quietly resolve to the {@code instances} folder itself -- and the
+     * two things that call this with a pack record (repair and delete) would then verify, or delete,
+     * every instance the user has instead of one pack.
+     */
     public static Path instanceDirFor(Path launcherRoot, String mcVersion, String loader) {
+        if (mcVersion == null || mcVersion.isBlank()) {
+            throw new IllegalArgumentException(
+                    "this modpack record doesn't say which Minecraft version it was installed for");
+        }
         String suffix = (loader == null || loader.equalsIgnoreCase("Vanilla")) ? "" : "-" + loader.toLowerCase();
         return launcherRoot.resolve("instances").resolve(mcVersion + suffix);
+    }
+
+    /** True when this record knows enough to locate its own instance folder (see {@link #instanceDirFor}). */
+    public boolean knowsTarget() {
+        return mcVersion != null && !mcVersion.isBlank();
     }
 
     public static Path fileFor(Path instanceDir) {
@@ -49,11 +80,26 @@ public class ModpackMeta {
 
     /** Builds the metadata for a pack that's about to be (or has just been) installed. */
     public static ModpackMeta of(ModpackInfo info) {
+        return of(info, info.mcVersion(), info.launcherLoader());
+    }
+
+    /**
+     * Builds the metadata for a pack installed INTO a known version + loader.
+     *
+     * <p>The distinction matters and used to be a real bug: a pack may declare no Minecraft version or
+     * loader at all (the launcher deliberately supports those, installing them into whatever the user
+     * has selected), and {@link #of(ModpackInfo)} would then record an EMPTY version and "Vanilla".
+     * Everything downstream reads this record to find the instance again -- {@link #pinnedLoaderVersion},
+     * the pack menu's "play this pack", the repair button, delete -- so the pack ended up pointing at
+     * {@code instances/} itself instead of its own folder, which is both useless and dangerous for the
+     * delete path. Recording where the pack really went is what makes those all work.
+     */
+    public static ModpackMeta of(ModpackInfo info, String mcVersion, String loader) {
         ModpackMeta meta = new ModpackMeta();
         meta.name = info.name();
         meta.version = info.version();
-        meta.mcVersion = info.mcVersion();
-        meta.loader = info.launcherLoader();
+        meta.mcVersion = mcVersion != null && !mcVersion.isBlank() ? mcVersion : info.mcVersion();
+        meta.loader = loader != null && !loader.isBlank() ? loader : info.launcherLoader();
         meta.loaderVersion = info.loaderVersion();
         meta.format = info.format() == null ? null : info.format().name();
         meta.iconPath = info.iconPath() == null ? null : info.iconPath().toString();
@@ -71,6 +117,21 @@ public class ModpackMeta {
             // Best-effort, exactly like ServerStore.save: worst case the pack simply isn't listed
             // next run -- the installed mods themselves are untouched either way.
         }
+    }
+
+    /** The pack's file manifest, never null (an older pack record simply has none). */
+    public List<ModpackFile> packFiles() {
+        return files == null ? List.of() : files;
+    }
+
+    /** Pack files that couldn't be fetched automatically, never null. */
+    public List<String> unresolvedFiles() {
+        return unresolved == null ? List.of() : unresolved;
+    }
+
+    /** True when this record carries enough to verify/repair the pack's own files. */
+    public boolean managesFiles() {
+        return !packFiles().isEmpty();
     }
 
     public static ModpackMeta read(Path instanceDir) {
@@ -105,7 +166,7 @@ public class ModpackMeta {
      * "newest stable build" behaviour.
      */
     public static String pinnedLoaderVersion(Path launcherRoot, String mcVersion, String loader) {
-        if (mcVersion == null || loader == null) return null;
+        if (mcVersion == null || mcVersion.isBlank() || loader == null) return null;
         ModpackMeta meta = read(instanceDirFor(launcherRoot, mcVersion, loader));
         if (meta == null || meta.loaderVersion == null || meta.loaderVersion.isBlank()) return null;
         if (meta.loader == null || !meta.loader.equalsIgnoreCase(loader)) return null;

@@ -181,6 +181,9 @@
 .theme-dark .gold-card-title { -fx-text-fill: #f5f5f6; -fx-font-weight: bold; -fx-font-size: 14px; }
 .theme-dark .gold-card-on .gold-card-title { -fx-text-fill: #f2c14e; }
 .theme-dark .gold-card-note { -fx-text-fill: #9a9ba3; -fx-font-size: 13px; -fx-wrap-text: true; }
+/* Live one-liner under a gold card saying what is actually being published right now (see
+   LauncherApp#buildShareCard) -- gold like the card's accent so it reads as status, not as boilerplate. */
+.theme-dark .gold-card-status { -fx-text-fill: #f2c14e; -fx-font-size: 13px; -fx-font-weight: bold; -fx-wrap-text: true; }
 .theme-dark .gold-switch {
     -fx-background-color: #202126; -fx-background-radius: 20; -fx-border-color: #4a4b52;
     -fx-border-radius: 20; -fx-text-fill: #9a9ba3; -fx-font-weight: bold; -fx-font-size: 12px;
@@ -522,6 +525,8 @@
 .theme-light .gold-card-title { -fx-text-fill: #17181b; -fx-font-weight: bold; -fx-font-size: 14px; }
 .theme-light .gold-card-on .gold-card-title { -fx-text-fill: #a67c14; }
 .theme-light .gold-card-note { -fx-text-fill: #6b6c72; -fx-font-size: 13px; -fx-wrap-text: true; }
+/* Live status line under a gold card -- see the dark-theme twin above. */
+.theme-light .gold-card-status { -fx-text-fill: #a67c14; -fx-font-size: 13px; -fx-font-weight: bold; -fx-wrap-text: true; }
 .theme-light .gold-switch {
     -fx-background-color: #ffffff; -fx-background-radius: 20; -fx-border-color: #d8d8dc;
     -fx-border-radius: 20; -fx-text-fill: #6b6c72; -fx-font-weight: bold; -fx-font-size: 12px;

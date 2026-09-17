@@ -10,14 +10,12 @@ you must build the Windows package *on Windows* and the Linux package
 Windows. If you don't have a Windows machine, see the fallback option
 at the bottom.
 
-## Before you build: embed your GitHub token (optional but recommended)
+## Before you build: do not embed credentials
 
-If you want Friends to work out of the box for everyone you give this
-to -- no setup on their end -- create `secrets/embedded-github.properties`
-in the project root first. See `GITHUB_SETUP.md` (Option B) for the
-exact steps. Gradle bakes it into the jar automatically on the next
-build; skip this and Friends just stays unconfigured until each person
-sets up their own `~/.deylauncher/github.properties`.
+Installers deliberately contain no GitHub, Microsoft, Mojang, or Minecraft account credentials. Friends
+stays unconfigured until the individual user creates their own local
+`~/.deylauncher/github.properties`; see `GITHUB_SETUP.md`. A launcher distributed publicly needs per-user
+OAuth or a server-side service for shared online data.
 
 ## Why updating is always safe
 
@@ -38,8 +36,7 @@ their own override -- unaffected by any update.
 ```
 
 This produces `build/libs/DeyLauncher-0.1.0.jar` -- the full fat jar,
-with your embedded token inside if you did the step above (check the
-build log for the confirmation line).
+with no user credentials inside it.
 
 Then build the app-image (a folder containing a bundled JRE + native
 launcher, no system-wide install needed):

@@ -31,9 +31,9 @@ tokens > Fine-grained tokens > Generate new token**.
   and update it when it expires).
 - Generate it, and copy the token now -- GitHub only shows it once.
 
-## 4. Two ways to configure DeyLauncher with this
+## 4. Configure DeyLauncher locally
 
-### Option A -- for you, running from source (`./gradlew run`)
+### Local setup only
 
 Create this file on your own machine:
 
@@ -51,56 +51,16 @@ friendsPath=friends.json
 Save it. Restart DeyLauncher (or just open Friends) and it picks this up
 automatically.
 
-### Option B -- embed it in the installer you build for friends
+Never put this file in the project, source control, a CI build secret that is copied into an artifact, or
+a distributed launcher. DeyLauncher intentionally reads it only from the current user's home directory and
+never copies it into a Minecraft instance. Each person who needs write access must use their own least-
+privileged, repo-scoped credential; a public launcher needs a server-side service or per-user OAuth instead.
 
-This is what makes it so **friends who install the built jar/app-image
-don't have to do any of this themselves.** Before building (see
-`INSTALLER_GUIDE.md`), create:
+## 5. What this protects
 
-```
-secrets/embedded-github.properties
-```
-
-(inside the project root, right next to `build.gradle.kts`) with the
-**exact same content** as the file in Option A. This folder is already
-listed in `.gitignore`, so it never gets committed if you put the
-project under git.
-
-When you run `./gradlew shadowJar` (or build an installer), Gradle
-automatically bakes this file into the jar as a bundled resource --
-you'll see a log line confirming it (`"embedding GitHub token from
-secrets/embedded-github.properties into this build"`). Every install of
-that build already has Friends working, with zero setup from the person
-who receives it.
-
-**DeyLauncher checks both locations, in this order:** a person's own
-`~/.deylauncher/github.properties` (if they've set one up themselves)
-always wins over the embedded one -- so you can still hand someone a
-build with your token embedded, and they can override it with their own
-config later if they ever want to point at a different backend.
-
-## 5. The tradeoff, stated plainly
-
-Anyone who has the token -- whether they read it out of
-`github.properties` or decompile it out of a distributed jar -- can
-read/write the whole shared `friends.json`, including everyone's
-presence status and friend graph, not just their own. That's inherent
-to "no real server holding the secret." The mitigations that make this
-an acceptable tradeoff for a small friend group:
-
-- The token belongs to a **dedicated bot account**, not your personal
-  one -- worst case, you lose control of two throwaway repos, not your
-  real GitHub identity.
-- The token is **fine-grained and repo-scoped** -- it can't touch
-  anything outside the one repo it was issued for.
-- You can **rotate it** at any time (regenerate on the bot account,
-  update `secrets/embedded-github.properties`, rebuild and redistribute)
-  if you're ever worried it's leaked further than intended.
-
-If this ever needs to scale past a small trusted group, the real fix is
-moving to per-user GitHub OAuth or a small serverless proxy that holds
-the token server-side instead -- both were discussed earlier in this
-project's design and remain the path forward if/when it's warranted.
+Microsoft’s OAuth client ID is intentionally public: it identifies the desktop app and is required by
+Microsoft’s device-code flow. It is not an account credential. Microsoft refresh tokens, Minecraft access
+tokens, and GitHub tokens are private credentials; they must never be committed or shipped in a jar/app image.
 
 ## What DeyLauncher actually does with this
 
