@@ -54,6 +54,12 @@ public class LauncherPrefs {
     // GPU context, this launches Minecraft through Mesa's software renderer (LIBGL_ALWAYS_SOFTWARE).
     // Defaults off so healthy machines keep GPU acceleration.
     public boolean softwareOpenGl = false;
+    // Native Wayland (Settings > Game): explicitly ask GLFW for Wayland while preserving DISPLAY for
+    // Java/AWT-based mods. Defaults to ON for anyone running the
+    // launcher inside a Wayland session -- that is the configuration whose XWayland window path can die in
+    // native code during window creation, which no driver update or software renderer fixes. On X11
+    // (DISPLAY without WAYLAND_DISPLAY) it defaults off and does nothing. See WaylandSupport.
+    public boolean nativeWayland = defaultNativeWayland();
 
     // Friends / presence (Account tab, Settings > Launcher)
     public boolean invisibleMode = false;         // broadcast OFFLINE to friends even while actually online
@@ -64,6 +70,23 @@ public class LauncherPrefs {
      *  LauncherApp.currentPresence -- and any leftover value here is cleared once at startup, so the
      *  field is kept purely so older prefs files still load. */
     public String myServerAddress = "";
+
+    /**
+     * Whether pressing PLAY first checks the active modpack's own file list and downloads back anything
+     * that has gone missing (see ModpackVerifier). On by default: an incomplete pack launching into a
+     * crash screen is never what anyone wants, and on a healthy instance the check is a few stat calls.
+     */
+    public boolean verifyModpackOnLaunch = true;
+
+    /**
+     * Whether this launcher is running inside a Wayland session -- i.e. whether starting the game natively
+     * on Wayland should be on by default. Wayland sessions are the only ones where GLFW otherwise routes
+     * window creation through XWayland, so an X11 user keeps the previous behaviour untouched.
+     */
+    public static boolean defaultNativeWayland() {
+        String waylandDisplay = System.getenv("WAYLAND_DISPLAY");
+        return waylandDisplay != null && !waylandDisplay.isBlank();
+    }
 
     private static Path file() {
         return Path.of(System.getProperty("user.home"), ".deylauncher", "launcher.properties");
@@ -99,9 +122,15 @@ public class LauncherPrefs {
             p.gameHeight = (int) parseDouble(props, "gameHeight", p.gameHeight);
             p.fullscreen = Boolean.parseBoolean(props.getProperty("fullscreen", "false"));
             p.softwareOpenGl = Boolean.parseBoolean(props.getProperty("softwareOpenGl", "false"));
+            // Deliberately NOT "false" as the fallback: on a Wayland session the default is on, so a prefs
+            // file written before this option existed still gets the launch path that works. Storing the
+            // key (Apply) makes the user's own choice stick either way.
+            p.nativeWayland = Boolean.parseBoolean(
+                    props.getProperty("nativeWayland", String.valueOf(defaultNativeWayland())));
             p.invisibleMode = Boolean.parseBoolean(props.getProperty("invisibleMode", "false"));
             p.shareServerAddress = Boolean.parseBoolean(props.getProperty("shareServerAddress", "false"));
             p.myServerAddress = props.getProperty("myServerAddress", "");
+            p.verifyModpackOnLaunch = Boolean.parseBoolean(props.getProperty("verifyModpackOnLaunch", "true"));
         } catch (IOException ignored) {
             // Missing/corrupt prefs file just means "use defaults" -- not worth failing startup over.
         }
@@ -131,9 +160,11 @@ public class LauncherPrefs {
             props.setProperty("gameHeight", String.valueOf(gameHeight));
             props.setProperty("fullscreen", String.valueOf(fullscreen));
             props.setProperty("softwareOpenGl", String.valueOf(softwareOpenGl));
+            props.setProperty("nativeWayland", String.valueOf(nativeWayland));
             props.setProperty("invisibleMode", String.valueOf(invisibleMode));
             props.setProperty("shareServerAddress", String.valueOf(shareServerAddress));
             props.setProperty("myServerAddress", myServerAddress == null ? "" : myServerAddress);
+            props.setProperty("verifyModpackOnLaunch", String.valueOf(verifyModpackOnLaunch));
             try (OutputStream out = Files.newOutputStream(file())) {
                 props.store(out, "DeyLauncher preferences");
             }

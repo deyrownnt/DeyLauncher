@@ -8,6 +8,7 @@ import com.google.gson.JsonObject;
 
 import java.nio.file.Path;
 import java.util.*;
+import java.util.function.Consumer;
 
 /**
  * Turns a PreparedVersion + AuthSession + user settings into an actual
@@ -16,16 +17,30 @@ import java.util.*;
  */
 public class GameLauncher {
 
-    /** Everything the RAM/resolution/fullscreen settings screen controls. */
+    /**
+     * Everything the RAM/resolution/fullscreen settings screen controls.
+     *
+     * <p>The last two are the Linux compatibility switches: {@code softwareOpenGl} runs the game through
+     * Mesa's CPU renderer (for a machine whose GPU can't expose an OpenGL 3.3 context), and
+     * {@code nativeWayland} starts it on Wayland's own driver path instead of XWayland (see
+     * {@link WaylandSupport} -- that is what a native crash inside {@code glfwCreateWindow} needs, since
+     * software rendering cannot avoid a fault that happens before any GPU work).
+     */
     public record LaunchSettings(int ramMinMb, int ramMaxMb, int width, int height, boolean fullscreen,
-                                 boolean softwareOpenGl) {
+                                 boolean softwareOpenGl, boolean nativeWayland) {
         public static LaunchSettings defaults() {
-            return new LaunchSettings(1024, 4096, 854, 480, false, false);
+            return new LaunchSettings(1024, 4096, 854, 480, false, false, false);
         }
 
-        /** Convenience: older callers that only set the classic five fields keep software OpenGL off. */
+        /** Convenience: older callers that only set the classic five fields keep both switches off. */
         public LaunchSettings(int ramMinMb, int ramMaxMb, int width, int height, boolean fullscreen) {
-            this(ramMinMb, ramMaxMb, width, height, fullscreen, false);
+            this(ramMinMb, ramMaxMb, width, height, fullscreen, false, false);
+        }
+
+        /** Convenience for callers written before the Wayland switch existed. */
+        public LaunchSettings(int ramMinMb, int ramMaxMb, int width, int height, boolean fullscreen,
+                              boolean softwareOpenGl) {
+            this(ramMinMb, ramMaxMb, width, height, fullscreen, softwareOpenGl, false);
         }
     }
 
@@ -41,6 +56,60 @@ public class GameLauncher {
      */
     public Process launch(GameFiles.PreparedVersion version, AuthSession session, Path gameDirectory,
                            LaunchSettings settings, String javaBinaryPath, String quickPlayMultiplayerTarget) throws Exception {
+        return launch(version, session, gameDirectory, settings, javaBinaryPath, quickPlayMultiplayerTarget, null);
+    }
+
+    /**
+     * The same launch, with an optional one-line warning sink. It carries the problems that are
+     * invisible otherwise -- most importantly a mod-loader profile referencing a {@code ${placeholder}}
+     * the launcher doesn't know, which would reach the game as literal text instead of a value
+     * (see {@link #unresolvedPlaceholders}).
+     */
+    public Process launch(GameFiles.PreparedVersion version, AuthSession session, Path gameDirectory,
+                           LaunchSettings settings, String javaBinaryPath, String quickPlayMultiplayerTarget,
+                           Consumer<String> log) throws Exception {
+
+        List<String> command = buildCommand(version, session, gameDirectory, settings,
+                javaBinaryPath, quickPlayMultiplayerTarget);
+
+        // A ${...} token we never substituted is a real bug class: the official launcher fills these
+        // in, so a version or mod-loader profile that asks for one would otherwise hand the game
+        // literal "${clientid}" text (which is exactly what happened here for ${clientid} and
+        // ${auth_xuid} on every 1.19+ launch). Rather than failing a launch that may still work, say
+        // so instead of letting it disappear into a log nobody reads.
+        List<String> unresolved = unresolvedPlaceholders(command);
+        if (!unresolved.isEmpty() && log != null) {
+            log.accept("Warning: this version asks for placeholder(s) DeyLauncher doesn't fill in: "
+                    + String.join(", ", unresolved)
+                    + " -- the game received them as literal text. Please report this.");
+        }
+
+        ProcessBuilder pb = new ProcessBuilder(command);
+        pb.directory(gameDirectory.toFile());
+        pb.redirectErrorStream(true); // merge stderr into stdout so callers only read one stream
+        // The JVM only writes its hs_err dump to the -XX:ErrorFile above if that file's PARENT FOLDER
+        // already exists -- it never creates it, and silently falls back to the working directory when
+        // it can't. Creating it here is what keeps a crash dump where the launcher expects to find it,
+        // redact the account token out of it and lock it down (see CrashDumps).
+        CrashDumps.prepareDumpLocation(gameDirectory);
+        // On a Wayland session, explicitly request GLFW's Wayland backend (Settings > Game > "Run natively
+        // on Wayland"). Do not hide DISPLAY: doing so left modern GLFW on a DISPLAY-less X11 backend and
+        // crashed Minecraft, while also breaking mods that initialise Java's X11/AWT support.
+        if (WaylandSupport.enableNativeWayland(settings.nativeWayland(), System.getProperty("os.name", ""),
+                pb.environment(), version.nativesDir(), version.versionJson()) && log != null) {
+            log.accept("Wayland session detected: requesting GLFW's native Wayland backend.");
+        }
+        return pb.start();
+    }
+
+    /**
+     * Every argument the game's JVM will be started with -- everything {@link #launch} does except
+     * actually starting it. Package-private so tests can assert the finished command line: which
+     * placeholders resolved, which Mojang argument rules applied on which platform, and where the
+     * JVM is told to put its crash dump.
+     */
+    List<String> buildCommand(GameFiles.PreparedVersion version, AuthSession session, Path gameDirectory,
+                              LaunchSettings settings, String javaBinaryPath, String quickPlayMultiplayerTarget) {
 
         Map<String, String> placeholders = buildPlaceholders(version, session, gameDirectory, settings);
         Map<String, Boolean> features = currentFeatures();
@@ -56,11 +125,38 @@ public class GameLauncher {
         command.add("-Xms" + settings.ramMinMb() + "M");
         command.add("-Xmx" + settings.ramMaxMb() + "M");
         command.add("-Djava.library.path=" + version.nativesDir());
+        // Keep the JVM's own crash dump (hs_err_pid<pid>.log) inside the instance, next to Minecraft's
+        // own crash reports, instead of the working directory. That file repeats the whole command
+        // line -- including ${auth_access_token} -- so the launcher scrubs and locks it down after a
+        // crash (see CrashDumps); putting it somewhere predictable is what makes that possible.
+        command.add(errorFileArg(gameDirectory));
 
         // JVM arguments from the version JSON (modern format), falling back to sane defaults
         // for older-style version JSONs that only list game arguments as a flat string.
         JsonObject args = version.versionJson().has("arguments")
                 ? version.versionJson().getAsJsonObject("arguments") : null;
+
+        // Headless mode: prevent Swing/AWT mods (like EarlyLoadingBar) from trying to create windows
+        // when no display is available (CI, servers, headless Linux). This must be added before
+        // the version JSON's JVM args so it takes effect early.
+        // Also enable when software rendering is used (strong indicator of headless/CI environment).
+        // On Linux, always enable headless for modpack launches unless native Wayland is explicitly requested,
+        // because modpacks often include mods (EarlyLoadingBar, etc.) that create Swing windows at startup.
+        // The launcher process may have a display, but the game process often ends up with software rendering (llvmpipe).
+        boolean headless = isHeadlessEnvironment() || settings.softwareOpenGl() || 
+                (System.getProperty("os.name", "").toLowerCase().contains("linux") && !settings.nativeWayland());
+        // Additionally, always enable headless on Linux for Fabric/Forge modpack launches as a safety net
+        // since many mods (EarlyLoadingBar, etc.) crash when trying to create Swing windows in software rendering mode.
+        if (!headless && System.getProperty("os.name", "").toLowerCase().contains("linux")) {
+            // Check if this is a modpack/modded launch by looking for Fabric/Forged indicators
+            String mainClass = version.mainClass();
+            if (mainClass != null && (mainClass.contains("fabric") || mainClass.contains("forge") || mainClass.contains("knot"))) {
+                headless = true;
+            }
+        }
+        if (headless) {
+            command.add("-Djava.awt.headless=true");
+        }
 
         if (args != null && args.has("jvm")) {
             addResolvedArgs(command, args.getAsJsonArray("jvm"), placeholders, features);
@@ -89,12 +185,36 @@ public class GameLauncher {
         // in software on the CPU, which does provide OpenGL 3.3 -- so Minecraft gets a window without
         // needing a working GPU driver, a display reconfig, or any admin rights. Off by default so
         // healthy machines keep GPU acceleration.
-        command = applySoftwareGl(command, settings.softwareOpenGl(), System.getProperty("os.name", ""));
+        return applySoftwareGl(command, settings.softwareOpenGl(), System.getProperty("os.name", ""));
+    }
 
-        ProcessBuilder pb = new ProcessBuilder(command);
-        pb.directory(gameDirectory.toFile());
-        pb.redirectErrorStream(true); // merge stderr into stdout so callers only read one stream
-        return pb.start();
+    /**
+     * The JVM's {@code -XX:ErrorFile} argument for one launch: the instance's own crash-reports folder,
+     * with the JVM's own {@code %p} (pid) placeholder kept for uniqueness.
+     *
+     * <p>The directory is created by {@link CrashDumps#prepareDumpLocation} at launch time, because the
+     * JVM itself never creates an {@code ErrorFile}'s parent: without it the dump silently lands in the
+     * working directory instead, which is precisely what happened before that call existed. Nothing is
+     * created at build-command time -- a launch that fails before the game starts should leave no trace.
+     */
+    static String errorFileArg(Path gameDirectory) {
+        Path dumps = gameDirectory.resolve("crash-reports").resolve("hs_err_pid%p.log");
+        return "-XX:ErrorFile=" + dumps;
+    }
+
+    /**
+     * Every distinct {@code ${...}} token still present in the finished command line -- i.e. a
+     * placeholder nobody substituted. Package-private so a test can assert a real 1.20.1-shaped
+     * version JSON leaves none behind (the version that shipped {@code --clientId ${clientid}}).
+     */
+    static List<String> unresolvedPlaceholders(List<String> command) {
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("\\$\\{([a-zA-Z0-9_]+)\\}").matcher("");
+        for (String arg : command) {
+            m.reset(arg);
+            while (m.find()) out.add(m.group(1));
+        }
+        return new ArrayList<>(out);
     }
 
     /**
@@ -127,8 +247,42 @@ public class GameLauncher {
         return out;
     }
 
+    /**
+     * Detects if we're running in a headless environment (no display server).
+     * This is used to set -Djava.awt.headless=true to prevent Swing/AWT mods
+     * (like EarlyLoadingBar) from trying to create windows when no display is available.
+     */
+    private static boolean isHeadlessEnvironment() {
+        String osName = System.getProperty("os.name", "").toLowerCase();
+        if (!osName.contains("linux")) return false;
 
-    private Map<String, String> buildPlaceholders(GameFiles.PreparedVersion version, AuthSession session,
+        // Check for display servers
+        String display = System.getenv("DISPLAY");
+        String waylandDisplay = System.getenv("WAYLAND_DISPLAY");
+        String xdgSessionType = System.getenv("XDG_SESSION_TYPE");
+
+        // No display at all = headless
+        if ((display == null || display.isBlank()) &&
+            (waylandDisplay == null || waylandDisplay.isBlank()) &&
+            (xdgSessionType == null || xdgSessionType.equals("tty"))) {
+            return true;
+        }
+
+        // DISPLAY set but points to nothing accessible (common in CI)
+        if (display != null && !display.isBlank() && !display.startsWith(":") && !display.contains(":")) {
+            return true;
+        }
+
+        return false;
+    }
+
+
+    /**
+     * The full ${...} substitution table for one launch. Package-private so a test can assert that
+     * the mod-loader-only placeholders (${library_directory}, ${classpath_separator}) are actually
+     * present -- leaking those literally onto the command line is a silent "modded game won't start".
+     */
+    Map<String, String> buildPlaceholders(GameFiles.PreparedVersion version, AuthSession session,
                                                     Path gameDirectory, LaunchSettings settings) {
         String classpath = String.join(java.io.File.pathSeparator,
                 version.libraryJars().stream().map(Path::toString).toList())
@@ -144,6 +298,23 @@ public class GameLauncher {
         m.put("assets_index_name", version.versionJson().getAsJsonObject("assetIndex").get("id").getAsString());
         m.put("auth_uuid", session.uuid());
         m.put("auth_access_token", session.accessToken());
+        // Mojang's own argument list for 1.19+ contains "--clientId ${clientid}" and
+        // "--xuid ${auth_xuid}" right after the access token, and both were MISSING here -- so every
+        // launch handed the game the literal strings "${clientid}" and "${auth_xuid}" (visible in the
+        // JVM's own crash dump: "--clientId ${clientid} --xuid ${auth_xuid}"). The client id is the
+        // app id this launcher's Microsoft sign-in uses (that is what the game expects it to be), and
+        // xuid is the account's Xbox id, which an offline session simply doesn't have -- the official
+        // launcher passes those through as-is for offline play too, so an empty string is the honest
+        // value there rather than a made-up id.
+        m.put("clientid", com.deylauncher.auth.MicrosoftAuth.CLIENT_ID);
+        m.put("auth_xuid", "");
+        // Placeholders used by the pre-1.13 "minecraftArguments" format (a flat string with
+        // ${user_properties} / ${profile_name} / ${auth_session} in it). Vanilla JSONs for 1.7-1.12
+        // still list them, and none of them existed here either, so an old version launched from this
+        // launcher got literal text where its launcher-specific option blob should have been.
+        m.put("user_properties", "{}");
+        m.put("profile_name", session.username());
+        m.put("auth_session", "token:" + session.accessToken() + ":" + session.uuid());
         m.put("user_type", session.isOffline() ? "legacy" : "msa");
         m.put("version_type", version.versionJson().has("type")
                 ? version.versionJson().get("type").getAsString() : "release");
@@ -151,6 +322,16 @@ public class GameLauncher {
         m.put("launcher_name", "DeyLauncher");
         m.put("launcher_version", AppUpdater.currentVersion()); // must match the actual running version (embedded at build)
         m.put("classpath", classpath);
+        // Forge 1.17+ profiles supply their own JVM args that reference these two: a
+        // -DlibraryDirectory=${library_directory}, a -p module path built from
+        // ${library_directory}/cpw/mods/..., and ${classpath_separator} between those module jars.
+        // They are not Mojang placeholders (vanilla version JSONs never use them), so without them
+        // the literal "${library_directory}" reached the JVM and Forge's BootstrapLauncher could not
+        // find its modules -- a modded launch that dies before the game even starts. The official
+        // launcher fills them in the same way: the launcher's own libraries folder, and the
+        // platform's path separator.
+        m.put("library_directory", version.launcherRoot().resolve("libraries").toString());
+        m.put("classpath_separator", java.io.File.pathSeparator);
         m.put("resolution_width", String.valueOf(settings.width()));
         m.put("resolution_height", String.valueOf(settings.height()));
         return m;
@@ -194,42 +375,22 @@ public class GameLauncher {
         return features;
     }
 
+    /**
+     * Whether one entry's {@code rules} array lets an ARGUMENT through. Delegates to
+     * {@link RuleEvaluator} so libraries and arguments can never disagree again about what a rule
+     * means (they used to be two copies, and both ignored {@code os.arch}/{@code os.version}).
+     *
+     * <p>A rule with none of {@code os}/{@code features} matches unconditionally, and a feature we
+     * never declared (any {@code is_quick_play_*} flag) counts as false -- which is what keeps the
+     * quick-play argument variants off a normal launch.
+     */
     private boolean argRulesPass(JsonArray rules, Map<String, Boolean> features) {
-        String os = System.getProperty("os.name").toLowerCase();
-        String osKey = os.contains("win") ? "windows" : os.contains("mac") ? "osx" : "linux";
-        // Mojang's rule semantics: default is disallow, and each matching rule
-        // (in order) overwrites the running result -- the last matching rule
-        // wins. A rule with neither "os" nor "features" matches unconditionally.
-        boolean allowed = false;
-        for (JsonElement el : rules) {
-            JsonObject rule = el.getAsJsonObject();
-            boolean matches = true;
+        return RuleEvaluator.allows(rules, RuleEvaluator.Platform.current(), features);
+    }
 
-            if (rule.has("os")) {
-                JsonObject osObj = rule.getAsJsonObject("os");
-                matches = !osObj.has("name") || osObj.get("name").getAsString().equals(osKey);
-            }
-
-            if (matches && rule.has("features")) {
-                JsonObject required = rule.getAsJsonObject("features");
-                for (String key : required.keySet()) {
-                    boolean requiredValue = required.get(key).getAsBoolean();
-                    // A feature we never declared (e.g. any is_quick_play_* flag) is treated as
-                    // false -- this is exactly what stops quick-play argument rules from matching
-                    // when DeyLauncher never requested quick play.
-                    boolean actualValue = features.getOrDefault(key, false);
-                    if (actualValue != requiredValue) {
-                        matches = false;
-                        break;
-                    }
-                }
-            }
-
-            if (matches) {
-                allowed = rule.get("action").getAsString().equals("allow");
-            }
-        }
-        return allowed;
+    /** Testable core of {@link #argRulesPass}: the platform is supplied instead of read from the JVM. */
+    static boolean argRulesPass(JsonArray rules, Map<String, Boolean> features, RuleEvaluator.Platform platform) {
+        return RuleEvaluator.allows(rules, platform, features);
     }
 
     private String substitute(String token, Map<String, String> placeholders) {

@@ -141,4 +141,78 @@ public class ModsManager {
         }
         return null;
     }
+
+    /**
+     * The license the mod itself declares, read straight out of its own jar -- the signal
+     * {@link com.deylauncher.modpack.ModDistributionPolicy} uses to decide whether a build of this mod
+     * may be fetched from a content source on the user's behalf.
+     *
+     * <p>Read in the order the loaders themselves document it: {@code fabric.mod.json}'s
+     * {@code license} (a string or an array of ids), then {@code META-INF/mods.toml}'s
+     * {@code license = "..."} (which both Forge and NeoForge generate), then a bundled LICENSE file.
+     * The LICENSE case is capped to its first few hundred characters, which is enough for an SPDX
+     * identifier or an "All rights reserved" line while keeping this cheap.
+     *
+     * @return the declared license text, or null when the jar declares none.
+     */
+    public String modLicense(String fileName) {
+        Path p = jarPath(fileName);
+        if (p == null) return null;
+        try (var zip = new java.util.zip.ZipFile(p.toFile())) {
+            String fabric = fabricLicense(zip);
+            if (fabric != null && !fabric.isBlank()) return fabric;
+            String toml = tomlLicense(zip);
+            if (toml != null && !toml.isBlank()) return toml;
+            for (String entryName : new String[]{"META-INF/LICENSE", "META-INF/LICENSE.txt", "LICENSE",
+                    "LICENSE.txt", "LICENCE", "LICENSE.md", "META-INF/licenses/LICENSE"}) {
+                var entry = zip.getEntry(entryName);
+                if (entry == null || entry.isDirectory()) continue;
+                try (var in = zip.getInputStream(entry)) {
+                    String text = new String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8).trim();
+                    if (!text.isBlank()) return text.length() > 500 ? text.substring(0, 500) : text;
+                }
+            }
+        } catch (Exception ignored) {
+            // Unreadable/corrupt jar -> null, which the policy treats as "no permission established".
+        }
+        return null;
+    }
+
+    /** {@code fabric.mod.json}'s {@code license}, which may be a single id or an array of ids. */
+    private String fabricLicense(java.util.zip.ZipFile zip) {
+        var entry = zip.getEntry("fabric.mod.json");
+        if (entry == null) return null;
+        try (var in = zip.getInputStream(entry)) {
+            var json = com.google.gson.JsonParser.parseString(new String(in.readAllBytes())).getAsJsonObject();
+            if (!json.has("license")) return null;
+            var license = json.get("license");
+            if (license == null || license.isJsonNull()) return null;
+            if (license.isJsonArray()) {
+                StringBuilder sb = new StringBuilder();
+                for (var part : license.getAsJsonArray()) {
+                    if (part == null || part.isJsonNull()) continue;
+                    if (sb.length() > 0) sb.append(", ");
+                    sb.append(part.getAsString());
+                }
+                return sb.length() == 0 ? null : sb.toString();
+            }
+            return license.getAsString();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** {@code META-INF/mods.toml}'s {@code license = "..."} line (Forge and NeoForge both emit one). */
+    private String tomlLicense(java.util.zip.ZipFile zip) {
+        var entry = zip.getEntry("META-INF/mods.toml");
+        if (entry == null) return null;
+        try (var in = zip.getInputStream(entry)) {
+            String toml = new String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+            var m = java.util.regex.Pattern.compile("^\\s*license\\s*=\\s*\"([^\"]*)\"",
+                    java.util.regex.Pattern.MULTILINE).matcher(toml);
+            return m.find() ? m.group(1) : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
 }

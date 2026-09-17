@@ -6,21 +6,25 @@ import com.deylauncher.auth.TokenVault;
 import com.deylauncher.friends.*;
 import com.deylauncher.deycapes.DeyCapesService;
 import com.deylauncher.identity.*;
+import com.deylauncher.launch.CrashDumps;
 import com.deylauncher.launch.GameFiles;
 import com.deylauncher.launch.GameLauncher;
 import com.deylauncher.launch.JavaRuntimeManager;
 import com.deylauncher.launch.LaunchDiagnostics;
 import com.deylauncher.launch.ServerAddressMatch;
 import com.deylauncher.launch.ServerSessionTracker;
+import com.deylauncher.launch.WaylandSupport;
 import com.deylauncher.modloader.FabricInstaller;
 import com.deylauncher.modloader.FabricApiInstaller;
 import com.deylauncher.modloader.ForgeInstaller;
+import com.deylauncher.modloader.NeoForgeInstaller;
 import com.deylauncher.modloader.SodiumInstaller;
 import com.deylauncher.modloader.IrisInstaller;
 import com.deylauncher.modloader.DeyCapesInstaller;
 import com.deylauncher.modloader.ModPairResolver;
 import com.deylauncher.modloader.ModsUtil;
 import com.deylauncher.modpack.*;
+import com.deylauncher.modrepair.InstalledModResolver;
 import com.deylauncher.server.*;
 import com.deylauncher.update.AppUpdater;
 import com.deylauncher.platform.PointerProbe;
@@ -129,6 +133,12 @@ public class LauncherApp extends Application {
     /** How often a live game session checks whether a pending "leave" has timed out (see ServerSessionTracker.poll). */
     private static final long PRESENCE_TICK_MS = 2_000L;
 
+    // ---- Account tab: the "share my server with friends" gold card ----
+    // Held so its status line can be refreshed the instant the live session (or invisible mode)
+    // changes, instead of only when the Account tab happens to be rebuilt. Null until the card has
+    // been built once; a stale runnable pointing at a closed window's labels is harmless.
+    private Runnable shareCardSync;
+
     // Dots currently being wave-pulsed (see WavePulse) -- unregistered when the containing page
     // re-renders so the animation engine never animates detached nodes.
     private final java.util.Set<Node> wavePulseDots = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -218,7 +228,7 @@ public class LauncherApp extends Application {
         this.darkMode = prefs.darkMode;
         this.identityStore = new IdentityStore(gameFiles.root);
         this.settings = new GameLauncher.LaunchSettings(prefs.ramMinMb, prefs.ramMaxMb,
-                prefs.gameWidth, prefs.gameHeight, prefs.fullscreen, prefs.softwareOpenGl);
+                prefs.gameWidth, prefs.gameHeight, prefs.fullscreen, prefs.softwareOpenGl, prefs.nativeWayland);
         this.friendsCache = new FriendsCache(gameFiles.root);
         this.friendNotes = new FriendNotesStore(gameFiles.root);
         this.serverStore = new ServerStore(gameFiles.root);
@@ -241,6 +251,11 @@ public class LauncherApp extends Application {
             };
             new Thread(seedTask, "dey-capes-seed").start();
         }
+
+        // Dumps written by earlier crashes (including ones from before the launcher redacted them) still
+        // sit in the instance folders repeating the launch command -- and therefore the account's access
+        // token. Clean them up on startup, in the background, so the fix also repairs what already leaked.
+        scrubLeftoverCrashDumps();
 
         stage.setTitle("DeyLauncher");
         stage.getIcons().add(new Image(getClass().getResourceAsStream("/app-icon.png")));
@@ -345,7 +360,11 @@ public class LauncherApp extends Application {
                 } catch (InterruptedException ignored) {
                     return;
                 }
-                if (appRunning) publishPresenceQuietly();
+                // Appearing offline means there is nothing to keep fresh: the entry is already
+                // OFFLINE with no details, and refreshing lastSeen would be the one thing that still
+                // leaks "their launcher is running". So the heartbeat simply idles while it's on --
+                // flipping the switch back publishes the real state immediately.
+                if (appRunning && !prefs.invisibleMode) publishPresenceQuietly();
             }
         }, "presence-heartbeat");
         heartbeat.setDaemon(true);
@@ -384,7 +403,11 @@ public class LauncherApp extends Application {
         PlayState state = livePlayState;
         String address = null;
         String name = null;
-        if (state == PlayState.SERVER && prefs.shareServerAddress) {
+        // "Only show to friends", in the one place every presence write goes through: with an empty
+        // friends list there is no audience at all, so not even the address is written. A friend added
+        // later sees it from the very next write (the heartbeat picks it up within a minute, and
+        // accepting a request also republishes).
+        if (state == PlayState.SERVER && prefs.shareServerAddress && hasAnyFriendCached()) {
             address = liveServerAddress;
             name = liveServerName;
         }
@@ -410,12 +433,17 @@ public class LauncherApp extends Application {
         if (friendsService == null) return;
         PlayerIdentity active = identityStore.getActive();
         if (active == null) return;
+        // While appearing offline, do NOT refresh lastSeen: friends.json is one shared file, so an
+        // entry whose lastSeen keeps ticking every minute is still a tell that the launcher is open,
+        // even with status OFFLINE. Invisible mode therefore writes only on the transition itself
+        // (see the toggle in buildAccountTab), and the heartbeat below skips while it is on.
+        boolean touchLastSeen = !prefs.invisibleMode;
         Task<Void> task = new Task<>() {
             @Override
             protected Void call() {
                 try {
                     friendsService.publishPresence(active.uuid, active.username, payload.status(),
-                            payload.address(), payload.name(), null, payload.playState());
+                            payload.address(), payload.name(), null, payload.playState(), touchLastSeen);
                 } catch (Exception ignored) {
                     // Best-effort -- a failed presence update isn't worth interrupting anything for.
                 }
@@ -453,7 +481,8 @@ public class LauncherApp extends Application {
         // null playState means invisible mode (currentPresence turned the whole payload into OFFLINE),
         // so there is nothing to advertise -- just publish that.
         boolean advertise = !prefs.invisibleMode && running && server.allowFriendsJoin
-                && live.playState() != null;
+                && live.playState() != null
+                && hasAnyFriendCached(); // nobody to join it yet -- nothing to advertise
         // Where the user actually IS beats where they're hosting: if the game we launched is already
         // connected to a server, that is the truthful presence (the local server is just something
         // they own), so it wins over advertising the hosted address.
@@ -1412,7 +1441,19 @@ public class LauncherApp extends Application {
         PlayerIdentity active = identityStore.getActive();
         if (active == null) return;
         FriendsService.FriendsView view = friendsCache.load();
-        FriendsData.UserEntry entry = (view != null) ? view.allUsers().get(friendUuid) : null;
+        // Friends only: this popup exists to render someone's published presence (what they're
+        // playing, which server to join). The shared friends file holds an entry for EVERY
+        // DeyLauncher user, so "there is an entry for this uuid" is not the same as "they are my
+        // friend" -- a uuid that isn't on our friends list must never reach the presence code below.
+        if (!isFriend(friendUuid, view)) {
+            new Alert(Alert.AlertType.INFORMATION,
+                    (friendUsername != null ? friendUsername : "That player") + " isn't on your friends "
+                            + "list, so their profile isn't shown. Send a friend request from the "
+                            + "Friends page first.",
+                    ButtonType.OK).showAndWait();
+            return;
+        }
+        FriendsData.UserEntry entry = view.allUsers().get(friendUuid);
         boolean online = effectivelyOnline(entry);
 
         VBox content = buildFriendProfileBody(active, friendUuid, friendUsername, entry, view, online);
@@ -1637,13 +1678,21 @@ public class LauncherApp extends Application {
     /** Publishes the currently-owned servers (from this install) to the friend profile, in the
      *  background. Only servers the user marked visible (Account > Friend Profile > Owned Servers)
      *  are shared; the rest stay private to this PC. Name + port; no icon since self-hosted servers
-     *  may have no hosted image. */
+     *  may have no hosted image. While "Appear offline" is on, an EMPTY list is published instead, so
+     *  the profile cannot keep advertising what this install hosts. */
     private void publishOwnedServers(PlayerIdentity active) {
         if (friendsService == null) return;
         java.util.List<FriendsData.ServerInfo> owned = new java.util.ArrayList<>();
-        for (var srv : serverStore.listAll()) {
-            if (srv.visibleToFriends && srv.name != null && !srv.name.isBlank()) {
-                owned.add(new FriendsData.ServerInfo(srv.name, srv.port, null));
+        // Appearing offline publishes nothing at all -- and that includes the servers you own, which
+        // would otherwise still tell anyone reading the shared file what you host and on which port
+        // while your profile claims to be offline. Pushing an empty list (rather than just skipping)
+        // is what actually clears whatever is already on the wire; the invisible toggle calls this
+        // immediately, and the one-shot publish at startup covers a launcher opened while invisible.
+        if (!prefs.invisibleMode) {
+            for (var srv : serverStore.listAll()) {
+                if (srv.visibleToFriends && srv.name != null && !srv.name.isBlank()) {
+                    owned.add(new FriendsData.ServerInfo(srv.name, srv.port, null));
+                }
             }
         }
         Task<Void> task = new Task<>() {
@@ -2155,7 +2204,11 @@ public class LauncherApp extends Application {
 
         var playing = view.friends().stream()
                 .map(f -> java.util.Map.entry(f, view.allUsers().get(f.uuid)))
-                .filter(e -> effectivelyOnline(e.getValue())
+                // Confirmed friends only, checked explicitly: this row hands friends a Join button
+                // straight into someone's server, so the friendship is re-verified here rather than
+                // trusted to "the list we iterated came from friends".
+                .filter(e -> isFriend(e.getKey().uuid, view)
+                        && effectivelyOnline(e.getValue())
                         && e.getValue().serverAddress != null && !e.getValue().serverAddress.isBlank())
                 .toList();
 
@@ -2360,6 +2413,7 @@ public class LauncherApp extends Application {
         String loader = actuallyDey ? "Fabric" : switch (server.type) {
             case FABRIC -> "Fabric";
             case FORGE -> "Forge";
+            case NEOFORGE -> "NeoForge";
             case VANILLA, PURPUR -> "Vanilla";
         };
         if (!versionBox.getItems().contains(server.minecraftVersion)) versionBox.getItems().add(server.minecraftVersion);
@@ -2826,6 +2880,152 @@ public class LauncherApp extends Application {
         d.getDialogPane().setContent(content);
         d.showAndWait();
     }
+    /**
+     * Applies a version change to a stopped server. This is the fix for "created a server, changed it
+     * to a lower version, and it crashes on the next launch", and it works in three parts:
+     *
+     * <ol>
+     *   <li><b>Know which way it goes.</b> The comparison is made against the version that actually
+     *       loaded this world last time ({@code lastRunVersion}), not just the configured one, because
+     *       that is what the world's data version really belongs to -- see {@link VersionChangePlan}.</li>
+     *   <li><b>Protect what an older server cannot read.</b> A downgrade (or an id we can't order, such
+     *       as a snapshot) offers to set the world aside first. Set aside means RENAMED, with the old
+     *       version and the date in the name -- never deleted -- and the same treatment is applied to
+     *       the mods folder, since mods built for a newer Minecraft version are the other thing that
+     *       kills an older server at startup.</li>
+     *   <li><b>Throw away the old software.</b> The jar, Forge's launch scripts and the Fabric/Forge
+     *       libraries are removed so the next Start must download the ones for the chosen version
+     *       ({@link ServerSoftwareMarker} records what ends up installed, and the downloader verifies
+     *       it on every start).</li>
+     * </ol>
+     */
+    private void applyServerVersionChange(ServerInstance server, String chosen,
+                                          List<VersionManifest.VersionEntry> manifestList, Label note) {
+        String worldVersion = (server.lastRunVersion != null && !server.lastRunVersion.isBlank())
+                ? server.lastRunVersion : server.minecraftVersion;
+        VersionChangePlan.Kind kind = VersionChangePlan.classify(worldVersion, chosen, manifestList);
+
+        boolean backUpWorld = false;
+        if (kind.needsWorldBackupOffer() && hasAnyWorld(server)) {
+            Alert confirm = new Alert(Alert.AlertType.CONFIRMATION);
+            confirm.setTitle("Change server version");
+            confirm.setHeaderText("Minecraft " + worldVersion + " -> " + chosen
+                    + (kind == VersionChangePlan.Kind.DOWNGRADE ? "  (an older version)" : ""));
+            confirm.setContentText("This server's world was saved by Minecraft " + worldVersion + ", and "
+                    + "an older server cannot read a world saved by a newer one -- that is what made a "
+                    + "downgrade end in a crash on the next launch.\n\n"
+                    + "BACK UP WORLD: the world is kept on disk under a new name (with " + worldVersion
+                    + " and the date), mods from " + worldVersion + " are set aside too, and the server "
+                    + "starts on a fresh world.\n\n"
+                    + "KEEP WORLD: nothing is moved, but the server may still refuse to start.");
+            ButtonType backupBtn = new ButtonType("Back up world & start fresh", ButtonBar.ButtonData.OK_DONE);
+            ButtonType keepBtn = new ButtonType("Keep world (may crash)", ButtonBar.ButtonData.NO);
+            confirm.getButtonTypes().setAll(backupBtn, keepBtn, ButtonType.CANCEL);
+            var picked = confirm.showAndWait();
+            if (picked.isEmpty() || picked.get() == ButtonType.CANCEL) return;
+            backUpWorld = picked.get() == backupBtn;
+        }
+
+        Path dir = serverStore.serverDir(server.id);
+        java.util.List<String> moved = new java.util.ArrayList<>();
+        boolean moveFailed = false;
+        if (backUpWorld) {
+            java.time.LocalDateTime when = java.time.LocalDateTime.now();
+            for (String worldDirName : VersionChangePlan.worldDirNames(serverLevelName(server, dir))) {
+                Path from = dir.resolve(worldDirName);
+                if (!Files.isDirectory(from)) continue;
+                Path to = dir.resolve(VersionChangePlan.backupDirName(worldDirName, worldVersion, when));
+                try {
+                    Files.move(from, to);
+                    moved.add(worldDirName + " -> " + to.getFileName());
+                } catch (Exception ex) {
+                    moveFailed = true;
+                    note.setText("Couldn't set the world aside (" + ex.getMessage() + "), so nothing was "
+                            + "changed. Close anything using the world and try again.");
+                }
+            }
+            // Mods belong to the version that installed them: a mod built for a newer Minecraft version
+            // is the other thing that kills an older server at startup, so they go with the world --
+            // renamed, never deleted, so they can be moved back for the newer version.
+            Path modsDir = dir.resolve("mods");
+            if (!moveFailed && hasFiles(modsDir)) {
+                Path to = dir.resolve(VersionChangePlan.backupDirName("mods", worldVersion, when));
+                try {
+                    Files.move(modsDir, to);
+                    moved.add("mods -> " + to.getFileName());
+                } catch (Exception ex) {
+                    note.setText("The world was set aside, but mods/ couldn't be moved ("
+                            + ex.getMessage() + "). Remove the mods built for " + worldVersion
+                            + " by hand before starting, or the server may still refuse to start.");
+                }
+            }
+        }
+        if (moveFailed) return;
+
+        // Old software must go even when the world is kept: launching the previous version's jar was
+        // the other half of the same bug. (The downloader re-checks this on every start.)
+        java.util.List<String> replaced = ServerSoftwareMarker.purgeVersionBoundSoftware(dir);
+        server.minecraftVersion = chosen;
+        serverStore.save(server);
+        finishVersionChange(server, chosen, moved, replaced, note);
+    }
+
+    /**
+     * Reports what a version change did -- including exactly what was set aside, so the user can find
+     * their old world -- and rebuilds the servers page so the new version shows on the card.
+     */
+    private void finishVersionChange(ServerInstance server, String chosen, java.util.List<String> moved,
+                                     java.util.List<String> replaced, Label note) {
+        StringBuilder summary = new StringBuilder("Version changed to " + chosen + ".");
+        if (!replaced.isEmpty()) {
+            summary.append(" Removed the old server software (").append(String.join(", ", replaced))
+                    .append(") -- the next Start downloads ")
+                    .append(server.type != null ? server.type.displayName() : "the server")
+                    .append(" ").append(chosen).append(".");
+        } else {
+            summary.append(" The next Start downloads this version's server software.");
+        }
+        if (!moved.isEmpty()) {
+            summary.append(" Kept, renamed: ").append(String.join("; ", moved)).append(".");
+        }
+        note.setText(summary.toString());
+        renderServersPageContent();
+
+        if (!moved.isEmpty()) {
+            new Alert(Alert.AlertType.INFORMATION, summary + "\n\nNothing was deleted -- everything set "
+                    + "aside is still inside this server's folder.", ButtonType.OK).showAndWait();
+        }
+    }
+
+    /** This server's world folder name, from server.properties (defaults to "world"). */
+    private String serverLevelName(ServerInstance server, Path serverDir) {
+        try {
+            String name = new ServerPropertiesManager(serverDir).read().get("level-name");
+            return (name == null || name.isBlank()) ? "world" : name.trim();
+        } catch (Exception e) {
+            return "world";
+        }
+    }
+
+    /** True when this server already has a world on disk, so a downgrade has something to protect. */
+    private boolean hasAnyWorld(ServerInstance server) {
+        Path dir = serverStore.serverDir(server.id);
+        for (String worldDirName : VersionChangePlan.worldDirNames(serverLevelName(server, dir))) {
+            if (Files.isDirectory(dir.resolve(worldDirName))) return true;
+        }
+        return false;
+    }
+
+    /** True when {@code dir} holds at least one entry (used to skip renaming an empty mods/ folder). */
+    private static boolean hasFiles(Path dir) {
+        if (!Files.isDirectory(dir)) return false;
+        try (var stream = Files.list(dir)) {
+            return stream.findAny().isPresent();
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
     private Node buildServerConsoleTab(ServerInstance server) {
         VBox box = new VBox(14);
         box.setPadding(new Insets(20));
@@ -2850,6 +3050,11 @@ public class LauncherApp extends Application {
             String current = serverVersionBox.getValue();
             serverVersionBox.getItems().clear();
             for (var v : versionsTask.getValue()) if (v.type().equals("release")) serverVersionBox.getItems().add(v.id());
+            // Keep this server's own version selectable even when it isn't a "release" in the manifest
+            // (the synthetic 26.2 seed, or a snapshot) -- otherwise the combo would come back blank.
+            if (current != null && !current.isBlank() && !serverVersionBox.getItems().contains(current)) {
+                serverVersionBox.getItems().add(0, current);
+            }
             serverVersionBox.setValue(current);
         });
         new Thread(versionsTask, "server-console-versions").start();
@@ -2858,6 +3063,7 @@ public class LauncherApp extends Application {
         changeVersionBtn.getStyleClass().add("pill-button");
         Label versionChangeNote = new Label();
         versionChangeNote.getStyleClass().add("notice-label");
+        versionChangeNote.setWrapText(true);
         changeVersionBtn.setOnAction(ev -> {
             String chosen = serverVersionBox.getValue();
             if (chosen == null || chosen.equals(server.minecraftVersion)) return;
@@ -2865,21 +3071,7 @@ public class LauncherApp extends Application {
                 versionChangeNote.setText("Stop the server before changing its version.");
                 return;
             }
-            server.minecraftVersion = chosen;
-            serverStore.save(server);
-            Path dir = serverStore.serverDir(server.id);
-            // The old server.jar (and, for Forge, its generated run.sh/run.bat/libraries) is for
-            // the PREVIOUS version -- delete just the software, not the world, so the next Start
-            // downloads a fresh server for the new version instead of silently reusing the old one.
-            try {
-                Files.deleteIfExists(dir.resolve("server.jar"));
-                Files.deleteIfExists(dir.resolve("run.sh"));
-                Files.deleteIfExists(dir.resolve("run.bat"));
-                Files.deleteIfExists(dir.resolve("user_jvm_args.txt"));
-            } catch (Exception ignored) {
-            }
-            versionChangeNote.setText("Version changed to " + chosen + " -- will download fresh on next Start.");
-            renderServersPageContent();
+            applyServerVersionChange(server, chosen, versionsTask.getValue(), versionChangeNote);
         });
 
         // ---- Copyable server IP (top right) ----
@@ -2964,6 +3156,7 @@ public class LauncherApp extends Application {
             String loader = actuallyDeyForPlay ? "Fabric" : switch (server.type) {
                 case FABRIC -> "Fabric";
                 case FORGE -> "Forge";
+                case NEOFORGE -> "NeoForge";
                 case VANILLA, PURPUR -> "Vanilla";
             };
             String clientVersion = clientVersionBox.getValue();
@@ -3066,7 +3259,11 @@ public class LauncherApp extends Application {
                     Platform.runLater(() -> serverConsoleArea.appendText("[DeyLauncher] Downloading/verifying "
                             + server.type.displayName() + " " + server.minecraftVersion + "...\n"));
                     ServerDownloader downloader = new ServerDownloader(manifest);
-                    Path jar = downloader.ensureServerJar(server, serverDir, javaBinary);
+                    // The note consumer is how the downloader explains anything it had to replace (e.g.
+                    // server files left over from another version) in this server's own console.
+                    Path jar = downloader.ensureServerJar(server, serverDir, javaBinary,
+                            message -> Platform.runLater(() ->
+                                    serverConsoleArea.appendText("[DeyLauncher] " + message + "\n")));
 
                     // Seed server.properties with a sensible default online-mode the first time a
                     // server runs (before the user ever opens Properties), matching the account
@@ -3084,16 +3281,38 @@ public class LauncherApp extends Application {
                         }
                     }
 
-                    Platform.runLater(() -> serverConsoleArea.appendText("[DeyLauncher] Starting...\n"));
+                    Platform.runLater(() -> serverConsoleArea.appendText("[DeyLauncher] Starting "
+                            + server.type.displayName() + " " + server.minecraftVersion
+                            + (jar != null ? " (" + jar.getFileName() + ")" : " (Forge launch args)")
+                            + "...\n"));
                     ServerProcessManager pm = new ServerProcessManager();
                     Process process = pm.start(server, serverDir, jar, javaBinary);
                     runningServers.put(server.id, pm);
 
+                    // Hints for the failure signatures Minecraft/Forge/Fabric actually print, shown once
+                    // each: a version change that still goes wrong must not look like a bare "exited with
+                    // code 1" with no explanation (see ServerStartDiagnostics).
+                    java.util.List<ServerStartDiagnostics.Hint> hintsShown = new java.util.ArrayList<>();
+                    boolean[] reportedReady = { false };
                     try (var reader = new java.io.BufferedReader(new java.io.InputStreamReader(process.getInputStream()))) {
                         String line;
                         while ((line = reader.readLine()) != null) {
                             String finalLine = line;
                             pm.observeConsoleLine(finalLine);
+                            ServerStartDiagnostics.Hint hint = ServerStartDiagnostics.hintFor(finalLine);
+                            if (ServerStartDiagnostics.isNew(hintsShown, hint)) {
+                                hintsShown.add(hint);
+                                Platform.runLater(() -> serverConsoleArea.appendText(
+                                        "[DeyLauncher] " + hint.message() + "\n"));
+                            }
+                            // "Done (...)! For help, type..." is the server saying it is actually up, which
+                            // is the only moment we know this version really can read the world -- so that
+                            // is when it becomes the baseline the NEXT version change is measured against.
+                            if (!reportedReady[0] && finalLine.contains("Done (")) {
+                                reportedReady[0] = true;
+                                server.lastRunVersion = server.minecraftVersion;
+                                serverStore.save(server);
+                            }
                             Platform.runLater(() -> serverConsoleArea.appendText(finalLine + "\n"));
                         }
                     }
@@ -3944,8 +4163,12 @@ public class LauncherApp extends Application {
                     throw new IllegalStateException("this pack is for Minecraft " + info.mcVersion()
                             + ", but this server runs Minecraft " + server.minecraftVersion + ".");
                 }
-                return new ModpackInstaller().installForServer(info, serverStore.serverDir(server.id),
-                        addonFolder, null);
+                // The pack's own version/loader drive the resolution of its CurseForge file ids, so the
+                // server gets the same automatic download the client does (only its own folder's files).
+                return new ModpackInstaller().installForServer(info,
+                        info.knowsMinecraftVersion() ? info.mcVersion() : server.minecraftVersion,
+                        info.loaderDeclared() ? info.launcherLoader() : server.type.displayName(),
+                        serverStore.serverDir(server.id), addonFolder, null, null);
             }
         };
         task.setOnSucceeded(ev -> Platform.runLater(() -> {
@@ -4630,6 +4853,7 @@ public class LauncherApp extends Application {
         liveServerAddress = address;
         liveServerName = resolvedName;
         livePlayState = PlayState.SERVER;
+        refreshShareCard(); // the Account tab's card says what is shared right now
         publishPresenceQuietly();
     }
 
@@ -4639,6 +4863,7 @@ public class LauncherApp extends Application {
         liveServerAddress = null;
         liveServerName = null;
         livePlayState = PlayState.SINGLE_PLAYER;
+        refreshShareCard();
         publishPresenceQuietly();
     }
 
@@ -4648,6 +4873,7 @@ public class LauncherApp extends Application {
         liveServerAddress = null;
         liveServerName = null;
         livePlayState = PlayState.IN_LAUNCHER;
+        refreshShareCard();
         publishPresenceQuietly();
     }
 
@@ -4944,11 +5170,11 @@ public class LauncherApp extends Application {
                     "DEY builds run a curated set of performance and quality-of-life mods -- "
                             + "Sodium + Iris (shaders) + Fabric API install automatically, no setup needed.");
         } else {
-            modLoaderBox.getItems().addAll("Vanilla", "Fabric", "Forge");
+            modLoaderBox.getItems().addAll("Vanilla", "Fabric", "Forge", "NeoForge");
             modLoaderBox.setValue("Vanilla");
             modLoaderBox.setDisable(false);
             mainDescriptionLabel.setText(
-                    "Clean, unmodified loaders -- pick Vanilla, Fabric, or Forge yourself.");
+                    "Clean, unmodified loaders -- pick Vanilla, Fabric, Forge, or NeoForge yourself.");
         }
         rebuildVersionTiles();
         refreshModpackButtonIcon(versionBox.getValue(), modLoaderBox.getValue());
@@ -5168,6 +5394,16 @@ public class LauncherApp extends Application {
             }
         });
 
+        Button repairBtn = new Button();
+        repairBtn.setGraphic(icon(IconFactory.Icon.TOOLS, 16));
+        repairBtn.setGraphicTextGap(0);
+        repairBtn.getStyleClass().add("icon-button");
+        repairBtn.setTooltip(new Tooltip("Check this pack's files and download anything missing"));
+        repairBtn.setOnAction(e -> {
+            popup.hide();
+            repairInstalledModpack(meta);
+        });
+
         Button deleteBtn = new Button();
         deleteBtn.setGraphic(icon(IconFactory.Icon.TRASH, 16));
         deleteBtn.setGraphicTextGap(0);
@@ -5185,10 +5421,47 @@ public class LauncherApp extends Application {
             deleteInstalledModpack(meta);
         });
 
-        HBox rowBox = new HBox(6, row, deleteBtn);
+        HBox rowBox = new HBox(6, row, repairBtn, deleteBtn);
         rowBox.setAlignment(Pos.CENTER_LEFT);
         rowBox.setMaxWidth(Double.MAX_VALUE);
         return rowBox;
+    }
+
+    /**
+     * Checks one installed pack against its own file manifest and downloads back anything that's
+     * missing -- the same pass that runs automatically before a pack is launched (see onPlay), offered
+     * on demand from the modpack menu so a pack can be verified without starting the game.
+     */
+    private void repairInstalledModpack(ModpackMeta meta) {
+        Path instanceDir = ModpackMeta.instanceDirFor(gameFiles.root, meta.mcVersion, meta.loader);
+        log("Checking \"" + meta.name + "\" for missing files...");
+        Task<ModpackVerifier.Report> task = new Task<>() {
+            @Override
+            protected ModpackVerifier.Report call() {
+                ModpackMeta fresh = ModpackMeta.read(instanceDir);
+                return new ModpackVerifier().verifyClient(fresh == null ? meta : fresh, instanceDir, null);
+            }
+        };
+        task.setOnSucceeded(ev -> Platform.runLater(() -> {
+            ModpackVerifier.Report report = task.getValue();
+            log("Modpack \"" + meta.name + "\": " + report.summary());
+            if (!report.errors().isEmpty()) {
+                String failed = "  " + String.join("\n  ", report.errors());
+                log("Files that couldn't be restored:\n" + failed);
+            }
+            StringBuilder alert = new StringBuilder(report.summary());
+            alert.append(report.clean()
+                    ? "\n\nEvery file this pack asks for is in place."
+                    : "\n\nThe missing ones were downloaded again into " + instanceDir + ".");
+            if (!report.errors().isEmpty()) {
+                alert.append("\n\nStill missing:\n")
+                        .append(String.join("\n", report.errors().subList(0, Math.min(8, report.errors().size()))));
+            }
+            new Alert(Alert.AlertType.INFORMATION, alert.toString(), ButtonType.OK).showAndWait();
+        }));
+        task.setOnFailed(ev -> Platform.runLater(() ->
+                log("Couldn't check \"" + meta.name + "\": " + task.getException())));
+        new Thread(task, "modpack-verify").start();
     }
 
     /** Deletes an installed modpack's entire instance folder (modpack.json, mods, config, etc.).
@@ -5370,15 +5643,20 @@ public class LauncherApp extends Application {
             bar.setVisible(true);
             bar.setManaged(true);
             bar.setProgress(0);
-            status.setText("Installing " + info.name() + " into Minecraft " + mc + " (" + loader
-                    + ") -- " + info.downloads().size() + " file(s) to download, "
-                    + info.bundled().size() + " bundled in the pack...");
+            status.setText(info.resolvesRemotely()
+                    ? "Resolving " + info.name() + "'s files on CurseForge, then installing into Minecraft "
+                      + mc + " (" + loader + ") -- its mods download themselves, nothing for you to fetch..."
+                    : "Installing " + info.name() + " into Minecraft " + mc + " (" + loader + ") -- "
+                      + info.downloads().size() + " file(s) to download, " + info.bundled().size()
+                      + " bundled in the pack...");
             Task<ModpackInstaller.Result> task = new Task<>() {
                 @Override
                 protected ModpackInstaller.Result call() throws Exception {
-                    // onProgress fires once per file (not per byte), so a runLater per step is cheap.
-                    return new ModpackInstaller().installForClient(info, instanceDir,
-                            f -> Platform.runLater(() -> bar.setProgress(f)));
+                    // onProgress fires once per resolved/file (not per byte), so a runLater per step is
+                    // cheap; the status sink reports the phases (resolving pack ids, then transferring).
+                    return new ModpackInstaller().installForClient(info, mc, loader, instanceDir,
+                            f -> Platform.runLater(() -> bar.setProgress(f)),
+                            msg -> Platform.runLater(() -> status.setText(msg)));
                 }
             };
             task.setOnSucceeded(ev -> Platform.runLater(() -> finishModpackInstall(
@@ -5451,9 +5729,13 @@ public class LauncherApp extends Application {
                 + (info.loaderVersion() == null || info.loaderVersion().isBlank() ? "" : " " + info.loaderVersion()));
         meta.getStyleClass().add("mod-filename");
         meta.setWrapText(true);
-        Label counts = new Label(info.downloads().size() + " file(s) to download  ·  "
-                + info.bundled().size() + " bundled in the pack"
-                + (info.unresolvedCount() > 0 ? "  ·  " + info.unresolvedCount() + " can't be fetched automatically" : ""));
+        Label counts = new Label(info.resolvesRemotely()
+                ? "This pack's files live on CurseForge by id -- they're fetched for you during the "
+                  + "install and dropped into the right mods folder automatically"
+                  + (info.bundled().size() > 0 ? "  ·  " + info.bundled().size() + " bundled in the pack" : "")
+                : info.downloads().size() + " file(s) to download  ·  "
+                  + info.bundled().size() + " bundled in the pack"
+                  + (info.unresolvedCount() > 0 ? "  ·  " + info.unresolvedCount() + " can't be fetched automatically" : ""));
         counts.getStyleClass().add("mod-filename");
         counts.setWrapText(true);
         text.getChildren().addAll(name, meta, counts);
@@ -5519,6 +5801,9 @@ public class LauncherApp extends Application {
         if (!selected) {
             log("Minecraft " + mc + " isn't selectable in the Version dropdown yet -- pick it there once it appears.");
         }
+        for (String warning : result.warnings()) {
+            log("Modpack note: " + warning);
+        }
         if (!result.errors().isEmpty()) {
             StringBuilder failed = new StringBuilder();
             int shown = 0;
@@ -5538,10 +5823,17 @@ public class LauncherApp extends Application {
         alert.append(".\n\n").append(result.summary()).append('\n');
         if (info.note() != null && !info.note().isBlank()) alert.append('\n').append(info.note());
         if (!result.errors().isEmpty()) {
-            alert.append("\n\nFile(s) that failed:\n")
+            alert.append("\n\nFile(s) the pack wants but couldn't be installed:\n")
                     .append(String.join("\n", result.errors().subList(0, Math.min(8, result.errors().size()))));
         }
-        alert.append("\n\nPress PLAY to start the pack.");
+        if (result.ok()) {
+            alert.append("\n\nPress PLAY to start the pack. Anything that goes missing later is checked and "
+                    + "downloaded again automatically before the game starts.");
+        } else {
+            alert.append("\n\nThat install is incomplete. Press PLAY anyway: the launcher re-checks the pack "
+                    + "and tries to fetch every missing file again before launching, so a flaky download "
+                    + "usually fixes itself on the next run.");
+        }
         new Alert(Alert.AlertType.INFORMATION, alert.toString(), ButtonType.OK).showAndWait();
     }
 
@@ -6429,6 +6721,9 @@ public class LauncherApp extends Application {
      * runs once the scan settles (success, failure, or nothing to scan) so the caller can refresh
      * anything that depends on {@code problemFiles}.
      */
+    /** Outcome of the background compatibility scan: which mods need fixing, and what it couldn't tell. */
+    private record FixScan(java.util.Set<String> problems, int unverified, int unchecked) { }
+
     private void refreshFixStatus(ModsManager mods, List<ModsManager.ModEntry> list,
                                   Button fixBtn, Label fixStatus, String mcVersion,
                                   java.util.Set<String> problemFiles, Runnable onDone) {
@@ -6441,31 +6736,47 @@ public class LauncherApp extends Application {
             if (onDone != null) onDone.run();
             return;
         }
-        Task<java.util.Set<String>> task = new Task<>() {
+        Task<FixScan> task = new Task<>() {
             @Override
-            protected java.util.Set<String> call() {
+            protected FixScan call() {
                 ModrinthClient client = new ModrinthClient();
+                CurseForgeFallback curseForge = new CurseForgeFallback(gameFiles.root);
+                InstalledModResolver resolver = new InstalledModResolver(client, curseForge);
+                String loader = modLoaderBox.getValue();
                 java.util.Set<String> problems = new java.util.LinkedHashSet<>();
+                int unverified = 0, unchecked = 0;
                 for (var m : candidates) {
-                    String slug = resolveModSlug(client, mods, m);
-                    if (slug == null) continue; // can't identify the project -> leave untouched
+                    // The SAME resolver the Fix action uses decides what counts as a problem here, so the
+                    // button is offered exactly when the fixer can actually act: Modrinth first, then the
+                    // keyless CurseForge fallback for a mod Modrinth doesn't carry or has no build for.
+                    // Only a VERIFIED identity may decide "this mod is incompatible" -- anything else is
+                    // counted instead, so the window never claims a mod is fine when we simply couldn't
+                    // judge it. (A mod that is on Modrinth with a compatible build short-circuits before
+                    // CurseForge is ever consulted, so a normal pack scan costs no extra requests.)
                     try {
-                        var compatible = client.compatibleVersionsLenient(slug, mcVersion);
-                        if (compatible.isEmpty()) { problems.add(m.fileName()); continue; } // no build for this MC version -> incompatible
-                        boolean installedMatches = compatible.stream()
-                                .anyMatch(v -> ModrinthClient.versionFileMatches(v, m.fileName()));
-                        if (!installedMatches) problems.add(m.fileName()); // compatible version exists but installed build is stale/wrong
+                        InstalledModResolver.Resolution r = resolver.resolve(mods.modSlug(m.fileName()),
+                                m.fileName(), mcVersion, loader, mods.modLicense(m.fileName()));
+                        if (r.transientFailure()) { unchecked++; continue; }
+                        boolean needsFix = r.needsReplacement()
+                                || (r.source() == InstalledModResolver.Source.NONE && r.modrinthKnown()
+                                    && r.noModrinthBuildForThisVersion());
+                        if (needsFix) {
+                            problems.add(m.fileName());
+                        } else if (r.source() == InstalledModResolver.Source.NONE && !r.modrinthKnown()) {
+                            unverified++; // not fixable from any permitted source: never touch it
+                        }
                     } catch (Exception ignored) {
-                        // Couldn't reach Modrinth for this one -- keep checking the rest.
+                        // Couldn't reach a source for this one (rate limit, offline) -- keep checking the rest.
+                        unchecked++;
                     }
                 }
-                return problems;
+                return new FixScan(problems, unverified, unchecked);
             }
         };
         task.setOnSucceeded(e -> Platform.runLater(() -> {
-            java.util.Set<String> problems = task.getValue();
-            problemFiles.addAll(problems);
-            boolean fix = !problems.isEmpty();
+            FixScan scan = task.getValue();
+            problemFiles.addAll(scan.problems());
+            boolean fix = !scan.problems().isEmpty();
             fixBtn.setVisible(fix);
             fixBtn.setManaged(fix);
             fixStatus.setVisible(fix);
@@ -6473,7 +6784,7 @@ public class LauncherApp extends Application {
             if (fix) {
                 fixStatus.setText("Some installed mods aren't compatible with Minecraft " + mcVersion
                         + ". Click Fix Mods to convert them to a working version (or remove them if "
-                        + "no compatible version exists).");
+                        + "no compatible version exists)." + scanNote(scan));
             }
             if (onDone != null) onDone.run();
         }));
@@ -6484,13 +6795,31 @@ public class LauncherApp extends Application {
         new Thread(task, "mod-compat-scan").start();
     }
 
+    /** Appends how many mods the scan could NOT judge, so "nothing to fix" is never misleading. */
+    private static String scanNote(FixScan scan) {
+        StringBuilder sb = new StringBuilder();
+        if (scan.unverified() > 0) {
+            sb.append(" (").append(scan.unverified()).append(scan.unverified() == 1
+                    ? " mod can't be fixed automatically (it isn't on Modrinth, and its own license "
+                      + "doesn't permit fetching it elsewhere), so it is left untouched.)"
+                    : " mods can't be fixed automatically (they aren't on Modrinth, and their own "
+                      + "licenses don't permit fetching them elsewhere), so they are left untouched.)");
+        }
+        if (scan.unchecked() > 0) {
+            sb.append(" (").append(scan.unchecked()).append(" couldn't be checked right now.)");
+        }
+        return sb.toString();
+    }
+
     /**
-     * The Mods window's selection-toolbar version of the Fix action: "Fix Selected" converts only
-     * the SELECTED mods that are actually incompatible (removing any with no compatible build for
-     * the current Minecraft version); "Update Selected" grabs the newest compatible build for every
-     * selected mod that isn't already on it, but never deletes one just because Modrinth has
-     * nothing newer for it. Bundled mods are skipped even if somehow selected. Runs in the
-     * background, same pattern as {@link #runFixIncompatibleMods}.
+     * The Mods window's selection-toolbar version of the Fix action: "Fix Selected" converts only the
+     * SELECTED mods that are actually incompatible (removing any with no compatible build for the current
+     * Minecraft version, unless the instance is a managed modpack); "Update Selected" grabs the newest
+     * compatible build for every selected mod that isn't already on it, and never deletes anything.
+     * Both go through the same resolver chain as {@link #runFixIncompatibleMods} (Modrinth, then the
+     * keyless CurseForge fallback), so a mod that only exists on CurseForge can be updated here too.
+     * Bundled mods are skipped even if somehow selected. Runs in the background, same pattern as
+     * {@link #runFixIncompatibleMods}.
      */
     private void runFixOrUpdateSelected(ModsManager mods, java.util.Set<String> selectedFiles,
                                         java.util.Set<String> problemFiles, String mcVersion,
@@ -6498,13 +6827,18 @@ public class LauncherApp extends Application {
         if (mcVersion == null || mcVersion.isBlank() || selectedFiles.isEmpty()) return;
         List<String> targets = new ArrayList<>(selectedFiles);
         java.util.Set<String> problemsSnapshot = new java.util.LinkedHashSet<>(problemFiles);
+        // Read both on the FX thread (this method runs there); a background task must not read the UI.
+        boolean packManaged = ModpackMeta.read(currentInstanceDir()) != null;
+        String loader = modLoaderBox.getValue();
         triggerBtn.setDisable(true);
         Task<String> task = new Task<>() {
             @Override
             protected String call() {
                 ModrinthClient client = new ModrinthClient();
+                CurseForgeFallback curseForge = new CurseForgeFallback(gameFiles.root);
+                InstalledModResolver resolver = new InstalledModResolver(client, curseForge);
                 StringBuilder detail = new StringBuilder();
-                int changed = 0, removed = 0, skipped = 0;
+                int changed = 0, removed = 0, kept = 0, unverified = 0, unchecked = 0, skipped = 0;
                 try {
                     java.util.Map<String, ModsManager.ModEntry> byFileName = new java.util.HashMap<>();
                     for (var m : mods.list()) byFileName.put(m.fileName(), m);
@@ -6512,42 +6846,27 @@ public class LauncherApp extends Application {
                         if (fixOnly && !problemsSnapshot.contains(fileName)) { skipped++; continue; }
                         ModsManager.ModEntry m = byFileName.get(fileName);
                         if (m == null || isBundledFamily(m.fileName())) { skipped++; continue; }
-                        String slug = resolveModSlug(client, mods, m);
-                        if (slug == null) { skipped++; continue; }
-                        try {
-                            var compatible = client.compatibleVersionsLenient(slug, mcVersion);
-                            if (compatible.isEmpty()) {
-                                if (fixOnly) {
-                                    mods.delete(m.fileName());
-                                    removed++;
-                                    detail.append("  • Removed ").append(m.fileName())
-                                            .append(" -- no version supports ").append(mcVersion).append(".\n");
-                                } else {
-                                    skipped++;
-                                }
-                                continue;
-                            }
-                            boolean installedMatches = compatible.stream()
-                                    .anyMatch(v -> ModrinthClient.versionFileMatches(v, m.fileName()));
-                            if (installedMatches) { skipped++; continue; } // already the newest compatible build
-                            var target = compatible.get(0); // newest compatible
-                            Path downloaded = client.download(target, mods.modsDir());
-                            try { deleteJarsForSlug(mods.modsDir(), slug, downloaded); } catch (Exception ignored) {}
-                            try {
-                                if (!downloaded.getFileName().toString().equals(m.fileName())) mods.delete(m.fileName());
-                            } catch (Exception ignored) {}
-                            changed++;
-                            detail.append("  • ").append(fixOnly ? "Converted " : "Updated ")
-                                    .append(m.displayName()).append(" to version ")
-                                    .append(target.versionNumber()).append(".\n");
-                        } catch (Exception ex) {
-                            skipped++;
+                        // Same resolver chain as Fix Mods (Modrinth -> keyless CurseForge). "Update
+                        // Selected" never removes anything, and "Fix Selected" never removes inside a
+                        // managed pack -- see applyResolvedFix for both rules.
+                        FixOutcome outcome = applyResolvedFix(client, resolver, curseForge, mods, m,
+                                mcVersion, loader, fixOnly && !packManaged);
+                        switch (outcome.kind()) {
+                            case FIXED -> changed++;
+                            case REMOVED -> removed++;
+                            case KEPT -> kept++;
+                            case UNIDENTIFIED -> unverified++;
+                            case UNCHECKED -> unchecked++;
+                            default -> skipped++; // already current, or not part of this action
                         }
+                        if (outcome.detail() != null) detail.append(outcome.detail());
                     }
                 } catch (Exception ex) {
                     return "ERROR\n" + ex.getMessage();
                 }
-                return "FIXED " + changed + "\nREMOVED " + removed + "\n" + detail;
+                return "FIXED " + changed + "\nREMOVED " + removed + "\nKEPT " + kept
+                        + "\nUNVERIFIED " + unverified + "\nUNCHECKED " + unchecked
+                        + "\nSKIPPED " + skipped + "\n" + detail;
             }
         };
         task.setOnSucceeded(ev -> Platform.runLater(() -> {
@@ -6576,12 +6895,146 @@ public class LauncherApp extends Application {
         addonSlugByBase.put(key, hit.slug());
         return hit.slug();
     }
-/**
-     * The Fix action: for each installed NON-bundled mod that is incompatible with the current MC
-     * version, download the newest compatible build from Modrinth and replace the installed jar; if
-     * the project has no build for this MC version at all, remove the mod. Bundled DEY mods are never
-     * touched here (they're repaired by their own installers). Runs in the background and re-renders +
-     * summarizes on completion.
+
+    /**
+     * A Modrinth slug we can actually TRUST for this installed jar -- the mod's own declared id
+     * (fabric.mod.json {@code id} / mods.toml {@code modId}) must resolve to a real Modrinth project
+     * of the right kind (see {@link ModrinthClient#projectByExactSlug}).
+     *
+     * <p>Deliberately does NOT fall back to a display-name search, unlike {@link #resolveModSlug}:
+     * that fuzzy path is fine for hanging an icon off a mod, but it must never decide that a jar is
+     * "incompatible", because acting on a wrong match is how a modpack loses working mods.
+     *
+     * @return the verified slug, or null when the mod can't be identified -- meaning "leave it alone".
+     */
+    private String resolveVerifiedSlug(ModrinthClient client, ModsManager mods, ModsManager.ModEntry m) {
+        String declared = mods.modSlug(m.fileName());
+        if (declared == null || declared.isBlank()) return null;
+        var hit = client.projectByExactSlug(declared, "mod");
+        return hit == null || hit.slug().isBlank() ? null : hit.slug();
+    }
+    /** What one mod's Fix attempt did, so both Fix entry points report it identically. */
+    private enum FixKind { UP_TO_DATE, FIXED, REMOVED, KEPT, UNIDENTIFIED, UNCHECKED }
+
+    /** One mod's Fix result plus the human-readable line describing it (null when nothing noteworthy). */
+    private record FixOutcome(FixKind kind, String detail) {
+        static FixOutcome of(FixKind kind) { return new FixOutcome(kind, null); }
+    }
+
+    /**
+     * Resolves and applies the fix for ONE installed mod through the shared resolver chain
+     * ({@link InstalledModResolver}): Modrinth first, then the keyless CurseForge fallback when the mod's
+     * own declared license permits it ({@link ModDistributionPolicy}).
+     *
+     * <p>This wiring is the point of the resolver: the launcher installs plenty of CurseForge packs, and
+     * for a mod that isn't published on Modrinth the old code simply reported "unverified / left
+     * untouched", so Fix did nothing useful for exactly the packs that needed it. Now such a mod is
+     * fetched from CurseForge when its license allows, and when nothing can be done the report says why.
+     *
+     * <p>Two invariants are preserved from the Modrinth-only implementation:
+     * <ul>
+     *   <li>only a mod whose own declared id resolves to a real project is ever touched -- no fuzzy name
+     *       matching (a wrong guess is how a modpack loses working mods), and</li>
+     *   <li>inside a modpack instance nothing is DELETED ({@code allowRemove} is false): the pack's mod
+     *       set is curated by its author.</li>
+     * </ul>
+     */
+    private FixOutcome applyResolvedFix(ModrinthClient client, InstalledModResolver resolver,
+                                        CurseForgeFallback curseForge, ModsManager mods,
+                                        ModsManager.ModEntry m, String mcVersion, String loader,
+                                        boolean allowRemove) {
+        InstalledModResolver.Resolution r;
+        try {
+            r = resolver.resolve(mods.modSlug(m.fileName()), m.fileName(), mcVersion, loader,
+                    mods.modLicense(m.fileName()));
+        } catch (Exception e) {
+            return new FixOutcome(FixKind.UNCHECKED, "  • Couldn't check " + m.fileName() + " right now ("
+                    + brief(e) + ") -- run Fix again in a minute.\n");
+        }
+
+        if (r.upToDate()) return FixOutcome.of(FixKind.UP_TO_DATE);
+
+        if (r.canFix()) {
+            try {
+                Path downloaded = r.source() == InstalledModResolver.Source.CURSEFORGE
+                        ? curseForge.download(r.curseForgeCandidate(), mods.modsDir())
+                        : client.download(r.downloadUrl(), r.targetFileName(), mods.modsDir());
+                // "Converted" replaces the jar one-for-one: never leave two builds of the same mod installed.
+                if (r.source() == InstalledModResolver.Source.MODRINTH) {
+                    try { deleteJarsForSlug(mods.modsDir(), mods.modSlug(m.fileName()), downloaded); }
+                    catch (Exception ignored) { }
+                }
+                try {
+                    if (!downloaded.getFileName().toString().equals(m.fileName())) mods.delete(m.fileName());
+                } catch (Exception ignored) { }
+                return new FixOutcome(FixKind.FIXED, "  • Converted " + m.displayName() + " to "
+                        + describeVersion(r.targetVersionLabel()) + " (" + sourceName(r.source()) + ").\n");
+            } catch (Exception e) {
+                return new FixOutcome(FixKind.UNCHECKED, "  • Found a replacement for " + m.fileName()
+                        + " but couldn't download it (" + brief(e) + ").\n");
+            }
+        }
+
+        // Nothing could be fetched. The ONLY case that still justifies removing a mod is the one the old
+        // code used: a project Modrinth genuinely knows, with no build at all for this MC version, and
+        // not inside a managed pack.
+        if (allowRemove && r.modrinthKnown() && r.noModrinthBuildForThisVersion()) {
+            try {
+                mods.delete(m.fileName());
+                return new FixOutcome(FixKind.REMOVED, "  • Removed " + m.fileName()
+                        + " -- no version supports " + mcVersion + ".\n");
+            } catch (Exception e) {
+                return new FixOutcome(FixKind.KEPT, "  • Kept " + m.fileName()
+                        + " -- it had to be removed but the file couldn't be deleted.\n");
+            }
+        }
+        if (r.transientFailure()) {
+            return new FixOutcome(FixKind.UNCHECKED, "  • Couldn't check " + m.fileName() + " -- "
+                    + r.note() + ". Run Fix again in a minute to retry it.\n");
+        }
+        if (r.modrinthKnown()) {
+            return new FixOutcome(FixKind.KEPT, "  • Kept " + m.fileName() + " -- " + r.note() + ".\n");
+        }
+        return new FixOutcome(FixKind.UNIDENTIFIED, "  • Left " + m.fileName() + " untouched -- "
+                + r.note() + ".\n");
+    }
+
+    /** Where a replacement build came from, as shown to the user. */
+    private static String sourceName(InstalledModResolver.Source source) {
+        return source == InstalledModResolver.Source.CURSEFORGE ? "CurseForge" : "Modrinth";
+    }
+
+    /** "version 1.2.3" when the source stated one, else a neutral phrase. */
+    private static String describeVersion(String label) {
+        return label == null || label.isBlank() ? "a compatible build" : "version " + label;
+    }
+
+    /** One short clause out of an exception, for a log line. */
+    private static String brief(Exception e) {
+        String msg = e.getMessage();
+        if (msg == null || msg.isBlank()) return e.getClass().getSimpleName();
+        return msg.length() > 80 ? msg.substring(0, 77) + "..." : msg;
+    }
+
+    /**
+     * The Fix Mods action: for every installed NON-bundled mod, work out whether a working build of it
+     * exists for the selected Minecraft version and, if so, swap the installed jar for it. The source is
+     * the shared resolver chain -- Modrinth first, then the keyless CurseForge fallback when the mod's own
+     * license permits it -- so a CurseForge-only pack (which this launcher installs a lot of) can finally
+     * be fixed here instead of being reported as "unverified". If nothing at all can be fetched, the run
+     * says why, per mod. Bundled DEY mods are never touched (their own installers repair those). Runs in
+     * the background and re-renders + summarizes on completion.
+     *
+     * <p>Two rules keep this safe on a modpack, where a wrong guess is very expensive:
+     * <ul>
+     *   <li><b>Only a verified identity is acted on.</b> A jar whose own declared id doesn't resolve to a
+     *       real project on either source, with a license that permits fetching, is reported and left
+     *       alone rather than guessed at -- fuzzy matching is what used to delete working
+     *       CurseForge-only pack mods.</li>
+     *   <li><b>Inside a modpack nothing is ever deleted</b> ({@code allowRemove=false}). A pack's mod set
+     *       is curated by its author and often pinned to a build no source carries, so "it has no build
+     *       for this version, remove it" would silently break the pack. Those mods are reported as kept.</li>
+     * </ul>
      */
     private void runFixIncompatibleMods(ModsManager mods, Button fixBtn, Label fixStatus,
                                         Runnable refresh, String mcVersion) {
@@ -6590,56 +7043,45 @@ public class LauncherApp extends Application {
         fixStatus.setText("Checking each installed mod against Minecraft " + mcVersion + "...");
         fixStatus.setVisible(true);
         fixStatus.setManaged(true);
+        boolean packManaged = ModpackMeta.read(currentInstanceDir()) != null;
+        // Read on the FX thread (this method runs there); the background task must not touch the combo box.
+        String loader = modLoaderBox.getValue();
         Task<String> task = new Task<>() {
             @Override
             protected String call() {
                 ModrinthClient client = new ModrinthClient();
+                CurseForgeFallback curseForge = new CurseForgeFallback(gameFiles.root);
+                InstalledModResolver resolver = new InstalledModResolver(client, curseForge);
                 StringBuilder detail = new StringBuilder();
-                int fixed = 0, removed = 0, skipped = 0;
+                int fixed = 0, removed = 0, kept = 0, unverified = 0, unchecked = 0;
+                java.util.List<ModsManager.ModEntry> all;
                 try {
-                    for (var m : mods.list()) {
-                        if (isBundledFamily(m.fileName())) { skipped++; continue; } // bundled mods: never delete
-                        String slug = resolveModSlug(client, mods, m);
-                        if (slug == null) { skipped++; continue; }
-                        var compatible = client.compatibleVersionsLenient(slug, mcVersion);
-                        if (compatible.isEmpty()) {
-                            // No version of this mod supports the current MC version on Modrinth -> remove it.
-                            try {
-                                mods.delete(m.fileName());
-                                removed++;
-                                detail.append("  • Removed ").append(m.fileName())
-                                        .append(" -- no version supports ").append(mcVersion).append(".\n");
-                            } catch (Exception ex) {
-                                skipped++;
-                            }
-                            continue;
-                        }
-                        boolean installedMatches = compatible.stream()
-                                .anyMatch(v -> ModrinthClient.versionFileMatches(v, m.fileName()));
-                        if (installedMatches) continue; // already a compatible build
-                        ModrinthClient.ProjectVersion target = compatible.get(0); // newest compatible
-                        try {
-                            Path downloaded = client.download(target, mods.modsDir());
-                            try { deleteJarsForSlug(mods.modsDir(), slug, downloaded); } catch (Exception ignored) {}
-                            // "Converted" means the replacement replaces it one-for-one: remove the
-                            // original (incompatible) jar too, so only the new, compatible version
-                            // remains -- never leave both versions of the same mod installed.
-                            try {
-                                if (!downloaded.getFileName().toString().equals(m.fileName())) {
-                                    mods.delete(m.fileName());
-                                }
-                            } catch (Exception ignored) {}
-                            fixed++;
-                            detail.append("  • Converted ").append(m.displayName()).append(" to version ")
-                                    .append(target.versionNumber()).append(" (").append(mcVersion).append(").\n");
-                        } catch (Exception ex) {
-                            skipped++;
-                        }
-                    }
+                    all = mods.list();
                 } catch (Exception ex) {
                     return "ERROR\n" + ex.getMessage();
                 }
-                return "FIXED " + fixed + "\nREMOVED " + removed + "\n" + detail;
+                int total = all.size(), done = 0;
+                for (var m : all) {
+                    reportFixProgress(fixStatus, ++done, total, mcVersion);
+                    if (isBundledFamily(m.fileName())) continue; // bundled mods: never delete
+                    // EVERY per-mod failure is contained inside applyResolvedFix. Modrinth can rate-limit
+                    // or drop a request mid-scan, and that used to escape this loop and turn the entire
+                    // run into "Couldn't fix your mods" even though the other mods were handled fine.
+                    // allowRemove=false inside a pack: its curated mod set is never deleted from.
+                    FixOutcome outcome = applyResolvedFix(client, resolver, curseForge, mods, m,
+                            mcVersion, loader, !packManaged);
+                    switch (outcome.kind()) {
+                        case FIXED -> fixed++;
+                        case REMOVED -> removed++;
+                        case KEPT -> kept++;
+                        case UNIDENTIFIED -> unverified++;
+                        case UNCHECKED -> unchecked++;
+                        default -> { }
+                    }
+                    if (outcome.detail() != null) detail.append(outcome.detail());
+                }
+                return "FIXED " + fixed + "\nREMOVED " + removed + "\nKEPT " + kept
+                        + "\nUNVERIFIED " + unverified + "\nUNCHECKED " + unchecked + "\n" + detail;
             }
         };
         task.setOnSucceeded(ev -> Platform.runLater(() -> {
@@ -6664,22 +7106,57 @@ public class LauncherApp extends Application {
         if (result.startsWith("ERROR")) {
             return "Couldn't fix your mods (please check the launcher log):\n" + result.substring(6);
         }
-        int fixed = 0, removed = 0;
+        int fixed = 0, removed = 0, kept = 0, unverified = 0, unchecked = 0;
         StringBuilder bullets = new StringBuilder();
         for (String line : result.split("\n")) {
             if (line.startsWith("FIXED ")) fixed = parseIntOr(line.substring(6).trim(), 0);
             else if (line.startsWith("REMOVED ")) removed = parseIntOr(line.substring(8).trim(), 0);
+            else if (line.startsWith("KEPT ")) kept = parseIntOr(line.substring(5).trim(), 0);
+            else if (line.startsWith("UNVERIFIED ")) unverified = parseIntOr(line.substring(11).trim(), 0);
+            else if (line.startsWith("UNCHECKED ")) unchecked = parseIntOr(line.substring(10).trim(), 0);
             else if (line.startsWith("  •")) bullets.append(line).append('\n');
         }
         StringBuilder sb = new StringBuilder();
         if (fixed == 0 && removed == 0) {
-            sb.append("All installed mods are already compatible -- nothing to fix.");
+            sb.append("Nothing was changed -- every mod that could be checked is already compatible ")
+                    .append("with this Minecraft version.");
         } else {
-            sb.append("Done. Converted ").append(fixed).append(" mod(s) and removed ").append(removed)
-                    .append(" incompatible mod(s) with no working version.\n\nDetails:\n");
-            sb.append(bullets);
+            sb.append("Done. Converted ").append(fixed).append(" mod(s)");
+            if (removed > 0) {
+                sb.append(" and removed ").append(removed).append(" incompatible mod(s) with no working version");
+            }
+            sb.append(".\n\nDetails:\n").append(bullets);
+        }
+        // Never let the summary hide the mods we did NOT judge: otherwise "nothing to fix" reads as
+        // "everything is fine" when part of the list simply couldn't be identified or reached.
+        if (kept > 0) {
+            sb.append("\nKept ").append(kept).append(" mod(s) that Modrinth has no build for on this ")
+              .append("Minecraft version -- removing them would break the modpack.");
+        }
+        if (unverified > 0) {
+            sb.append("\nLeft ").append(unverified).append(" mod(s) untouched: nothing could be resolved for ")
+              .append("them (not published on Modrinth, and their own license doesn't permit fetching a ")
+              .append("build from CurseForge on your behalf), so there's nothing safe to compare them against.");
+        }
+        if (unchecked > 0) {
+            sb.append("\nCouldn't check ").append(unchecked).append(" mod(s) right now (Modrinth was busy ")
+              .append("or rate-limited us) -- run Fix again in a minute to retry those.");
         }
         return sb.toString();
+    }
+
+    /**
+     * Throttled "N/M checked" progress for a background Fix run. Called from the worker thread, so it
+     * only ever touches the label through Platform.runLater, and only every few mods -- a modpack has
+     * hundreds of them, and one UI callback per mod would flood the FX event queue.
+     */
+    private void reportFixProgress(Label status, int done, int total, String mcVersion) {
+        if (done % 10 != 0 && done != total) return;
+        Platform.runLater(() -> {
+            if (status.isVisible()) {
+                status.setText("Checking mods against Minecraft " + mcVersion + "... " + done + "/" + total);
+            }
+        });
     }
 /**
      * Builds the Mods window: an undecorated (borderless) window that stays in sync with the
@@ -7693,10 +8170,18 @@ public class LauncherApp extends Application {
                 prefs.invisibleMode = b;
                 prefs.save();
                 publishPresenceQuietly(); // reflect the change immediately, not just on next app start
+                // The servers you own are unpublished while invisible too (see publishOwnedServers),
+                // so that flips in the same click instead of at the next launch -- and the share card
+                // right below says "paused" instead of claiming to be sharing something.
+                publishOwnedServers(active);
+                refreshShareCard();
                 syncInvisibleCard.run();
             });
             syncInvisibleCard.run();
             content.getChildren().add(invisibleCard);
+
+            // ---- Share my server with friends (the other half of the same privacy pair) --------
+            content.getChildren().add(buildShareCard());
 
             // ---- Friend-profile socials (published so friends can see them on your profile) ----
             if (friendsService != null) {
@@ -7758,6 +8243,129 @@ public class LauncherApp extends Application {
             }
         }
         return content;
+    }
+
+    /**
+     * The "Share my server with friends" card in the Account tab: the same gold treatment as "Appear
+     * offline" directly above it, because the two switches together decide everything a friend can
+     * see about you.
+     *
+     * <p>It applies the instant it is flipped -- prefs are saved and presence republished in the same
+     * click, never through the Settings window's APPLY button -- and it deliberately does NOT mark the
+     * window dirty. It used to be a checkbox in Launcher &gt; FRIENDS, where flipping it immediately
+     * claimed there were unsaved changes even though the write had already gone through.
+     *
+     * <p>The status line is what makes the switch honest: presence is derived from a live game session
+     * (see currentPresence), so with no game open there is genuinely nothing to publish yet. Instead of
+     * quietly publishing an empty address -- which made the old checkbox look like it did nothing at
+     * all -- the card spells out exactly what friends can and cannot see right now.
+     */
+    private Node buildShareCard() {
+        ToggleButton shareToggle = new ToggleButton();
+        shareToggle.getStyleClass().add("gold-switch");
+        shareToggle.setSelected(prefs.shareServerAddress);
+        shareToggle.setFocusTraversable(false);
+
+        Label shareTitle = new Label();
+        shareTitle.getStyleClass().add("gold-card-title");
+        Region shareSpacer = new Region();
+        HBox.setHgrow(shareSpacer, Priority.ALWAYS);
+        HBox shareHead = new HBox(10, shareTitle, shareSpacer, shareToggle);
+        shareHead.setAlignment(Pos.CENTER_LEFT);
+
+        Label shareNote = new Label("Friends see the server you join automatically -- there is nothing to "
+                + "type, and only a live game session is ever published. Sitting in the launcher, or "
+                + "playing single player, never shows a server. Leave this off, or turn on Appear offline "
+                + "above, and friends only see that you're online. Only friends see any of it: your entry "
+                + "is published once you have at least one.");
+        shareNote.getStyleClass().add("gold-card-note");
+        shareNote.setWrapText(true);
+
+        Label shareStatus = new Label();
+        shareStatus.getStyleClass().add("gold-card-status");
+        shareStatus.setWrapText(true);
+
+        VBox card = new VBox(8, shareHead, shareNote, shareStatus);
+        card.getStyleClass().add("gold-card");
+
+        Runnable sync = () -> {
+            boolean on = prefs.shareServerAddress;
+            shareToggle.setText(on ? "ON" : "OFF");
+            shareTitle.setText(on ? "Sharing your server" : "Share my server with friends");
+            shareStatus.setText(shareStatusText(on));
+            card.getStyleClass().remove("gold-card-on");
+            if (on && !prefs.invisibleMode) card.getStyleClass().add("gold-card-on");
+        };
+
+        shareToggle.selectedProperty().addListener((o, a, b) -> {
+            prefs.shareServerAddress = b;
+            prefs.save();
+            publishPresenceQuietly(); // publish (or clear) it right away, not on the next heartbeat
+            sync.run();
+        });
+
+        sync.run();
+        shareCardSync = sync;
+        return card;
+    }
+
+    /**
+     * What the share card must say for the current switch state -- always the truth about what friends
+     * would see, so the toggle can never look like it did nothing. Kept separate from the nodes so the
+     * wording lives in exactly one place, in step with {@link #currentPresence}.
+     */
+    private String shareStatusText(boolean sharing) {
+        if (prefs.invisibleMode) {
+            return "Paused -- you appear offline, so friends see nothing at all, server included.";
+        }
+        if (!sharing) {
+            return "Off -- friends can see that you're online, but not which server you're on.";
+        }
+        if (!hasAnyFriendCached()) {
+            return "No friends added yet -- nothing is published until you have at least one.";
+        }
+        PlayState state = livePlayState;
+        if (state == PlayState.SERVER && liveServerAddress != null && !liveServerAddress.isBlank()) {
+            String name = (liveServerName != null && !liveServerName.isBlank()) ? liveServerName : null;
+            return "Sharing now: " + (name != null ? name + " (" + liveServerAddress + ")" : liveServerAddress);
+        }
+        if (state == PlayState.SERVER) {
+            return "On -- you're on a server whose address can't be shared (it runs on this PC).";
+        }
+        return "On -- waiting for you to join a server; it's shared the moment you're in.";
+    }
+
+    /**
+     * True when this install knows about at least one confirmed friend. Read from the local friends
+     * cache rather than fetched, because it gates every presence write (including the heartbeat).
+     *
+     * <p>This is what "only show to friends" means in practice here: with an empty friends list there
+     * is nobody to share anything with, so nothing about where you are is written to the shared file at
+     * all. Adding a friend makes the very next presence write carry it.
+     */
+    private boolean hasAnyFriendCached() {
+        FriendsService.FriendsView cached = friendsCache.load();
+        return cached != null && cached.friends() != null && !cached.friends().isEmpty();
+    }
+
+    /** Refreshes the Account tab's share card, if it is currently built -- see {@link #buildShareCard}. */
+    private void refreshShareCard() {
+        Runnable sync = shareCardSync;
+        if (sync == null || !Platform.isFxApplicationThread()) return;
+        sync.run();
+    }
+
+    /**
+     * True only when {@code uuid} is on OUR friends list. Every renderer that shows someone else's
+     * presence (server address, current server, live play state) goes through this, so a stranger whose
+     * entry merely exists in the shared friends file can never be presented as someone to join.
+     */
+    private boolean isFriend(String uuid, FriendsService.FriendsView view) {
+        if (uuid == null || view == null || view.friends() == null) return false;
+        for (var f : view.friends()) {
+            if (uuid.equals(f.uuid)) return true;
+        }
+        return false;
     }
 
     /** Editor for the socials shown on your friend profile. Changes are published to friends.json. */
@@ -8661,6 +9269,7 @@ public class LauncherApp extends Application {
             prefs.gameHeight = settings.height();
             prefs.fullscreen = settings.fullscreen();
             prefs.softwareOpenGl = settings.softwareOpenGl();
+            prefs.nativeWayland = settings.nativeWayland();
             prefs.save();
             savedLabel.setText("Settings saved.");
             dirty.set(false);
@@ -8716,7 +9325,8 @@ public class LauncherApp extends Application {
             markDirty.run();
             ramLabel.setText((int) val.doubleValue() + " MB max RAM");
             pending[0] = new GameLauncher.LaunchSettings(pending[0].ramMinMb(), (int) val.doubleValue(),
-                    pending[0].width(), pending[0].height(), pending[0].fullscreen(), pending[0].softwareOpenGl());
+                    pending[0].width(), pending[0].height(), pending[0].fullscreen(), pending[0].softwareOpenGl(),
+                    pending[0].nativeWayland());
         });
 
         TextField widthField = new TextField(String.valueOf(settings.width()));
@@ -8725,26 +9335,43 @@ public class LauncherApp extends Application {
         heightField.setPrefWidth(90);
         Runnable applyRes = () -> pending[0] = new GameLauncher.LaunchSettings(pending[0].ramMinMb(), pending[0].ramMaxMb(),
                 parseIntOr(widthField.getText(), pending[0].width()),
-                parseIntOr(heightField.getText(), pending[0].height()), pending[0].fullscreen(), pending[0].softwareOpenGl());
+                parseIntOr(heightField.getText(), pending[0].height()), pending[0].fullscreen(), pending[0].softwareOpenGl(),
+                pending[0].nativeWayland());
         widthField.textProperty().addListener((o, a, b) -> { applyRes.run(); markDirty.run(); });
         heightField.textProperty().addListener((o, a, b) -> { applyRes.run(); markDirty.run(); });
 
         CheckBox fullscreenBox = new CheckBox("Launch fullscreen");
         fullscreenBox.setSelected(settings.fullscreen());
         fullscreenBox.selectedProperty().addListener((o, a, b) -> pending[0] = new GameLauncher.LaunchSettings(
-                pending[0].ramMinMb(), pending[0].ramMaxMb(), pending[0].width(), pending[0].height(), b, pending[0].softwareOpenGl()));
+                pending[0].ramMinMb(), pending[0].ramMaxMb(), pending[0].width(), pending[0].height(), b,
+                pending[0].softwareOpenGl(), pending[0].nativeWayland()));
         fullscreenBox.selectedProperty().addListener((o, a, b) -> markDirty.run());
 
         CheckBox softwareGlBox = new CheckBox("Software rendering (compatibility)");
         softwareGlBox.setSelected(settings.softwareOpenGl());
         softwareGlBox.selectedProperty().addListener((o, a, b) -> pending[0] = new GameLauncher.LaunchSettings(
-                pending[0].ramMinMb(), pending[0].ramMaxMb(), pending[0].width(), pending[0].height(), pending[0].fullscreen(), b));
+                pending[0].ramMinMb(), pending[0].ramMaxMb(), pending[0].width(), pending[0].height(),
+                pending[0].fullscreen(), b, pending[0].nativeWayland()));
         softwareGlBox.selectedProperty().addListener((o, a, b) -> markDirty.run());
         Label softwareGlHint = new Label("For machines whose GPU can't expose OpenGL 3.3 "
                 + "(\"GLXBadFBConfig\" / \"Driver does not support OpenGL 3.3\"). Renders on the CPU "
                 + "(slower but works) without admin rights. Linux only; no effect on Windows.");
         softwareGlHint.setWrapText(true);
         softwareGlHint.getStyleClass().add("settings-hint-label");
+
+        CheckBox waylandBox = new CheckBox("Run natively on Wayland");
+        waylandBox.setSelected(settings.nativeWayland());
+        waylandBox.selectedProperty().addListener((o, a, b) -> pending[0] = new GameLauncher.LaunchSettings(
+                pending[0].ramMinMb(), pending[0].ramMaxMb(), pending[0].width(), pending[0].height(),
+                pending[0].fullscreen(), pending[0].softwareOpenGl(), b));
+        waylandBox.selectedProperty().addListener((o, a, b) -> markDirty.run());
+        Label waylandHint = new Label("On a Wayland session the game is otherwise started through XWayland "
+                + "(GLFW picks X11 whenever DISPLAY is set). This starts it on Wayland's own driver path "
+                + "instead, which is what fixes a native crash at window creation -- software rendering cannot, "
+                + "because that fault happens before any GPU work. On by default in a Wayland session; needs a "
+                + "GLFW with Wayland support (Minecraft 1.20 and newer). Ignored on Windows and on X11.");
+        waylandHint.setWrapText(true);
+        waylandHint.getStyleClass().add("settings-hint-label");
 
         Button optionsKitsBtn = new Button();
         setButtonIcon(optionsKitsBtn, IconFactory.Icon.SETTINGS, "Option Kits");
@@ -8771,9 +9398,11 @@ public class LauncherApp extends Application {
         grid.add(sectionLabel("COMPATIBILITY"), 0, 6, 2, 1);
         grid.add(softwareGlBox, 0, 7, 2, 1);
         grid.add(softwareGlHint, 0, 8, 2, 1);
-        grid.add(sectionLabel("OPTION KITS"), 0, 9, 2, 1);
-        grid.add(optionsKitsBtn, 0, 10, 2, 1);
-        grid.add(optionsKitsHint, 0, 11, 2, 1);
+        grid.add(waylandBox, 0, 9, 2, 1);
+        grid.add(waylandHint, 0, 10, 2, 1);
+        grid.add(sectionLabel("OPTION KITS"), 0, 11, 2, 1);
+        grid.add(optionsKitsBtn, 0, 12, 2, 1);
+        grid.add(optionsKitsHint, 0, 13, 2, 1);
         return grid;
     }
 
@@ -8892,6 +9521,20 @@ public class LauncherApp extends Application {
             prefs.save();
         });
 
+        // Modpacks (Settings > Launcher): whether Play first checks the active pack's own file list and
+        // downloads back whatever has gone missing, instead of launching a pack with mods missing.
+        CheckBox verifyPackBox = new CheckBox("Check modpacks for missing mods before every launch");
+        verifyPackBox.setSelected(prefs.verifyModpackOnLaunch);
+        verifyPackBox.setTooltip(new Tooltip("Uses the pack's own file list to re-download anything that "
+                + "went missing, straight into that version's mods folder. Mods you disabled stay disabled."));
+        verifyPackBox.selectedProperty().addListener((o, a, b) -> {
+            markDirty.run();
+            prefs.verifyModpackOnLaunch = b;
+            prefs.save();
+        });
+        Label verifyPackNote = new Label("Anything missing is fetched automatically before the game starts.");
+        verifyPackNote.getStyleClass().add("notice-label");
+
         Runnable applyStartupSize = () -> {
             markDirty.run();
             prefs.startWidth = parseIntOr(startWidthField.getText(), (int) prefs.startWidth);
@@ -8955,23 +9598,14 @@ public class LauncherApp extends Application {
         grid.add(settingsSizeNote, 0, row++, 2, 1);
 
         row++;
-        grid.add(sectionLabel("FRIENDS"), 0, row++, 2, 1);
-        CheckBox shareAddressBox = new CheckBox("Share my current server address with friends");
-        shareAddressBox.setSelected(prefs.shareServerAddress);
-        Label addressNote = new Label("Turned on, the server you're on right now is published to friends "
-                + "automatically -- there's nothing to type. Only a live game session publishes anything: "
-                + "sitting in the launcher, or playing single player, never shows a server. Ignored "
-                + "entirely while invisible mode (Account tab) is on.");
-        addressNote.getStyleClass().add("notice-label");
-        addressNote.setWrapText(true);
-        shareAddressBox.selectedProperty().addListener((o, a, b) -> {
-            markDirty.run();
-            prefs.shareServerAddress = b;
-            prefs.save();
-            publishPresenceQuietly(); // publish (or clear) my shared address right away
-        });
-        grid.add(shareAddressBox, 0, row++, 2, 1);
-        grid.add(addressNote, 0, row++, 2, 1);
+        grid.add(sectionLabel("MODPACKS"), 0, row++, 2, 1);
+        grid.add(verifyPackBox, 0, row++, 2, 1);
+        grid.add(verifyPackNote, 0, row++, 2, 1);
+
+        // NOTE: "Share my current server address with friends" used to live here. It is now a gold
+        // card in the Account tab, right next to "Appear offline" (see buildShareCard): both decide
+        // what friends can see about you, both apply instantly without the APPLY button, and neither
+        // belongs in a Launcher-appearance panel.
 
         return grid;
     }
@@ -9143,15 +9777,48 @@ public class LauncherApp extends Application {
                     if (forgeVersion == null) forgeVersion = forge.recommendedOrLatestVersion(entry.id());
                     if (forgeVersion == null) throw new IllegalStateException(
                             "Forge has no build for " + entry.id() + " yet.");
-                    versionJson = forge.install(entry.id(), forgeVersion, javaBinary.toString());
+                    // Forge's own installer is the ONLY thing that explains a Forge install failure, so
+                    // stream its output into the launcher log (hopping to the FX thread, since log()
+                    // appends to a TextArea) rather than discarding it as we used to.
+                    versionJson = forge.withOutputSink(line -> {
+                        String trimmed = line == null ? "" : line.trim();
+                        if (!trimmed.isEmpty()) Platform.runLater(() -> log("Forge: " + trimmed));
+                    }).install(entry.id(), forgeVersion, javaBinary.toString());
+                } else if (modLoader.equals("NeoForge")) {
+                    updateMessage("Installing NeoForge (this runs NeoForge's own installer, may take a minute)...");
+                    NeoForgeInstaller neoForge = new NeoForgeInstaller(manifest, files.root);
+                    // Same idea as Forge above: a modpack's own NeoForge build wins, otherwise the
+                    // newest one NeoForge publishes FOR THIS Minecraft version -- stable preferred,
+                    // beta only when that is all that exists yet (26.3's first builds are betas, and
+                    // refusing them would mean "NeoForge doesn't work" on the newest version).
+                    String neoVersion = ModpackMeta.pinnedLoaderVersion(files.root, entry.id(), "NeoForge");
+                    if (neoVersion == null) neoVersion = neoForge.latestVersion(entry.id());
+                    if (neoVersion == null) throw new IllegalStateException(
+                            "NeoForge has no build for " + entry.id() + " yet.");
+                    // NeoForge's own installer is the ONLY thing that explains a NeoForge install
+                    // failure, so stream its output into the launcher log exactly like Forge's.
+                    versionJson = neoForge.withOutputSink(line -> {
+                        String trimmed = line == null ? "" : line.trim();
+                        if (!trimmed.isEmpty()) Platform.runLater(() -> log("NeoForge: " + trimmed));
+                    }).install(entry.id(), neoVersion, javaBinary.toString());
                 } else {
                     versionJson = vanillaJson;
                 }
+
                 report.accept(0.30); // loader installed (or not needed) -- downloads are next
 
                 updateMessage("Downloading files (cached after first run)...");
                 var prepared = files.prepare(versionJson,
                         f -> report.accept(0.30 + f * 0.56)); // download phase: 30% -> 86%
+
+                // Replace buggy libglfw.so (GLFW 3.4.0 in LWJGL 3.3.1) with fixed version (GLFW 3.4.1 in LWJGL 3.3.2+)
+                // for modpacks on Wayland sessions to avoid SIGSEGV in glfwCreateWindow.
+                // Sodium requires LWJGL 3.3.1 at runtime, so we keep the version JSON but patch the native JAR
+                // in the libraries directory BEFORE extraction, so LWJGL always gets the fixed version.
+                if (isLinuxWaylandSession() && WaylandSupport.usesBuggyLwjgl(versionJson)) {
+                    log("Patching native libglfw.so in libraries directory for Wayland compatibility");
+                    GameFiles.patchNativeGlfwInJar(files.root.resolve("libraries"), msg -> log(msg));
+                }
 
                 var gameDir = files.root.resolve("instances").resolve(entry.id()
                         + (modLoader.equals("Vanilla") ? "" : "-" + modLoader.toLowerCase()));
@@ -9162,9 +9829,30 @@ public class LauncherApp extends Application {
                 // (mods, config, options, etc.) stays exactly as isolated as before.
                 com.deylauncher.launch.SharedSaves.ensureShared(files.root, gameDir);
 
-                // DeyCapes mod integration: hand the github repo credentials to the installed mod so
-                // it can fetch the capes.json map + cape textures for the private repo at runtime.
-                // Only for DEY builds (the only ones that bundle DeyCapes). Best-effort.
+                // ---- Modpack self-repair, before the game starts. A pack's mods can go missing for
+                // ordinary reasons (an interrupted first install, a deleted instance folder, a mod
+                // removed by hand, antivirus quarantine), and the pack's own record lists every file it
+                // owns. So instead of launching a broken pack and leaving the player to download jars
+                // one by one, anything missing is fetched again -- into this exact version's mods
+                // folder -- right here. Mods the user switched OFF (mods-disabled/) are left alone. ----
+                if (prefs.verifyModpackOnLaunch) {
+                    ModpackMeta packMeta = ModpackMeta.read(gameDir);
+                    if (packMeta != null && packMeta.managesFiles()) {
+                        updateMessage("Checking \"" + packMeta.name + "\" for missing mods...");
+                        ModpackVerifier.Report packReport = new ModpackVerifier().verifyClient(packMeta, gameDir,
+                                f -> report.accept(0.86 + f * 0.06)); // 86% -> 92% of the launch bar
+                        String line = "Modpack \"" + packMeta.name + "\": " + packReport.summary();
+                        Platform.runLater(() -> log(line));
+                        if (!packReport.errors().isEmpty()) {
+                            String failed = "  " + String.join("\n  ", packReport.errors());
+                            Platform.runLater(() -> log("Files the pack wants that couldn't be fetched:\n" + failed));
+                        }
+                    }
+                }
+
+                // DeyCapes integration only receives public repository coordinates. Never copy a GitHub
+                // credential into a game instance: instance folders, logs and mod jars are user-accessible.
+                // Private cape repositories require a server-side/public proxy rather than a shipped token.
                 if (deyMode && modLoader.equals("Fabric") && deyCapesService != null && !"Vanilla".equals(modLoader)) {
                     try {
                         var cfgDir = gameDir.resolve("config").resolve("deycapes");
@@ -9172,12 +9860,11 @@ public class LauncherApp extends Application {
                         var cfg = new java.util.Properties();
                         cfg.setProperty("owner", deyCapesService.gitConfig().owner());
                         cfg.setProperty("repo", deyCapesService.gitConfig().repo());
-                        cfg.setProperty("token", deyCapesService.gitConfig().token());
                         cfg.setProperty("capesPath", deyCapesService.gitConfig().capesPath());
                         cfg.setProperty("capesOwnedPath", deyCapesService.gitConfig().ownershipPath());
                         cfg.setProperty("capesDir", deyCapesService.gitConfig().capesDir());
                         try (var out = java.nio.file.Files.newOutputStream(cfgDir.resolve("github.properties"))) {
-                            cfg.store(out, "DeyCapes - read by the DeyCapes mod to fetch capes from the DeyLauncher repo");
+                            cfg.store(out, "DeyCapes public repository settings");
                         }
                     } catch (Exception cfgEx) {
                         Platform.runLater(() -> log("Couldn't write DeyCapes config (continuing without remote capes): " + cfgEx.getMessage()));
@@ -9234,19 +9921,25 @@ public class LauncherApp extends Application {
                 presenceTick.setDaemon(true);
                 presenceTick.start();
 
-                // Self-healing: on machines whose GPU can't provide OpenGL 3.3 (the classic Linux
-                // "GLXBadFBConfig" / "Driver does not support OpenGL 3.3" crash), retry ONCE with Mesa
-                // software rendering enabled, so the game gets a window even when the software-rendering
-                // setting was left off. Only fires when the first attempt actually died from that
-                // signature (runGameAndWait's diagnosis is null on a normal exit), and it flips the
-                // toggle only for this single retry -- it is never persisted or forced on healthy runs.
+                // Self-healing, one retry, and WHICH retry now depends on what failed (see retrySettings):
+                // on a Wayland session the useful move is to hand the game Wayland's own backend instead of
+                // XWayland, because a native fault inside GLFW's window creation is not something Mesa's
+                // software renderer can avoid (measured: identical crash with libGLX_mesa/llvmpipe loaded
+                // and no NVIDIA GLX library at all), while native Wayland fixes both that window-layer fault
+                // and a GLX context failure at once (it uses EGL). Everything else keeps the older
+                // software-rendering retry.
                 LaunchOutcome first = runGameAndWait(prepared, session, gameDir, settings, javaBinary, quickPlayTarget, tracker, onSessionEvent);
-                if (first.diagnosis() != null && !settings.softwareOpenGl()) {
-                    Platform.runLater(() -> log("Retrying once with software rendering (compatibility) enabled..."));
-                    GameLauncher.LaunchSettings compat = new GameLauncher.LaunchSettings(
-                            settings.ramMinMb(), settings.ramMaxMb(), settings.width(), settings.height(),
-                            settings.fullscreen(), true);
-                    runGameAndWait(prepared, session, gameDir, compat, javaBinary, quickPlayTarget, tracker, onSessionEvent);
+                GameLauncher.LaunchSettings retry = retrySettings(first, settings, prepared);
+                if (retry != null) {
+                    boolean waylandRetry = retry.nativeWayland() && !settings.nativeWayland();
+                    boolean xwaylandFallbackRetry = !retry.nativeWayland() && settings.nativeWayland();
+                    String retryMessage = waylandRetry
+                                    ? "Retrying once on Wayland directly (XWayland bypassed)..."
+                                    : xwaylandFallbackRetry
+                                    ? "Retrying once through XWayland (this version's native Wayland backend just crashed)..."
+                                    : "Retrying once with software rendering (compatibility) enabled...";
+                    Platform.runLater(() -> log(retryMessage));
+                    runGameAndWait(prepared, session, gameDir, retry, javaBinary, quickPlayTarget, tracker, onSessionEvent);
                 }
                 // The game process (whichever attempt actually ran last) has now exited, so this
                 // session is over: reset the tracker and stop advertising wherever it last was. This is
@@ -9292,8 +9985,67 @@ public class LauncherApp extends Application {
         logArea.appendText(line + "\n");
     }
 
-    /** Result of one game run: the exit code plus a human-readable crash diagnosis (null on a normal exit). */
-    private record LaunchOutcome(int exit, String diagnosis) {}
+    /**
+     * Result of one game run: the exit code, a human-readable crash diagnosis (null on a normal exit),
+     * and whether THIS run already had native Wayland switched on and still failed in the GLFW window
+     * layer -- either one of the two known feature-unavailable/no-DISPLAY messages (see
+     * LaunchDiagnostics#isNativeWaylandBackfire), or a straight native SIGSEGV inside libglfw.so (see
+     * LaunchDiagnostics#isGlfwWindowLayerCrash), most commonly hit by a MODPACK pinned to an older
+     * Minecraft/LWJGL build whose Wayland backend isn't production-safe even though it passes every
+     * static check DeyLauncher can do ahead of time. In every one of these cases it is native Wayland
+     * itself that broke this run, and the only real fix is running THIS launch through XWayland instead
+     * -- see {@link #retrySettings}.
+     */
+    private record LaunchOutcome(int exit, String diagnosis, boolean nativeWaylandBackfired) {}
+
+    /**
+     * The single retry worth making after a failed run, or null when a retry would change nothing.
+     *
+     * <p>Only fires when {@link LaunchDiagnostics} actually recognized a graphics/window failure (a normal
+     * exit diagnoses nothing). The preference order is deliberate:
+     * <ol>
+     *   <li><b>Turn native Wayland back OFF</b> -- when THIS run already had it on and it is what crashed
+     *       ({@link LaunchOutcome#nativeWaylandBackfired}). Checked first and unconditionally, because
+     *       retrying with the same switch in the same position would just reproduce the identical crash
+     *       (the modpack-on-an-older-LWJGL-build case).</li>
+     *   <li><b>Native Wayland ON</b> -- when the switch is off but this machine/version could safely use
+     *       it (Linux, a live Wayland socket, a GLFW with the Wayland backend, and an LWJGL release known
+     *       not to crash on it: see {@link WaylandSupport}). This covers both failure families at once: a
+     *       native fault inside {@code glfwCreateWindow} via XWayland (which software rendering
+     *       demonstrably does not avoid) and a broken GLX context (Wayland uses EGL, so the GLX path isn't
+     *       even touched).</li>
+     *   <li><b>Software rendering</b> -- the older remedy, for an X11 session or a GLFW without Wayland
+     *       support, where Mesa's CPU renderer is the only lever left.</li>
+     * </ol>
+     * The flipped switch applies to this one retry only; nothing is persisted, so a healthy machine never
+     * gets either workaround forced on it.
+     */
+    private GameLauncher.LaunchSettings retrySettings(LaunchOutcome first, GameLauncher.LaunchSettings settings,
+                                                      GameFiles.PreparedVersion prepared) {
+        if (first.diagnosis() == null) return null;
+
+        // Checked FIRST and unconditionally: this run already had native Wayland on and it is what
+        // crashed (see LaunchOutcome#nativeWaylandBackfired's doc) -- e.g. a MODPACK pinned to an older
+        // Minecraft/LWJGL build whose Wayland backend is not production-safe, which passes every static
+        // check WaylandSupport can do ahead of time (a "normal"/custom instance on a current LWJGL never
+        // hits this). Retrying with native Wayland on again would just reproduce the identical crash, so
+        // this is the one case where the fix is turning the switch OFF, not on.
+        if (first.nativeWaylandBackfired()) {
+            return new GameLauncher.LaunchSettings(settings.ramMinMb(), settings.ramMaxMb(), settings.width(),
+                    settings.height(), settings.fullscreen(), settings.softwareOpenGl(), false);
+        }
+        if (!settings.nativeWayland()
+                && WaylandSupport.shouldUseNativeWayland(true, System.getProperty("os.name", ""),
+                        System.getenv(), prepared.nativesDir(), prepared.versionJson())) {
+            return new GameLauncher.LaunchSettings(settings.ramMinMb(), settings.ramMaxMb(), settings.width(),
+                    settings.height(), settings.fullscreen(), settings.softwareOpenGl(), true);
+        }
+        if (!settings.softwareOpenGl()) {
+            return new GameLauncher.LaunchSettings(settings.ramMinMb(), settings.ramMaxMb(), settings.width(),
+                    settings.height(), settings.fullscreen(), true, settings.nativeWayland());
+        }
+        return null;
+    }
 
     /**
      * Launches the game and streams its output into the log, keeping a bounded recent-output tail so a
@@ -9310,7 +10062,11 @@ public class LauncherApp extends Application {
                                          GameLauncher.LaunchSettings s, Path javaBinary, String quickPlayTarget,
                                          ServerSessionTracker tracker,
                                          java.util.function.Consumer<ServerSessionTracker.Event> onSessionEvent) throws Exception {
-        Process process = new GameLauncher().launch(prepared, session, gameDir, s, javaBinary.toString(), quickPlayTarget);
+        // The log sink carries the launch's own one-line notes into the launcher's log as well -- most
+        // usefully "starting the game natively on Wayland" and any ${placeholder} the version profile
+        // asked for that we couldn't fill in.
+        Process process = new GameLauncher().launch(prepared, session, gameDir, s, javaBinary.toString(),
+                quickPlayTarget, line -> Platform.runLater(() -> log(line)));
 
         // Keep a bounded recent-output tail so that, if the game ends in a native/GL crash, we can
         // explain it in plain words instead of just the raw exit code.
@@ -9329,15 +10085,76 @@ public class LauncherApp extends Application {
             }
         }
         int exit = process.waitFor();
+        // The JVM writes the ENTIRE launch command line -- including --accessToken -- into its own crash
+        // dump (hs_err_pid<pid>.log) when it dies natively, and creates that file readable by everyone.
+        // Redact the session token and restrict the file to this user before anything else reads it.
+        // Best-effort by design: a launch is never failed over a dump.
+        CrashDumps.Result dumps = CrashDumps.scrubInstance(gameDir, java.util.List.of(session.accessToken()));
         Platform.runLater(() -> log("Game exited with code " + exit));
-        String diagnosis = LaunchDiagnostics.analyze(new java.util.ArrayList<>(recent), exit);
+        if (dumps.changedAnything()) {
+            Platform.runLater(() -> log("Crash dump cleaned up: " + dumps.summary() + "."));
+        }
+        java.util.ArrayList<String> recentList = new java.util.ArrayList<>(recent);
+        String diagnosis = LaunchDiagnostics.analyze(recentList, exit, s.nativeWayland());
         if (diagnosis != null) {
             Platform.runLater(() -> log("\n==== Crash diagnostic ====\n" + diagnosis));
         }
-        return new LaunchOutcome(exit, diagnosis);
+        // "Backfired" means THIS run already had native Wayland switched on and still hit a GLFW
+        // window-layer failure -- either one of the two known feature-unavailable/no-DISPLAY messages,
+        // or a straight native SIGSEGV inside libglfw.so (the crash a MODPACK on an older LWJGL build's
+        // Wayland backend produces even though it passed every earlier safety check -- see
+        // WaylandSupport's LWJGL-version gate). When native Wayland was OFF for this run, the same
+        // libglfw.so crash means the opposite thing (the original XWayland-crashes-natively bug that
+        // switching TO Wayland fixes), which is already handled by retrySettings' existing branch --
+        // so this flag must only ever fire while native Wayland was actually in use.
+        boolean nativeWaylandBackfired = s.nativeWayland()
+                && (LaunchDiagnostics.isNativeWaylandBackfire(recentList)
+                    || LaunchDiagnostics.isGlfwWindowLayerCrash(recentList));
+        return new LaunchOutcome(exit, diagnosis, nativeWaylandBackfired);
     }
 
     // ---- Cross-platform icon helpers ----
+
+    /**
+     * Redacts + locks JVM crash dumps left behind by earlier runs, across every instance.
+     *
+     * <p>The value of the leaked token is not known at startup (it may belong to a previous session), so
+     * this relies on the form the JVM always quotes back verbatim -- {@code --accessToken <token>},
+     * {@code accessToken=<token>}, and the {@code token:<token>:<uuid>} of pre-1.13 argument lists. That
+     * is exactly why {@link CrashDumps} redacts by shape as well as by known value.
+     *
+     * <p>Runs on a daemon thread and never blocks, fails, or throws into startup: worst case a dump stays
+     * as it was, and the next launch's own scrub (which DOES know the token) handles it.
+     */
+    private void scrubLeftoverCrashDumps() {
+        Task<Integer> task = new Task<>() {
+            @Override
+            protected Integer call() {
+                Path instances = gameFiles.root.resolve("instances");
+                if (!Files.isDirectory(instances)) return 0;
+                int redacted = 0;
+                try (var stream = Files.list(instances)) {
+                    for (Path dir : (Iterable<Path>) stream.filter(Files::isDirectory)::iterator) {
+                        CrashDumps.Result result = CrashDumps.scrubInstance(dir, java.util.List.of());
+                        if (result.changedAnything()) redacted += result.redacted();
+                    }
+                } catch (Exception ignored) {
+                    // A folder we can't read simply isn't cleaned up here.
+                }
+                return redacted;
+            }
+        };
+        task.setOnSucceeded(e -> {
+            int redacted = task.getValue() == null ? 0 : task.getValue();
+            if (redacted > 0) {
+                log("Cleaned up " + redacted + " old JVM crash dump(s) that still contained your account "
+                        + "token -- they are redacted and now readable only by you.");
+            }
+        });
+        Thread thread = new Thread(task, "crash-dump-scrub");
+        thread.setDaemon(true);
+        thread.start();
+    }
 
     private Node icon(IconFactory.Icon icon) {
         return IconFactory.create(icon, 18);
@@ -9753,5 +10570,16 @@ public class LauncherApp extends Application {
         root.setCenter(scroll);
         root.setBottom(bar);
         return root;
+    }
+
+    /**
+     * Checks if the launcher is running on Linux in a Wayland session.
+     * Uses the same detection as {@link LauncherPrefs#defaultNativeWayland()}.
+     */
+    private boolean isLinuxWaylandSession() {
+        String osName = System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT);
+        if (!osName.contains("linux")) return false;
+        String waylandDisplay = System.getenv("WAYLAND_DISPLAY");
+        return waylandDisplay != null && !waylandDisplay.isBlank();
     }
 }

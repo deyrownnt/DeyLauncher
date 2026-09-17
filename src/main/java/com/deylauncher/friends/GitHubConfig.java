@@ -7,24 +7,9 @@ import java.nio.file.Path;
 import java.util.Properties;
 
 /**
- * Two ways this gets configured, checked in this order:
- *
- * 1. LOCAL OVERRIDE: ~/.deylauncher/github.properties -- for anyone running
- *    from source/building their own jar. Never shipped, never in the repo.
- *
- * 2. EMBEDDED (for distributed installers): a resource baked into the jar
- *    at build time from a local, gitignored file (see build.gradle.kts'
- *    processResources block and GITHUB_SETUP.md). This is what makes
- *    "friends who install the built jar/app-image don't need to configure
- *    anything" work -- the dev embeds their own bot-account token once,
- *    at their own build time, and every installer they hand out already
- *    has it. The token is still extractable by anyone who decompiles the
- *    jar; see GITHUB_SETUP.md for the blast-radius mitigations (dedicated
- *    bot account, repo-scoped fine-grained token) that make this an
- *    acceptable tradeoff for a small friend group.
- *
- * If neither is present, Friends just reports "not set up" -- never a
- * silent failure.
+ * Credentials are loaded only from the current user's local
+ * {@code ~/.deylauncher/github.properties}. They are never committed, embedded in a build, or copied into
+ * a game instance. If it is absent, features requiring GitHub authentication report "not set up".
  */
 public class GitHubConfig {
 
@@ -65,9 +50,6 @@ public class GitHubConfig {
     public static GitHubConfig load() {
         GitHubConfig local = loadFrom(localOverrideFile());
         if (local != null && local.isConfigured()) return local;
-
-        GitHubConfig embedded = loadFromClasspath("/embedded-github.properties");
-        if (embedded != null && embedded.isConfigured()) return embedded;
 
         return new GitHubConfig(null, null, null, "friends.json", "capes.json", "capes-owned.json",
                 "capes", "options-kits.json");

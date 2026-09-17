@@ -19,6 +19,14 @@ public class ServerInstance {
     public String name;
     public ServerType type = ServerType.VANILLA;
     public String minecraftVersion;
+    /**
+     * The Minecraft version that actually loaded this server's world last time it started (written to
+     * this file only once the server reported it was up). Kept separately from
+     * {@link #minecraftVersion} because the two differ exactly when they matter: after a version change
+     * that was never started yet, the world on disk still belongs to the PREVIOUS version, and that is
+     * what decides whether a further change is a downgrade an older server cannot read.
+     */
+    public String lastRunVersion;
     public int port = 25565;
     public int ramMinMb = 1024;
     public int ramMaxMb = 2048;

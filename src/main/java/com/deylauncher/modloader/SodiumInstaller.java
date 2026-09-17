@@ -17,10 +17,14 @@ import java.nio.file.StandardCopyOption;
  * documented API (the same kind of official integration point as Fabric's meta API, see
  * FabricInstaller) -- not reverse-engineered or scraped.
  *
- * Real Sodium is Fabric/Quilt-only; it doesn't run on Forge at all. For a DEY Forge instance
+ * Real Sodium is Fabric/Quilt-only; it doesn't run on older Forge at all. For a DEY Forge instance
  * this installs Embeddium instead -- the actual Forge-compatible continuation of Sodium (same
  * renderer, same author lineage), rather than silently doing nothing or claiming to install
  * something that can't work under Forge.
+ *
+ * NeoForge is its own case again: Sodium itself publishes NeoForge builds (Modrinth lists them under
+ * the "neoforge" loader, e.g. {@code mc26.3-0.9.2-neoforge}), so NeoForge gets Sodium -- not
+ * Embeddium -- which is what NeoForge players actually run.
  */
 public class SodiumInstaller {
 
@@ -32,6 +36,9 @@ public class SodiumInstaller {
         if ("Forge".equalsIgnoreCase(modLoader)) {
             this.projectSlug = "embeddium";
             this.loaderName = "forge";
+        } else if ("NeoForge".equalsIgnoreCase(modLoader)) {
+            this.projectSlug = "sodium";
+            this.loaderName = "neoforge";
         } else {
             this.projectSlug = "sodium";
             this.loaderName = "fabric";

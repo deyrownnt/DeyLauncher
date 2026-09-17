@@ -117,10 +117,17 @@ public final class ModpackReader {
             String sha512 = hashes == null ? "" : str(hashes, "sha512");
             long size = f.has("fileSize") && f.get("fileSize").isJsonPrimitive() ? f.get("fileSize").getAsLong() : -1L;
             JsonObject env = obj(f, "env");
-            boolean clientUnsupported = env != null && "unsupported".equalsIgnoreCase(str(env, "client"));
-            boolean serverUnsupported = env != null && "unsupported".equalsIgnoreCase(str(env, "server"));
+            // Modrinth's env block is a three-way choice per side: "required", "optional" or
+            // "unsupported". Optional mods still install (the pack author wanted them there), but a
+            // failure to fetch one is a warning, never an incomplete install.
+            String envClient = env == null ? "" : str(env, "client");
+            String envServer = env == null ? "" : str(env, "server");
+            boolean clientUnsupported = "unsupported".equalsIgnoreCase(envClient);
+            boolean serverUnsupported = "unsupported".equalsIgnoreCase(envServer);
+            boolean clientRequired = !"optional".equalsIgnoreCase(envClient);
+            boolean serverRequired = !"optional".equalsIgnoreCase(envServer);
             downloads.add(ModpackFile.download(path, url, sha1, sha512, size,
-                    !clientUnsupported, clientUnsupported, !serverUnsupported, serverUnsupported));
+                    clientRequired, clientUnsupported, serverRequired, serverUnsupported));
         }
 
         // overrides/ (pack spec v1) plus the v1.1 split folders, if the author used them.
@@ -177,13 +184,93 @@ public final class ModpackReader {
 
         int unresolved = objArray(manifest, "files").size();
         String note = unresolved == 0 ? null
-                : "CurseForge lists its " + unresolved + " pack file(s) by project/file id only, and "
-                + "resolving those needs a CurseForge API key DeyLauncher doesn't ship -- the pack's "
-                + "bundled (overrides) files install normally; the rest need the pack author's own "
-                + "overrides or the Modrinth edition of the pack.";
+                : "CurseForge lists its " + unresolved + " pack file(s) by project/file id only, so "
+                + "DeyLauncher looks every one of them up on CurseForge and downloads it straight into "
+                + "this instance's mods/ folder while installing -- no manual downloads, no placing "
+                + "jars by hand. Anything that has genuinely been removed upstream is listed in the "
+                + "launcher log instead of being silently skipped.";
+        // Nothing is known-unresolvable at read time: the ids are resolved (offline-safe, cached) by
+        // ModpackResolver while installing, and it reports whatever genuinely couldn't be fetched.
         return new ModpackInfo(ModpackFormat.CURSEFORGE_ZIP, name, version, mc,
                 loader == null ? "Vanilla" : loader, loaderVersion,
-                List.of(), bundled, unresolved, null, pack, note);
+                List.of(), bundled, 0, null, pack, note);
+    }
+
+    /**
+     * A CurseForge pack's declared files, straight out of its {@code manifest.json}: every entry is a
+     * {@code projectID} + {@code fileID} pair with no path, no URL and no hash, which is why
+     * {@link CurseForgeFiles} exists to turn them into real downloads.
+     *
+     * <p>Names are matched up with the pack's own {@code modlist.html} (CurseForge writes one
+     * {@code <li>} per manifest entry, in the same order) and are used ONLY as a fallback when the id
+     * lookup fails; the pairing is dropped entirely when the two lists don't line up, so a mismatched
+     * order can never make us fetch a different mod than the pack asked for.
+     */
+    public static List<CurseForgeEntry> curseForgeEntries(Path pack) {
+        if (pack == null || !Files.exists(pack)) return List.of();
+        try {
+            boolean folder = Files.isDirectory(pack);
+            JsonObject manifest = readJson(pack, folder, "manifest.json");
+            if (manifest == null) return List.of();
+            List<ModlistEntry> listed = modlistEntries(pack, folder);
+            List<JsonObject> files = objArray(manifest, "files");
+            boolean namesLineUp = listed.size() == files.size();
+            List<CurseForgeEntry> out = new ArrayList<>();
+            int index = 0;
+            for (JsonObject f : files) {
+                long projectId = longValue(f, "projectID");
+                long fileId = longValue(f, "fileID");
+                if (projectId <= 0 || fileId <= 0) continue;
+                boolean required = !f.has("required") || f.get("required").isJsonPrimitive() && f.get("required").getAsBoolean();
+                String name = namesLineUp ? listed.get(index).name() : "";
+                out.add(new CurseForgeEntry(projectId, fileId, required, name));
+                index++;
+            }
+            return out;
+        } catch (Exception e) {
+            // A pack we can't parse simply has no resolvable files -- the overrides still install.
+            return List.of();
+        }
+    }
+
+    /** One {@code <li>} of a CurseForge pack's {@code modlist.html}: the mod's name and its page. */
+    private record ModlistEntry(String name, String pageUrl) {}
+
+    /**
+     * Reads the human names out of a CurseForge pack's {@code modlist.html}, in document order.
+     * Purely best-effort: a pack without that file (or with a hand-written one) just yields an empty
+     * list, and the id-based lookup is used on its own.
+     */
+    private static List<ModlistEntry> modlistEntries(Path pack, boolean folder) {
+        List<ModlistEntry> out = new ArrayList<>();
+        try {
+            String html = folder
+                    ? (Files.isRegularFile(pack.resolve("modlist.html"))
+                        ? Files.readString(pack.resolve("modlist.html"), StandardCharsets.UTF_8) : null)
+                    : readZipText(pack, "modlist.html");
+            if (html == null || html.isBlank()) return out;
+            var matcher = java.util.regex.Pattern
+                    .compile("<a\\s+href=\"([^\"]+)\"[^>]*>([^<]*)</a>", java.util.regex.Pattern.CASE_INSENSITIVE)
+                    .matcher(html);
+            while (matcher.find()) {
+                String name = matcher.group(2) == null ? "" : matcher.group(2).trim();
+                if (name.isBlank()) continue;
+                out.add(new ModlistEntry(name, matcher.group(1)));
+            }
+        } catch (Exception ignored) {
+            // Never fatal: names are a nicety, the ids are the source of truth.
+        }
+        return out;
+    }
+
+    private static long longValue(JsonObject o, String key) {
+        if (o == null || !o.has(key)) return -1L;
+        try {
+            JsonElement el = o.get(key);
+            return el == null || el.isJsonNull() ? -1L : el.getAsLong();
+        } catch (Exception e) {
+            return -1L;
+        }
     }
 
     // ---- MultiMC / Prism Launcher exported instance ----
@@ -296,7 +383,7 @@ public final class ModpackReader {
             try (var walk = Files.walk(base)) {
                 for (Path p : (Iterable<Path>) walk.filter(Files::isRegularFile)::iterator) {
                     String full = source.relativize(p).toString().replace('\\', '/');
-                    String target = safeRel(stripPrefix(full, prefix));
+                    String target = safeRel(stripMinecraftPrefix(stripPrefix(full, prefix)));
                     if (target == null || isPackMetadata(target)) continue;
                     if (whitelistOnly && !isGamePath(target)) continue;
                     // archiveEntry doubles as "where to read it from": an absolute path for folders,
@@ -313,7 +400,7 @@ public final class ModpackReader {
                 if (e.isDirectory()) continue;
                 String n = e.getName();
                 if (!prefix.isEmpty() && !n.startsWith(prefix)) continue;
-                String target = safeRel(stripPrefix(n, prefix));
+                String target = safeRel(stripMinecraftPrefix(stripPrefix(n, prefix)));
                 if (target == null || isPackMetadata(target)) continue;
                 if (whitelistOnly && !isGamePath(target)) continue;
                 out.add(ModpackFile.bundled(target, n, e.getSize(), clientOk, serverOk));
@@ -364,6 +451,39 @@ public final class ModpackReader {
         return p;
     }
 
+    /**
+     * Rewrites the KNOWN top-level game folders to the spelling the game itself uses, so a pack that
+     * ships {@code Mods/foo.jar} (or {@code Config/...}, {@code ResourcePacks/...}, {@code Options.txt})
+     * lands where Minecraft actually reads it.
+     *
+     * <p>Linux and macOS have a case-sensitive filesystem, so before this a pack with a capitalised
+     * folder installed "successfully" into a folder the mod loader never scans -- the pack silently did
+     * nothing for that user, while the very same archive worked on the pack author's Windows machine
+     * (NTFS is case-insensitive). That "works for them, not for me" difference is exactly the bug this
+     * closes. On Windows the same rewrite also stops two entries that differ only by case
+     * ({@code mods/a.jar} vs {@code Mods/a.jar}) from quietly overwriting each other.
+     *
+     * <p>Deliberately conservative: only names in {@link #GAME_FOLDERS} / {@link #ROOT_GAME_FILES} are
+     * rewritten. A pack-specific folder ({@code kubejs_scripts}, a mod's own data dir, ...) keeps the
+     * pack's exact spelling, because only the pack's author knows whether something reads it
+     * case-sensitively.
+     */
+    static String canonicalGameFolder(String rel) {
+        if (rel == null) return null;
+        String p = rel.replace('\\', '/');
+        int slash = p.indexOf('/');
+        String top = slash < 0 ? p : p.substring(0, slash);
+        String lower = top.toLowerCase(Locale.ROOT);
+        String canonical = null;
+        if (GAME_FOLDERS.contains(lower)) {
+            canonical = lower; // every name in GAME_FOLDERS is already lower-case, i.e. the game's own spelling
+        } else if (slash < 0 && ROOT_GAME_FILES.contains(lower)) {
+            canonical = lower; // ...and Minecraft writes options.txt / servers.dat in lower case too
+        }
+        if (canonical == null || canonical.equals(top)) return p;
+        return canonical + (slash < 0 ? "" : p.substring(slash));
+    }
+
     private static String stripPrefix(String entry, String prefix) {
         if (prefix.isEmpty()) return entry;
         return entry.startsWith(prefix) ? entry.substring(prefix.length()) : entry;
@@ -371,6 +491,23 @@ public final class ModpackReader {
 
     private static String stripTrailingSlash(String s) {
         return s.endsWith("/") ? s.substring(0, s.length() - 1) : s;
+    }
+
+    /**
+     * Drops a leading {@code .minecraft/} from a pack-relative path.
+     *
+     * <p>Plenty of exported instances (and hand-made packs) wrap everything in a {@code .minecraft/}
+     * folder, which is where Minecraft itself keeps the instance -- but a DeyLauncher instance IS that
+     * folder, so {@code .minecraft/mods/foo.jar} has to become {@code mods/foo.jar}. Without this the
+     * jar landed in {@code <instance>/.minecraft/mods/}, where the mod loader never looks: the pack
+     * reported a successful install while none of those mods actually loaded.
+     */
+    static String stripMinecraftPrefix(String rel) {
+        if (rel == null) return null;
+        String p = rel.replace('\\', '/');
+        String lower = p.toLowerCase(Locale.ROOT);
+        if (lower.equals(".minecraft")) return null; // the wrapper folder itself is not a file
+        return lower.startsWith(".minecraft/") ? p.substring(".minecraft/".length()) : rel;
     }
 
     private static String withTrailingSlash(String s) {

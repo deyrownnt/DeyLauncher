@@ -22,23 +22,6 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Create embedded GitHub config
-        shell: bash
-        env:
-          GITHUB_TOKEN_VALUE: ${{ secrets.DEYLAUNCHER_GITHUB_TOKEN }}
-          GITHUB_OWNER: ${{ secrets.DEYLAUNCHER_GITHUB_OWNER }}
-          GITHUB_REPO: ${{ secrets.DEYLAUNCHER_GITHUB_REPO }}
-          GITHUB_FRIENDS_PATH: ${{ secrets.DEYLAUNCHER_GITHUB_FRIENDS_PATH }}
-        run: |
-          mkdir -p secrets
-
-          cat > secrets/embedded-github.properties <<EOF
-          token=${GITHUB_TOKEN_VALUE}
-          owner=${GITHUB_OWNER}
-          repo=${GITHUB_REPO}
-          friendsPath=${GITHUB_FRIENDS_PATH}
-          EOF
-
       - name: Build
         run: ./gradlew clean prepareJpackage
 
@@ -93,23 +76,6 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-
-      - name: Create embedded GitHub config
-        shell: pwsh
-        env:
-          GITHUB_TOKEN_VALUE: ${{ secrets.DEYLAUNCHER_GITHUB_TOKEN }}
-          GITHUB_OWNER: ${{ secrets.DEYLAUNCHER_GITHUB_OWNER }}
-          GITHUB_REPO: ${{ secrets.DEYLAUNCHER_GITHUB_REPO }}
-          GITHUB_FRIENDS_PATH: ${{ secrets.DEYLAUNCHER_GITHUB_FRIENDS_PATH }}
-        run: |
-          New-Item -ItemType Directory -Force -Path secrets | Out-Null
-
-          @"
-          token=$env:GITHUB_TOKEN_VALUE
-          owner=$env:GITHUB_OWNER
-          repo=$env:GITHUB_REPO
-          friendsPath=$env:GITHUB_FRIENDS_PATH
-          "@ | Set-Content secrets/embedded-github.properties
 
       - name: Build
         run: .\gradlew.bat clean prepareJpackage

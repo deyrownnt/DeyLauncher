@@ -35,6 +35,10 @@ public class DeyCapesInstaller {
         if (v.startsWith("1.20")) return "DeyCapes-1.20.jar";
         if (v.equals("1.21") || v.equals("1.21.1")) return "DeyCapes-1.21.1.jar";
         if (v.startsWith("1.21.")) return "DeyCapes-1.21.2+.jar";
+        // Newest 26.x builds are matched BEFORE the generic "26" arm below, so each gets the jar
+        // that actually declares a matching depends.minecraft (26.3 -> ~26.3, else the loader
+        // abort/refuse path kicks in and the version would silently lose capes).
+        if (v.startsWith("26.3")) return "DeyCapes-26.3.jar";
         if (v.startsWith("26")) return "DeyCapes-26.2.jar";
         return null;
     }

@@ -101,13 +101,6 @@ tasks.shadowJar {
     archiveVersion.set(version.toString())
 }
 
-// Bakes a GitHub token into the built jar for distributed installers, so friends who install
-// the packaged app don't need to set up github.properties themselves -- only the dev building
-// the installer does. Reads from a LOCAL, gitignored file (never committed, never in chat):
-//   secrets/embedded-github.properties
-// Same format as ~/.deylauncher/github.properties -- see GITHUB_SETUP.md.
-// If that file doesn't exist (e.g. building from source without setting this up), this is a
-// silent no-op and GitHubConfig just falls back to each user's own local override file instead.
 tasks.processResources {
     // Single source of truth for the self-updater's version: bake project.version (above) into a
     // tiny resource the running app reads, so AppUpdater.currentVersion() is correct in BOTH the
@@ -121,15 +114,6 @@ tasks.processResources {
     }
     from(versionFile)
 
-    val embedSource = file("secrets/embedded-github.properties")
-    if (embedSource.exists()) {
-        from(embedSource) {
-            rename { "embedded-github.properties" }
-        }
-        logger.lifecycle("DeyLauncher: embedding GitHub token from secrets/embedded-github.properties into this build.")
-    } else {
-        logger.lifecycle("DeyLauncher: no secrets/embedded-github.properties found -- building WITHOUT an embedded token (users will need their own github.properties for Friends).")
-    }
 }
 
 tasks.register("printClasspath") {
