@@ -98,7 +98,7 @@ public class NeoForgeInstaller {
 
     /**
      * The Maven artifact + version prefix NeoForge uses for {@code mcVersion}, or null when NeoForge
-     * has no build for it at all (the 1.16-1.19 era, or a snapshot id).
+     * has no build for it at all (the 1.16-1.19 era, 1.20.0, or a snapshot id).
      *
      * <p>This only maps the Minecraft version onto NeoForge's naming scheme; whether a build actually
      * exists is decided against the live Maven metadata in {@link #latestVersion}, so an unsupported
@@ -114,14 +114,34 @@ public class NeoForgeInstaller {
         // "1.20.1-forge-47.1.106", i.e. that same string is the client profile id it writes).
         if (v.equals("1.20.1")) return new Target("forge", "1.20.1-", true);
 
-        // Modern scheme: drop the leading "1." and keep the first two numeric segments.
-        //   1.21.1 -> 21.1.   1.21.11 -> 21.11.   26.2 -> 26.2.
-        String trimmed = v.startsWith("1.") ? v.substring(2) : v;
-        String[] parts = trimmed.split("\\.");
-        if (parts.length < 2) return null; // e.g. "1.20" (there is no NeoForge 1.20.0) or a snapshot id
+        // Real Minecraft versions start with "1." (e.g. "1.21.1", "1.20.4")
+        if (v.startsWith("1.")) {
+            // Modern scheme: drop the leading "1." and keep the first two numeric segments.
+            //   1.21.1 -> 21.1.   1.21.11 -> 21.11.   1.20.4 -> 20.4.
+            String trimmed = v.substring(2);
+            String[] parts = trimmed.split("\\.");
+            if (parts.length < 2) return null; // e.g. "1.20" (there is no NeoForge 1.20.0) or a snapshot id
+            for (int i = 0; i < 2; i++) {
+                if (parts[i].isEmpty() || !parts[i].chars().allMatch(Character::isDigit)) return null;
+            }
+
+            // 1.20.x (except 1.20.1 which is handled above) has no NeoForge builds.
+            int major = Integer.parseInt(parts[0]);
+            if (major < 20) return null; // 1.16-1.19 predate NeoForge entirely
+
+            return new Target("neoforge", parts[0] + "." + parts[1] + ".", false);
+        }
+
+        // Synthetic DeyLauncher versions like "26.2", "26.3" (for 1.21+)
+        // Must have exactly two numeric segments, no extra parts (so "26.3-snapshot-2" is rejected).
+        String[] parts = v.split("\\.");
+        if (parts.length != 2) return null;
         for (int i = 0; i < 2; i++) {
             if (parts[i].isEmpty() || !parts[i].chars().allMatch(Character::isDigit)) return null;
         }
+        // Synthetic versions 20+ map to 1.21+ NeoForge
+        int major = Integer.parseInt(parts[0]);
+        if (major < 20) return null;
         return new Target("neoforge", parts[0] + "." + parts[1] + ".", false);
     }
 
@@ -130,7 +150,14 @@ public class NeoForgeInstaller {
      * {@code neoforge-26.2.0.88} (modern) or {@code 1.20.1-forge-47.1.106} (legacy 1.20.1).
      */
     public static String profileId(Target target, String neoVersion) {
-        if (target != null && target.legacyForge()) return neoVersion;
+        if (target != null && target.legacyForge()) {
+            // Legacy profile id uses "forge" in the name: 1.20.1-forge-47.1.106
+            String prefix = target.versionPrefix(); // "1.20.1-"
+            if (neoVersion.startsWith(prefix)) {
+                return prefix + "forge-" + neoVersion.substring(prefix.length());
+            }
+            return prefix + "forge-" + neoVersion;
+        }
         return "neoforge-" + neoVersion;
     }
 

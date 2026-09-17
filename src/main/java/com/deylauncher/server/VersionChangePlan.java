@@ -70,8 +70,10 @@ public final class VersionChangePlan {
         int currentIndex = indexOf(manifest, current);
         int chosenIndex = indexOf(manifest, chosen);
         if (currentIndex < 0 || chosenIndex < 0) return null;
-        // Newest first, so a SMALLER index means a NEWER version -- the sign has to be flipped here.
-        return Integer.compare(currentIndex, chosenIndex) * -1;
+        // Manifest is newest-first. A SMALLER index means a NEWER version.
+        // If currentIndex < chosenIndex: current is newer -> DOWNGRADE (negative)
+        // If currentIndex > chosenIndex: current is older -> UPGRADE (positive)
+        return Integer.compare(currentIndex, chosenIndex);
     }
 
     private static int indexOf(List<VersionManifest.VersionEntry> manifest, String id) {
@@ -89,8 +91,10 @@ public final class VersionChangePlan {
         if (a == null || b == null) return null;
         int length = Math.max(a.length, b.length);
         for (int i = 0; i < length; i++) {
-            int left = i < a.length ? a[i] : 0;
-            int right = i < b.length ? b[i] : 0;
+            // Compare chosen vs current: if chosen > current -> UPGRADE (positive)
+            // If chosen < current -> DOWNGRADE (negative)
+            int left = i < b.length ? b[i] : 0;   // chosen
+            int right = i < a.length ? a[i] : 0;  // current
             if (left != right) return Integer.compare(left, right);
         }
         return 0;
