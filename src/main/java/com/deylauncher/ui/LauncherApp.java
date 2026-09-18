@@ -3290,14 +3290,21 @@ public class LauncherApp extends Application {
                     // starting the server is still the user's call.
                     if (server.type == ServerType.FABRIC && server.minecraftVersion != null) {
                         try {
+                            // Messages are buffered and shown only when something was actually
+                            // installed -- otherwise "all dependencies present" would be printed on
+                            // every single start.
+                            java.util.List<String> depNotes = new java.util.ArrayList<>();
                             var deps = new ServerModDependencyResolver().resolveAndInstall(
-                                    serverDir, server.minecraftVersion, server.type.displayName(), null,
-                                    message -> Platform.runLater(() -> serverConsoleArea
-                                            .appendText("[DeyLauncher] " + message + "\n")));
+                                    serverDir, server.minecraftVersion, server.type.displayName(),
+                                    null, depNotes::add);
                             if (deps.installed() > 0) {
-                                Platform.runLater(() -> serverConsoleArea.appendText(
-                                        "[DeyLauncher] Installed " + deps.installed()
-                                        + " missing mod dependency(ies) before start.\n"));
+                                depNotes.add("Installed " + deps.installed()
+                                        + " missing mod dependency(ies) before start.");
+                                Platform.runLater(() -> {
+                                    for (String note : depNotes) {
+                                        serverConsoleArea.appendText("[DeyLauncher] " + note + "\n");
+                                    }
+                                });
                             }
                         } catch (Exception ignored) {
                             // A dependency lookup must never hold up a start.
