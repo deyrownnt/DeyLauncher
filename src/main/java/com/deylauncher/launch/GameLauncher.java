@@ -136,25 +136,17 @@ public class GameLauncher {
         JsonObject args = version.versionJson().has("arguments")
                 ? version.versionJson().getAsJsonObject("arguments") : null;
 
-        // Headless mode: prevent Swing/AWT mods (like EarlyLoadingBar) from trying to create windows
-        // when no display is available (CI, servers, headless Linux). This must be added before
-        // the version JSON's JVM args so it takes effect early.
-        // Also enable when software rendering is used (strong indicator of headless/CI environment).
-        // On Linux, always enable headless for modpack launches unless native Wayland is explicitly requested,
-        // because modpacks often include mods (EarlyLoadingBar, etc.) that create Swing windows at startup.
-        // The launcher process may have a display, but the game process often ends up with software rendering (llvmpipe).
-        boolean headless = isHeadlessEnvironment() || settings.softwareOpenGl() || 
-                (System.getProperty("os.name", "").toLowerCase().contains("linux") && !settings.nativeWayland());
-        // Additionally, always enable headless on Linux for Fabric/Forge modpack launches as a safety net
-        // since many mods (EarlyLoadingBar, etc.) crash when trying to create Swing windows in software rendering mode.
-        if (!headless && System.getProperty("os.name", "").toLowerCase().contains("linux")) {
-            // Check if this is a modpack/modded launch by looking for Fabric/Forged indicators
-            String mainClass = version.mainClass();
-            if (mainClass != null && (mainClass.contains("fabric") || mainClass.contains("forge") || mainClass.contains("knot"))) {
-                headless = true;
-            }
-        }
-        if (headless) {
+        // Headless mode: lets AWT/Swing-based mods fail cleanly instead of trying to open a window
+        // when there is genuinely no display server (CI, a real headless box). It must be added
+        // before the version JSON's JVM args so it takes effect early.
+        //
+        // This flag is deliberately set ONLY when no display exists. Earlier versions also forced it
+        // on every Linux launch (and later on every Fabric/Quilt launch) as a "safety net" -- but
+        // forcing it on a normal desktop session is exactly what made mods that pop an AWT/Swing
+        // window during startup die with HeadlessException, e.g. EarlyLoadingBar's PreLaunchWindow
+        // (java.awt.GraphicsEnvironment#checkHeadless throws as soon as java.awt.headless=true).
+        // Minecraft's own window is GLFW/LWJGL, so no mod loader needs this flag to start.
+        if (isHeadlessEnvironment()) {
             command.add("-Djava.awt.headless=true");
         }
 
@@ -248,32 +240,42 @@ public class GameLauncher {
     }
 
     /**
-     * Detects if we're running in a headless environment (no display server).
-     * This is used to set -Djava.awt.headless=true to prevent Swing/AWT mods
-     * (like EarlyLoadingBar) from trying to create windows when no display is available.
+     * Detects if we're running in a headless environment (no display server). Only then is
+     * {@code -Djava.awt.headless=true} handed to the game, so an AWT/Swing mod that opens a window
+     * during startup (EarlyLoadingBar) still works on a normal desktop session.
      */
     private static boolean isHeadlessEnvironment() {
-        String osName = System.getProperty("os.name", "").toLowerCase();
-        if (!osName.contains("linux")) return false;
+        return isHeadless(System.getProperty("os.name", ""), System.getenv("DISPLAY"),
+                System.getenv("WAYLAND_DISPLAY"), System.getenv("XDG_SESSION_TYPE"));
+    }
 
-        // Check for display servers
-        String display = System.getenv("DISPLAY");
-        String waylandDisplay = System.getenv("WAYLAND_DISPLAY");
-        String xdgSessionType = System.getenv("XDG_SESSION_TYPE");
+    /**
+     * Testable core of {@link #isHeadlessEnvironment()}: the OS name and the three display-related
+     * environment values are supplied instead of read from the JVM.
+     *
+     * <p>Only Linux is ever reported as headless: on Windows/macOS the launcher has no display probe,
+     * and forcing the flag there would break the same Swing mods it is meant to protect.
+     */
+    static boolean isHeadless(String osName, String display, String waylandDisplay, String sessionType) {
+        String os = osName == null ? "" : osName.toLowerCase();
+        if (!os.contains("linux")) return false;
 
-        // No display at all = headless
-        if ((display == null || display.isBlank()) &&
-            (waylandDisplay == null || waylandDisplay.isBlank()) &&
-            (xdgSessionType == null || xdgSessionType.equals("tty"))) {
+        // No display at all = headless.
+        if (isBlank(display) && isBlank(waylandDisplay)
+                && (sessionType == null || sessionType.equals("tty"))) {
             return true;
         }
 
-        // DISPLAY set but points to nothing accessible (common in CI)
-        if (display != null && !display.isBlank() && !display.startsWith(":") && !display.contains(":")) {
+        // DISPLAY set but not a usable X display (some CI containers set a bare host name).
+        if (!isBlank(display) && !display.startsWith(":") && !display.contains(":")) {
             return true;
         }
 
         return false;
+    }
+
+    private static boolean isBlank(String s) {
+        return s == null || s.isBlank();
     }
 
 

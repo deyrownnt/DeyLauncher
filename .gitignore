@@ -11,6 +11,18 @@ secrets/
 # Local AI-assistant chat history (tooling, not source)
 .aider*
 
+# A running game/server instance keeps its own config, logs and mixin output in these folders. They
+# belong in ~/.deylauncher/instances, never in the repo; an earlier commit added them by accident and
+# they have been removed (from history too). Keep them out.
+config/
+logs/
+patchouli_books/
+.mixin.out/
+
+# Installer / debug logs and throwaway dumps
+*.log
+log*.txt
+
 # IDE
 .idea/
 .vscode/

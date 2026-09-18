@@ -197,6 +197,54 @@ class GameLauncherTest {
         assertEquals(List.of(), GameLauncher.unresolvedPlaceholders(List.of("--clientId", "abc", "-Xmx4G")));
     }
 
+    /**
+     * The EarlyLoadingBar fix. {@code -Djava.awt.headless=true} must never be added on a normal
+     * desktop session: a mod that opens an AWT/Swing window during startup (EarlyLoadingBar's
+     * PreLaunchWindow) throws {@code HeadlessException} the instant that flag is set, which is exactly
+     * the crash the launcher used to cause by forcing it on every Linux -- and later every
+     * Fabric/Quilt -- launch. A real display must always come back "not headless".
+     */
+    @Test
+    void aRealDisplayIsNeverTreatedAsHeadless() {
+        assertFalse(GameLauncher.isHeadless("Linux", ":0", null, "x11"),
+                "an X11 desktop must never get -Djava.awt.headless=true");
+        assertFalse(GameLauncher.isHeadless("Linux", ":0", null, "wayland"),
+                "XWayland still gives AWT a usable display");
+        assertFalse(GameLauncher.isHeadless("Linux", null, "wayland-0", "wayland"),
+                "a native Wayland session has a display too");
+        // Windows/macOS are never classified headless: the launcher has no display probe there.
+        assertFalse(GameLauncher.isHeadless("Windows 11", null, null, null));
+        assertFalse(GameLauncher.isHeadless("Mac OS X", null, null, null));
+    }
+
+    /** Only a genuinely display-less Linux box gets the flag. */
+    @Test
+    void onlyADisplayLessLinuxBoxIsHeadless() {
+        assertTrue(GameLauncher.isHeadless("Linux", null, null, null));
+        assertTrue(GameLauncher.isHeadless("Linux", null, null, "tty"));
+        assertTrue(GameLauncher.isHeadless("Linux", "ci-runner", null, null),
+                "DISPLAY without a colon is not a usable X display (common in CI containers)");
+    }
+
+    /**
+     * The flag on the finished command line is decided by exactly that probe and nothing else, so a
+     * future change can't quietly reintroduce the per-loader/per-OS forcing.
+     */
+    @Test
+    void headlessFlagMatchesTheDisplayProbeAndNothingElse() {
+        Path root = Path.of("/tmp/deyroot");
+        List<String> command = new GameLauncher().buildCommand(
+                vanillaStyleVersion(root), AuthSession.offline("tester"),
+                root.resolve("instances").resolve("1.20.1"),
+                GameLauncher.LaunchSettings.defaults(), "java", null);
+
+        boolean expected = GameLauncher.isHeadless(System.getProperty("os.name", ""),
+                System.getenv("DISPLAY"), System.getenv("WAYLAND_DISPLAY"), System.getenv("XDG_SESSION_TYPE"));
+        assertEquals(expected, command.contains("-Djava.awt.headless=true"),
+                "headless must come only from the display probe: " + command);
+    }
+
+
     /** A PreparedVersion shaped like real 1.20.1 (its argument list is why those tests exist). */
     private static GameFiles.PreparedVersion vanillaStyleVersion(Path root) {
         JsonObject versionJson = JsonParser.parseString("""

@@ -7,6 +7,7 @@ import com.deylauncher.friends.*;
 import com.deylauncher.deycapes.DeyCapesService;
 import com.deylauncher.identity.*;
 import com.deylauncher.launch.CrashDumps;
+import com.deylauncher.launch.DownloadProgress;
 import com.deylauncher.launch.GameFiles;
 import com.deylauncher.launch.GameLauncher;
 import com.deylauncher.launch.JavaRuntimeManager;
@@ -70,6 +71,7 @@ import java.util.Base64;
 import java.util.Comparator;
 import java.util.Deque;
 import java.util.List;
+import java.util.function.Consumer;
 import com.google.gson.Gson;
 
 /**
@@ -3281,6 +3283,27 @@ public class LauncherApp extends Application {
                         }
                     }
 
+                    // Best-effort pre-start dependency check: a Fabric server missing a library mod
+                    // its mods require dies immediately with "Incompatible mod set". Resolving that
+                    // here turns a confusing crash into a one-line note. It costs nothing when
+                    // nothing is missing, never blocks a start, and any failure is only logged --
+                    // starting the server is still the user's call.
+                    if (server.type == ServerType.FABRIC && server.minecraftVersion != null) {
+                        try {
+                            var deps = new ServerModDependencyResolver().resolveAndInstall(
+                                    serverDir, server.minecraftVersion, server.type.displayName(), null,
+                                    message -> Platform.runLater(() -> serverConsoleArea
+                                            .appendText("[DeyLauncher] " + message + "\n")));
+                            if (deps.installed() > 0) {
+                                Platform.runLater(() -> serverConsoleArea.appendText(
+                                        "[DeyLauncher] Installed " + deps.installed()
+                                        + " missing mod dependency(ies) before start.\n"));
+                            }
+                        } catch (Exception ignored) {
+                            // A dependency lookup must never hold up a start.
+                        }
+                    }
+
                     Platform.runLater(() -> serverConsoleArea.appendText("[DeyLauncher] Starting "
                             + server.type.displayName() + " " + server.minecraftVersion
                             + (jar != null ? " (" + jar.getFileName() + ")" : " (Forge launch args)")
@@ -4031,6 +4054,21 @@ public class LauncherApp extends Application {
         Label packStatus = new Label();
         packStatus.getStyleClass().add("notice-label");
         packStatus.setWrapText(true);
+
+        // The install's own progress, shown IN this tab (never a separate popup): a bar that fills as
+        // the pack's files download and its missing dependencies resolve, plus the live phase text.
+        // Both stay hidden until a pack is actually being installed.
+        ProgressBar installBar = new ProgressBar(0);
+        installBar.setMaxWidth(Double.MAX_VALUE);
+        installBar.getStyleClass().add("play-progress");
+        installBar.setVisible(false);
+        installBar.setManaged(false);
+        Label installStatus = new Label();
+        installStatus.getStyleClass().add("notice-label");
+        installStatus.setWrapText(true);
+        installStatus.setVisible(false);
+        installStatus.setManaged(false);
+
         addPackBtn.setOnAction(e -> {
             FileChooser chooser = new FileChooser();
             chooser.setTitle("Select a modpack for this server");
@@ -4038,7 +4076,9 @@ public class LauncherApp extends Application {
                     new FileChooser.ExtensionFilter("Modpacks (.mrpack / .zip)", "*.mrpack", "*.zip"),
                     new FileChooser.ExtensionFilter("All files", "*.*"));
             java.io.File picked = chooser.showOpenDialog(shellWindowOwner("server-" + server.id));
-            if (picked != null) installServerModpack(server, picked.toPath(), packStatus, renderAddons);
+            if (picked != null) {
+                installServerModpack(server, picked.toPath(), packStatus, installBar, installStatus, renderAddons);
+            }
         });
 
         VBox dropZone = new VBox(new Label("Drop " + folderKind + " .jar files here, or a modpack (.mrpack / .zip)"));
@@ -4064,8 +4104,9 @@ public class LauncherApp extends Application {
                         } catch (Exception ignored) {
                         }
                     } else if (ModpackFormat.installable(p)) {
-                        // A whole pack: install its server half in the background (it may download).
-                        installServerModpack(server, p, packStatus, renderAddons);
+                        // A whole pack: install its server half in the background (it may download),
+                        // reporting into this tab's own progress bar.
+                        installServerModpack(server, p, packStatus, installBar, installStatus, renderAddons);
                     }
                 }
             }
@@ -4122,7 +4163,7 @@ public class LauncherApp extends Application {
         searchRow.setAlignment(Pos.CENTER_LEFT);
 
         renderAddons.run();
-        box.getChildren().addAll(heading, dropZone, addPackBtn, packStatus,
+        box.getChildren().addAll(heading, dropZone, addPackBtn, packStatus, installBar, installStatus,
                 sectionLabel("SEARCH ONLINE"), searchRow, searchStatus, resultsBox,
                 listBox);
         return scroll;
@@ -4138,17 +4179,36 @@ public class LauncherApp extends Application {
      * refused with the reason: a server runs exactly one loader and one version, so installing anyway
      * would be a silent no-op at best and a startup crash at worst.
      */
-    private void installServerModpack(ServerInstance server, Path pack, Label packStatus, Runnable renderAddons) {
+    private void installServerModpack(ServerInstance server, Path pack, Label packStatus,
+                                      ProgressBar installBar, Label installStatus, Runnable renderAddons) {
         String addonFolder = ServerAddonsManager.folderNameFor(server.type);
         if (addonFolder == null) {
             packStatus.setText("Switch this server to Fabric, Forge or Purpur first -- a Vanilla server "
                     + "has no mods/ or plugins/ folder for a pack to install into.");
             return;
         }
-        packStatus.setText("Reading " + (pack.getFileName() == null ? pack : pack.getFileName()) + "...");
-        Task<ModpackInstaller.Result> task = new Task<>() {
+
+        // Progress lives IN this tab (the bar + label built beside the Add Modpack button): no popup
+        // window, so nothing can be left dangling behind the tab. Both nodes are only un-hidden for
+        // the duration of the install.
+        installBar.setProgress(0);
+        installBar.setVisible(true);
+        installBar.setManaged(true);
+        installStatus.setText("Reading " + (pack.getFileName() == null ? pack : pack.getFileName()) + "...");
+        installStatus.setVisible(true);
+        installStatus.setManaged(true);
+        packStatus.setText("");
+
+        // Phase helpers -- all called from the install thread; each one hops to the FX thread.
+        Consumer<String> updateLabel = text -> Platform.runLater(() -> installStatus.setText(text));
+        Consumer<String> updateDetail = text -> Platform.runLater(() -> installStatus.setText(text));
+
+        Task<Void> task = new Task<>() {
             @Override
-            protected ModpackInstaller.Result call() throws Exception {
+            protected Void call() throws Exception {
+                // Phase 1: Install the modpack
+                updateLabel.accept("Reading modpack...");
+                updateDetail.accept(pack.getFileName().toString());
                 ModpackInfo info = ModpackReader.read(pack);
                 String problem = info.blockingProblem();
                 if (problem != null) throw new IllegalStateException(problem);
@@ -4163,28 +4223,93 @@ public class LauncherApp extends Application {
                     throw new IllegalStateException("this pack is for Minecraft " + info.mcVersion()
                             + ", but this server runs Minecraft " + server.minecraftVersion + ".");
                 }
-                // The pack's own version/loader drive the resolution of its CurseForge file ids, so the
-                // server gets the same automatic download the client does (only its own folder's files).
-                return new ModpackInstaller().installForServer(info,
+
+                updateLabel.accept("Installing modpack files...");
+                updateDetail.accept("Resolving and downloading modpack files...");
+
+                // Install modpack with progress (this phase owns 5%..60% of the bar).
+                DownloadProgress installerProgress = fraction -> {
+                    double f = 0.05 + fraction * 0.55;
+                    Platform.runLater(() -> installBar.setProgress(f));
+                };
+                Consumer<String> installerLog = msg -> Platform.runLater(() -> installStatus.setText(msg));
+
+                ModpackInstaller.Result result = new ModpackInstaller().installForServer(info,
                         info.knowsMinecraftVersion() ? info.mcVersion() : server.minecraftVersion,
                         info.loaderDeclared() ? info.launcherLoader() : server.type.displayName(),
-                        serverStore.serverDir(server.id), addonFolder, null, null);
+                        serverStore.serverDir(server.id), addonFolder, installerProgress, installerLog);
+
+                if (!result.errors().isEmpty()) {
+                    log("Server modpack files that failed:\n  " + String.join("\n  ", result.errors()));
+                }
+// Phase 2: fetch the required dependencies the pack's mods declare but the server
+                // lacks (Fabric family only -- other loaders use a different metadata format). This is
+                // what keeps a freshly installed server from dying with "Incompatible mod set".
+                String mcVersion = server.minecraftVersion;
+                String loader = server.type.displayName();
+                if (("Fabric".equalsIgnoreCase(loader) || "Quilt".equalsIgnoreCase(loader))
+                        && mcVersion != null && !mcVersion.isBlank()) {
+                    updateLabel.accept("Resolving missing mod dependencies...");
+
+                    DownloadProgress resolverProgress = fraction -> {
+                        double f = 0.6 + fraction * 0.4; // 60% - 100%
+                        Platform.runLater(() -> installBar.setProgress(f));
+                    };
+                    Consumer<String> resolverLog = msg -> {
+                        Platform.runLater(() -> installStatus.setText(msg));
+                        log(msg);
+                    };
+
+                    ServerModDependencyResolver.Result depResult = new ServerModDependencyResolver()
+                            .resolveAndInstall(serverStore.serverDir(server.id), mcVersion, loader,
+                                    resolverProgress, resolverLog);
+
+                    Platform.runLater(() -> {
+                        String summary = "Modpack installed: " + result.summary();
+                        if (depResult.missingDepsFound() > 0) {
+                            summary += " | Dependencies: " + depResult.summary();
+                        }
+                        if (depResult.hasErrors()) {
+                            summary += " -- " + depResult.errors().size() + " dependency error(s), see log";
+                            log("Server modpack dependency errors:\n  " + String.join("\n  ", depResult.errors()));
+                        }
+                        if (!depResult.warnings().isEmpty()) {
+                            log("Server modpack dependency warnings:\n  " + String.join("\n  ", depResult.warnings()));
+                        }
+                        packStatus.setText(summary);
+                        installStatus.setText("Modpack installed.");
+                        // Always refresh the addons list after both phases.
+                        renderAddons.run();
+                    });
+                } else {
+                    Platform.runLater(() -> {
+                        packStatus.setText("Modpack installed into this server's " + addonFolder + "/ folder: "
+                                + result.summary() + (result.errors().isEmpty()
+                                ? "" : " -- " + result.errors().size() + " file(s) failed, see the launcher log"));
+                        renderAddons.run();
+                    });
+                }
+                return null;
             }
         };
-        task.setOnSucceeded(ev -> Platform.runLater(() -> {
-            ModpackInstaller.Result result = task.getValue();
-            packStatus.setText("Modpack installed into this server's " + addonFolder + "/ folder: "
-                    + result.summary() + (result.errors().isEmpty()
-                    ? "" : " -- " + result.errors().size() + " file(s) failed, see the launcher log"));
-            if (!result.errors().isEmpty()) {
-                log("Server modpack files that failed:\n  " + String.join("\n  ", result.errors()));
-            }
-            renderAddons.run();
-        }));
-        task.setOnFailed(ev -> Platform.runLater(() -> {
+
+        // Task's own handlers already run on the FX thread, so the UI can be touched directly.
+        task.setOnSucceeded(ev -> {
+            installBar.setProgress(1);
+            installStatus.setText("Done. See the summary below.");
+        });
+
+        task.setOnFailed(ev -> {
             Throwable ex = task.getException();
-            packStatus.setText("Couldn't install that modpack: " + (ex == null ? "unknown error" : ex.getMessage()));
-        }));
+            String message = ex == null ? "unknown error" : ex.getMessage();
+            installBar.setVisible(false);
+            installBar.setManaged(false);
+            installStatus.setVisible(false);
+            installStatus.setManaged(false);
+            packStatus.setText("Couldn't install that modpack: " + message);
+            log("Modpack install failed: " + message);
+        });
+
         new Thread(task, "server-modpack-install").start();
     }
 
