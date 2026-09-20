@@ -61,6 +61,8 @@
     -fx-cursor: hand; -fx-border-color: #2a2b30; -fx-border-radius: 50%; -fx-font-size: 16px;
 }
 .theme-dark .icon-button:hover { -fx-border-color: #ff7a1f; -fx-text-fill: #ff7a1f; }
+/* A modpack is attached to the version/loader selection: ring the modpack button in the accent color. */
+.theme-dark .icon-button.modpack-attached { -fx-border-color: #ff7a1f; -fx-background-color: rgba(255,122,31,0.15); }
 
 /* ---- Home page: left column (mode toggle + version tiles) ---- */
 .theme-dark .side-panel {
@@ -410,6 +412,7 @@
     -fx-cursor: hand; -fx-border-color: #e2e2e4; -fx-border-radius: 50%; -fx-font-size: 16px;
 }
 .theme-light .icon-button:hover { -fx-border-color: #ff7a1f; -fx-text-fill: #e8690f; }
+.theme-light .icon-button.modpack-attached { -fx-border-color: #ff7a1f; -fx-background-color: rgba(255,122,31,0.12); }
 
 /* ---- Home page: left column (mode toggle + version tiles) ---- */
 .theme-light .side-panel {

@@ -13,6 +13,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class GameLauncherTest {
@@ -198,50 +199,67 @@ class GameLauncherTest {
     }
 
     /**
-     * The EarlyLoadingBar fix. {@code -Djava.awt.headless=true} must never be added on a normal
-     * desktop session: a mod that opens an AWT/Swing window during startup (EarlyLoadingBar's
-     * PreLaunchWindow) throws {@code HeadlessException} the instant that flag is set, which is exactly
-     * the crash the launcher used to cause by forcing it on every Linux -- and later every
-     * Fabric/Quilt -- launch. A real display must always come back "not headless".
+     * The EarlyLoadingBar fix, in full. Two things have to hold at once for a mod that opens an AWT/Swing
+     * window during startup (EarlyLoadingBar's PreLaunchWindow) to survive on Linux:
+     * <ul>
+     *   <li>an X display AWT can use must NEVER come back as {@code -Djava.awt.headless=true} -- forcing
+     *       that flag on every Linux (and later every Fabric/Quilt) launch is exactly what made that mod's
+     *       static initialiser throw, see {@code java.awt.GraphicsEnvironment#checkHeadless}; and</li>
+     *   <li>a Linux launch must not fall back to the JDK's own default either, because on Unix that default
+     *       is "headless unless DISPLAY is set" -- so a Wayland session that exports no DISPLAY silently
+     *       turned AWT off for the whole game process, the same crash by another route. Every Linux launch
+     *       therefore pins the flag explicitly (and the child also gets a DISPLAY: see X11Display).</li>
+     * </ul>
+     * Windows/macOS get no flag at all: their default is already non-headless and there is no display probe
+     * there, so a flag could only break the very mods this protects.
      */
     @Test
-    void aRealDisplayIsNeverTreatedAsHeadless() {
-        assertFalse(GameLauncher.isHeadless("Linux", ":0", null, "x11"),
-                "an X11 desktop must never get -Djava.awt.headless=true");
-        assertFalse(GameLauncher.isHeadless("Linux", ":0", null, "wayland"),
-                "XWayland still gives AWT a usable display");
-        assertFalse(GameLauncher.isHeadless("Linux", null, "wayland-0", "wayland"),
-                "a native Wayland session has a display too");
-        // Windows/macOS are never classified headless: the launcher has no display probe there.
-        assertFalse(GameLauncher.isHeadless("Windows 11", null, null, null));
-        assertFalse(GameLauncher.isHeadless("Mac OS X", null, null, null));
-    }
-
-    /** Only a genuinely display-less Linux box gets the flag. */
-    @Test
-    void onlyADisplayLessLinuxBoxIsHeadless() {
-        assertTrue(GameLauncher.isHeadless("Linux", null, null, null));
-        assertTrue(GameLauncher.isHeadless("Linux", null, null, "tty"));
-        assertTrue(GameLauncher.isHeadless("Linux", "ci-runner", null, null),
+    void theAwtHeadlessFlagFollowsTheXDisplayAndIsPinnedOnLinux() {
+        assertEquals("false", GameLauncher.awtHeadlessMode("Linux", ":0"),
+                "an X11/XWayland display must never be headless");
+        assertEquals("false", GameLauncher.awtHeadlessMode("Linux", "localhost:10.0"),
+                "ssh -X forwards a display AWT can use too");
+        assertEquals("true", GameLauncher.awtHeadlessMode("Linux", null),
+                "no X display at all: keep the clean failure a real headless box needs");
+        assertEquals("true", GameLauncher.awtHeadlessMode("Linux", "   "));
+        assertEquals("true", GameLauncher.awtHeadlessMode("Linux", "ci-runner"),
                 "DISPLAY without a colon is not a usable X display (common in CI containers)");
+        assertNull(GameLauncher.awtHeadlessMode("Windows 11", ":0"),
+                "Windows must not be given a flag at all (it is already non-headless by default)");
+        assertNull(GameLauncher.awtHeadlessMode("Windows 11", null));
+        assertNull(GameLauncher.awtHeadlessMode("Mac OS X", null));
     }
 
     /**
-     * The flag on the finished command line is decided by exactly that probe and nothing else, so a
-     * future change can't quietly reintroduce the per-loader/per-OS forcing.
+     * The flag on the finished command line is decided by exactly the X-display probe and nothing else, so
+     * a future change can't quietly reintroduce the per-loader/per-OS forcing -- and Windows/macOS must get
+     * no {@code -Djava.awt.headless} argument whatsoever.
      */
     @Test
     void headlessFlagMatchesTheDisplayProbeAndNothingElse() {
         Path root = Path.of("/tmp/deyroot");
+        GameFiles.PreparedVersion version = vanillaStyleVersion(root);
         List<String> command = new GameLauncher().buildCommand(
-                vanillaStyleVersion(root), AuthSession.offline("tester"),
+                version, AuthSession.offline("tester"),
                 root.resolve("instances").resolve("1.20.1"),
                 GameLauncher.LaunchSettings.defaults(), "java", null);
 
-        boolean expected = GameLauncher.isHeadless(System.getProperty("os.name", ""),
-                System.getenv("DISPLAY"), System.getenv("WAYLAND_DISPLAY"), System.getenv("XDG_SESSION_TYPE"));
-        assertEquals(expected, command.contains("-Djava.awt.headless=true"),
-                "headless must come only from the display probe: " + command);
+        String expected = GameLauncher.awtHeadlessMode(System.getProperty("os.name", ""),
+                X11Display.resolvableDisplay());
+        String flag = command.stream().filter(arg -> arg.startsWith("-Djava.awt.headless="))
+                .findFirst().orElse(null);
+        assertEquals(expected == null ? null : "-Djava.awt.headless=" + expected, flag,
+                "the headless flag must come only from the display probe: " + command);
+
+        // And it must be the LAST JVM option, just before the main class: a -D repeated later wins, so
+        // anything the version profile itself declares can no longer overrule this decision.
+        if (flag != null) {
+            int flagIndex = command.indexOf(flag);
+            assertTrue(flagIndex < command.indexOf(version.mainClass()),
+                    "the headless flag must precede the main class: " + command);
+            assertTrue(flagIndex > command.indexOf("-Djava.library.path=" + version.nativesDir()),
+                    "the headless flag must come after the version profile's own JVM arguments: " + command);
+        }
     }
 
 

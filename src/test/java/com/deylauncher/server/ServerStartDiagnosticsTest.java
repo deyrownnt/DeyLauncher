@@ -38,6 +38,21 @@ class ServerStartDiagnosticsTest {
     }
 
     @Test
+    void aMissingModLibraryIsRecognisedAsTheAutoFixableCase() {
+        var immediate = ServerStartDiagnostics.hintFor(
+                "[19:55:04] [main/INFO]: Immediate reason: [HARD_DEP_NO_CANDIDATE antique_atlas_item 1.0.0 "
+                        + "{depends antique_atlas @ [>=2.11.2+1.20]}, ROOT_FORCELOAD_SINGLE antique_atlas_item 1.0.0]");
+        assertNotNull(immediate);
+        assertEquals("missing-mod-dependency", immediate.key());
+        assertTrue(immediate.message().contains("mods-disabled"),
+                "the hint must point at where the launcher sets the offending mod aside");
+
+        assertEquals("missing-mod-dependency", ServerStartDiagnostics.hintFor(
+                "\t - Mod 'AntiqueAtlasItem' (antique_atlas_item) 1.0.0 requires version 2.11.2+1.20 "
+                        + "or later of antique_atlas, which is missing!").key());
+    }
+
+    @Test
     void otherCommonStartupFailuresAreRecognised() {
         assertEquals("java-too-old", ServerStartDiagnostics.hintFor(
                 "java.lang.UnsupportedClassVersionError: net/minecraft/server/Main has been compiled by a "

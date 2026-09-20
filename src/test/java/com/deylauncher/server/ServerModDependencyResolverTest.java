@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -174,11 +175,168 @@ class ServerModDependencyResolverTest {
     }
 
     /**
+     * The id a mod declares is not always the Modrinth slug of the project it means. Simply Swords
+     * declares {@code simplytooltips} while the project's slug is {@code simply-tooltips}, and a raw id
+     * lookup finds nothing -- which used to leave a whole server unable to start. The curated alias is
+     * what bridges that, and it must keep working.
+     */
+    @Test
+    void aKnownAliasBridgesTheDeclaredIdAndTheModrinthSlug(@TempDir Path serverDir) throws Exception {
+        Path mods = serverDir.resolve("mods");
+        writeModJar(mods, "simplyswords.jar", """
+                {"id":"simplyswords","depends":{"simplytooltips":"*"}}
+                """);
+
+        FakeModrinth modrinth = new FakeModrinth(Map.of(
+                "simply-tooltips", "{\"id\":\"simplytooltips\"}"));
+
+        ServerModDependencyResolver.Result result = new ServerModDependencyResolver(modrinth)
+                .resolveAndInstall(serverDir, "1.20.1", "Fabric", null, null);
+
+        assertEquals(1, result.missingDepsFound());
+        assertEquals(1, result.installed(), "the alias must resolve what the raw id could not");
+        assertTrue(result.warnings().isEmpty(), String.join(", ", result.warnings()));
+        assertTrue(result.setAsideMods().isEmpty(), "a resolved dependency must not cost a mod");
+        assertTrue(Files.isRegularFile(mods.resolve("simply-tooltips.jar")));
+        assertEquals(List.of("simply-tooltips"), modrinth.downloaded);
+    }
+
+    /**
+     * A dependency with no build for this Minecraft version cannot be supplied from anywhere, and Fabric
+     * refuses to boot the whole server over one missing hard dependency. The mod that needs it is moved
+     * into {@code mods-disabled/} (never deleted), with a README, and the reason is reported -- leaving
+     * it in place would mean nothing starts at all.
+     */
+    @Test
+    void aModWhoseDependencyCannotBeSuppliedIsSetAsideNotLeftToCrash(@TempDir Path serverDir)
+            throws Exception {
+        Path mods = serverDir.resolve("mods");
+        writeModJar(mods, "antiqueatlastweaks-1.0.0.jar", """
+                {"id":"antique_atlas_item","depends":{"antique_atlas":">=2.11.2+1.20"}}
+                """);
+        writeModJar(mods, "keepme.jar", "{\"id\":\"keepme\"}");
+
+        ServerModDependencyResolver.Result result = new ServerModDependencyResolver(new FakeModrinth(Map.of()))
+                .resolveAndInstall(serverDir, "1.20.1", "Fabric", null, null);
+
+        assertEquals(1, result.missingDepsFound());
+        assertEquals(0, result.installed());
+        assertEquals(1, result.warnings().size());
+        assertTrue(result.warnings().get(0).contains("antique_atlas"));
+        assertTrue(result.warnings().get(0).contains("no Modrinth project matches this id"),
+                "the warning must say WHY, not just 'could not resolve': " + result.warnings().get(0));
+
+        assertEquals(1, result.setAsideMods().size());
+        assertTrue(result.setAsideMods().get(0).contains("antiqueatlastweaks-1.0.0.jar"));
+        assertFalse(Files.exists(mods.resolve("antiqueatlastweaks-1.0.0.jar")), "moved, not deleted");
+        assertTrue(Files.isRegularFile(serverDir.resolve("mods-disabled/antiqueatlastweaks-1.0.0.jar")));
+        assertTrue(Files.isRegularFile(serverDir.resolve("mods-disabled/README.txt")),
+                "the set-aside folder must explain itself");
+        assertTrue(Files.isRegularFile(mods.resolve("keepme.jar")), "an unrelated mod is untouched");
+    }
+
+    /** "On Modrinth, but nothing for this Minecraft version" is reported as exactly that. */
+    @Test
+    void aProjectWithNoBuildForThisMinecraftVersionSaysSo(@TempDir Path serverDir) throws Exception {
+        Path mods = serverDir.resolve("mods");
+        writeModJar(mods, "aa_tweaks.jar", """
+                {"id":"aa_tweaks","depends":{"moonlight":"*"}}
+                """);
+
+        ServerModDependencyResolver.Result result = new ServerModDependencyResolver(
+                new NoBuildModrinth(Map.of("moonlight", MOONLIGHT)))
+                .resolveAndInstall(serverDir, "1.20.1", "Fabric", null, null);
+
+        assertEquals(1, result.warnings().size());
+        assertTrue(result.warnings().get(0).contains("no build for Minecraft 1.20.1"),
+                result.warnings().get(0));
+    }
+
+    /**
+     * Jar-in-jar: Fabric loads every jar under {@code META-INF/jars/} as a mod of its own, and mods ship
+     * their libraries that way (Cardinal Components' modules, WunderLib inside BCLib). A resolver that
+     * only read the outside of a jar reported those libraries as missing, which is what caused good
+     * mods to be needlessly installed over and even moved aside.
+     */
+    @Test
+    void aLibraryNestedInsideAnotherJarSatisfiesTheDependency(@TempDir Path serverDir) throws Exception {
+        Path mods = serverDir.resolve("mods");
+        writeJarWithNested(mods, "outer.jar", "{\"id\":\"outer\"}",
+                "wunderlib-1.1.5.jar", "{\"id\":\"wunderlib\"}");
+        writeModJar(mods, "needsit.jar", "{\"id\":\"needsit\",\"depends\":{\"wunderlib\":\"*\"}}");
+
+        ServerModDependencyResolver.Result result = new ServerModDependencyResolver(new FakeModrinth(Map.of()))
+                .resolveAndInstall(serverDir, "1.20.1", "Fabric", null, null);
+
+        assertEquals(0, result.missingDepsFound(), "the nested library already provides it");
+        assertEquals(0, result.installed());
+        assertTrue(result.setAsideMods().isEmpty(), "nothing may be set aside for a present dependency");
+        assertFalse(Files.exists(serverDir.resolve("mods-disabled")));
+    }
+
+    /** A nested library's own dependencies are followed too, since Fabric loads it as a mod. */
+    @Test
+    void aNestedLibrarysOwnDependencyIsResolved(@TempDir Path serverDir) throws Exception {
+        Path mods = serverDir.resolve("mods");
+        writeJarWithNested(mods, "outer.jar", "{\"id\":\"outer\"}",
+                "cc-base.jar", "{\"id\":\"cardinal-components-base\",\"depends\":{\"moonlight\":\"*\"}}");
+
+                // moonlight itself declares a "fabric" dependency (Fabric API); the resolver correctly demands
+        // fabric-api for it, so the fake must serve it too (as a leaf mod whose id is fabric).
+        ServerModDependencyResolver.Result result = new ServerModDependencyResolver(
+                new FakeModrinth(Map.of("moonlight", MOONLIGHT,
+                        "fabric-api", "{\"id\":\"fabric\"}")))
+                .resolveAndInstall(serverDir, "1.20.1", "Fabric", null, null);
+
+        assertEquals(1, result.missingDepsFound());
+        assertEquals(2, result.installed(),
+                "moonlight plus the fabric-api its own dependency demands");
+        assertTrue(Files.isRegularFile(mods.resolve("moonlight.jar")));
+        assertTrue(Files.isRegularFile(mods.resolve("fabric-api.jar")));
+        assertTrue(result.warnings().isEmpty(), String.join(", ", result.warnings()));
+    }
+
+    /** A client-only mod never loads on a dedicated server, so Fabric never asks for its dependencies. */
+    @Test
+    void aClientOnlyModsDependenciesAreNotDemanded(@TempDir Path serverDir) throws Exception {
+        Path mods = serverDir.resolve("mods");
+        writeModJar(mods, "enchdesc.jar",
+                "{\"id\":\"enchdesc\",\"environment\":\"client\",\"depends\":{\"clientsidelib\":\"*\"}}");
+
+        ServerModDependencyResolver.Result result = new ServerModDependencyResolver(new FakeModrinth(Map.of()))
+                .resolveAndInstall(serverDir, "1.20.1", "Fabric", null, null);
+
+        assertEquals(0, result.missingDepsFound(), "a disabled client mod's deps are not server deps");
+        assertTrue(result.setAsideMods().isEmpty());
+    }
+
+    /**
+     * The guard that keeps a resolver mistake from wrecking a working modpack: a mod that fails on one
+     * dependency but is the only provider of ids other mods require must be left where it is. Moving it
+     * would turn one unusable mod into a cascade of missing dependencies.
+     */
+    @Test
+    void aModThatProvidesIdsOthersNeedIsNeverSetAside(@TempDir Path serverDir) throws Exception {
+        Path mods = serverDir.resolve("mods");
+        // Provides the library others use, but itself needs something this version has no build for.
+        writeModJar(mods, "sharedlib.jar",
+                "{\"id\":\"sharedlib\",\"depends\":{\"missing_build_lib\":\"*\"}}");
+        writeModJar(mods, "user.jar", "{\"id\":\"user\",\"depends\":{\"sharedlib\":\"*\"}}");
+
+        ServerModDependencyResolver.Result result = new ServerModDependencyResolver(new FakeModrinth(Map.of()))
+                .resolveAndInstall(serverDir, "1.20.1", "Fabric", null, null);
+
+        assertTrue(result.setAsideMods().isEmpty(), "a library other mods depend on must not be moved");
+        assertTrue(Files.isRegularFile(mods.resolve("sharedlib.jar")), "left in place");
+        assertFalse(Files.exists(serverDir.resolve("mods-disabled")), "no empty folder is created");
+    }
+
+    /**
      * A Modrinth client that never touches the network: it knows exactly two projects, answers every
      * version query for the requested Minecraft version, and writes real (tiny) jars carrying the
      * metadata the map supplies -- so transitive resolution is exercised for real.
      */
-    private static final class FakeModrinth extends ModrinthClient {
+    private static class FakeModrinth extends ModrinthClient {
 
         private final Map<String, String> fabricJsonBySlug;
         private final List<String> downloaded = new java.util.ArrayList<>();
@@ -216,12 +374,51 @@ class ServerModDependencyResolverTest {
         }
     }
 
+    /** A client whose project lookups work but which has published nothing for this Minecraft version. */
+    private static final class NoBuildModrinth extends FakeModrinth {
+
+        NoBuildModrinth(Map<String, String> fabricJsonBySlug) {
+            super(fabricJsonBySlug);
+        }
+
+        @Override
+        public List<ProjectVersion> compatibleVersionsLenient(String slug, String mcVersion) {
+            return List.of();
+        }
+    }
+
     /** Writes a real jar (zip) whose only entry is the given {@code fabric.mod.json}. */
     private static void writeModJar(Path dir, String fileName, String fabricJson) throws Exception {
         Files.createDirectories(dir);
         try (var zip = new java.util.zip.ZipOutputStream(Files.newOutputStream(dir.resolve(fileName)))) {
             zip.putNextEntry(new java.util.zip.ZipEntry("fabric.mod.json"));
             zip.write(fabricJson.getBytes(StandardCharsets.UTF_8));
+            zip.closeEntry();
+        }
+    }
+
+    /**
+     * Writes a jar that declares {@code topJson} outside and nests a second mod (with
+     * {@code nestedJson}) under {@code META-INF/jars/} -- how mods ship their libraries.
+     */
+    private static void writeJarWithNested(Path dir, String fileName, String topJson,
+                                          String nestedFileName, String nestedJson) throws Exception {
+        Files.createDirectories(dir);
+        byte[] nested;
+        try (var bos = new java.io.ByteArrayOutputStream();
+             var zip = new java.util.zip.ZipOutputStream(bos)) {
+            zip.putNextEntry(new java.util.zip.ZipEntry("fabric.mod.json"));
+            zip.write(nestedJson.getBytes(StandardCharsets.UTF_8));
+            zip.closeEntry();
+            zip.finish();
+            nested = bos.toByteArray();
+        }
+        try (var zip = new java.util.zip.ZipOutputStream(Files.newOutputStream(dir.resolve(fileName)))) {
+            zip.putNextEntry(new java.util.zip.ZipEntry("fabric.mod.json"));
+            zip.write(topJson.getBytes(StandardCharsets.UTF_8));
+            zip.closeEntry();
+            zip.putNextEntry(new java.util.zip.ZipEntry("META-INF/jars/" + nestedFileName));
+            zip.write(nested);
             zip.closeEntry();
         }
     }

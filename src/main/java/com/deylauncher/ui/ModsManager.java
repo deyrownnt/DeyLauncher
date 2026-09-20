@@ -16,12 +16,20 @@ import java.util.List;
  */
 public class ModsManager {
 
+    private final Path instanceDir;
     private final Path modsDir;
     private final Path disabledDir;
 
     public ModsManager(Path instanceDir) {
+        this.instanceDir = instanceDir;
         this.modsDir = instanceDir.resolve("mods");
         this.disabledDir = instanceDir.resolve("mods-disabled");
+    }
+
+    /** The instance folder this manager was opened on -- the Mods window keeps acting on THIS folder
+     * even if the launcher's version/loader selection changes while the window is still open. */
+    public Path instanceDir() {
+        return instanceDir;
     }
 
     /** The enabled-mods folder itself, e.g. for external installers (SodiumInstaller) that

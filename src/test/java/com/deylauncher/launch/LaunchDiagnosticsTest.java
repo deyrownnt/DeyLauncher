@@ -163,4 +163,85 @@ class LaunchDiagnosticsTest {
         assertTrue(windows.contains("NVIDIA GeForce Driver") || windows.contains("GPU driver"),
                 "Windows advice should point to a driver update");
     }
+
+    /**
+     * The crash that started this. Minecraft's own window came up fine ("Game entered main loop!" is
+     * printed by the game itself) and the process then died in a mod's Swing splash window, because the
+     * game's process had no DISPLAY for Java's toolkit to use: Java's AWT has no Wayland backend, and on
+     * Linux the JDK reads a missing DISPLAY as "this process is headless" (that check is Unix-only, which
+     * is why the identical modpack ran on Windows). None of the graphics markers this class used to look
+     * for appear anywhere in this tail, so it produced no diagnosis at all.
+     */
+    @Test
+    void recognizesAwtNoDisplayCrash_fromEarlyLoadingBar() {
+        List<String> tail = List.of(
+                "Loading 173 mods:",
+                "Game entered main loop!",
+                "Exception in thread \"main\" java.awt.HeadlessException:",
+                "No X11 DISPLAY variable was set, but this program performed an operation which requires it.",
+                "\tat java.desktop/java.awt.GraphicsEnvironment.checkHeadless(GraphicsEnvironment.java:170)",
+                "\tat java.desktop/java.awt.Window.<init>(Window.java:545)",
+                "\tat com.iafenvoy.elb.gui.PreLaunchWindow.<clinit>(PreLaunchWindow.java:15)",
+                "Game exited with code 1"
+        );
+
+        String linux = LaunchDiagnostics.analyze(tail, 1, "Linux");
+        assertNotNull(linux, "a Java mod's headless window failure must be recognized, not silently ignored");
+        assertTrue(linux.contains("HeadlessException"), "the diagnosis should quote the failure back");
+        assertTrue(linux.contains("XWayland") || linux.contains("X11"),
+                "the Linux remedy (an X server / XWayland) must be named");
+        assertTrue(linux.contains("earlyloadingbar"), "the cosmetic mod whose window this is should be named");
+        assertFalse(linux.contains("LIBGL_ALWAYS_SOFTWARE"),
+                "software rendering cannot give AWT a display, so it must not be offered here");
+        assertFalse(linux.contains("NATIVE"),
+                "the game's own window was fine -- this must not be framed as a native/GPU crash");
+    }
+
+    /**
+     * The second shape this failure takes, and the one the launcher's own fix can leave behind on a
+     * machine with no XWayland at all: headless mode explicitly OFF (so no {@code HeadlessException}) and
+     * the toolkit then failing to reach an X server. Same remedy, so it must be recognized too.
+     */
+    @Test
+    void recognizesTheNoXServerShape_whenHeadlessModeIsAlreadyOff() {
+        List<String> tail = List.of(
+                "Game entered main loop!",
+                "Exception in thread \"main\" java.awt.AWTError: Can't connect to X11 window server using ':0' "
+                        + "as the value of the DISPLAY variable.",
+                "\tat java.desktop/sun.awt.X11GraphicsEnvironment.initDisplay(Native Method)",
+                "\tat com.iafenvoy.elb.gui.PreLaunchWindow.<clinit>(PreLaunchWindow.java:15)",
+                "Game exited with code 1"
+        );
+        assertNotNull(LaunchDiagnostics.analyze(tail, 1, "Linux"));
+        assertTrue(LaunchDiagnostics.isAwtNoDisplayFailure(tail));
+    }
+
+    /** The Windows wording must not send anyone chasing Linux-only remedies. */
+    @Test
+    void windowsAdviceForAnAwtFailureStaysPlatformHonest() {
+        List<String> tail = List.of("java.awt.HeadlessException", "Game exited with code 1");
+        String windows = LaunchDiagnostics.analyze(tail, 1, "Windows 11");
+        assertNotNull(windows);
+        assertFalse(windows.contains("XWayland"), "Windows advice must not suggest the Linux XWayland fix");
+        assertFalse(windows.contains("earlyloadingbar"), "and it must not tell a Windows user to delete a mod");
+        assertTrue(windows.contains("-Djava.awt.headless"), "it should point at the flag that caused it");
+    }
+
+    /**
+     * The recognizer is deliberately narrow: it is a *mod's Swing window* failure, so ordinary exits and
+     * the graphics failures this class already handles must not be swallowed by it (they need their own,
+     * different advice).
+     */
+    @Test
+    void onlyAwtNoDisplayOutputMatchesTheAwtRecognizer() {
+        assertTrue(LaunchDiagnostics.isAwtNoDisplayFailure(
+                List.of("java.awt.HeadlessException", "No X11 DISPLAY variable was set")));
+        assertFalse(LaunchDiagnostics.isAwtNoDisplayFailure(
+                List.of("Setting user: Deyronn", "Loading world...", "Game exited with code 0")));
+        assertFalse(LaunchDiagnostics.isAwtNoDisplayFailure(
+                List.of("GLX: Failed to create context: GLXBadFBConfig")));
+        assertFalse(LaunchDiagnostics.isAwtNoDisplayFailure(List.of("# C  [libglfw.so+0x2257b]")));
+        assertFalse(LaunchDiagnostics.isAwtNoDisplayFailure(null));
+        assertFalse(LaunchDiagnostics.isAwtNoDisplayFailure(List.of()));
+    }
 }
