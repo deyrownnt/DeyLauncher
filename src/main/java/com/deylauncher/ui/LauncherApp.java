@@ -269,8 +269,8 @@ public class LauncherApp extends Application {
         if (deyCapesService != null) {
             Task<Void> seedTask = new Task<>() {
                 @Override protected Void call() throws Exception {
-                    try { deyCapesService.ensureCatalog().hashCode(); } catch (Exception ignored) {}
-                    try { deyCapesService.seedTextures(); } catch (Exception ignored) {}
+                    try { deyCapesService.ensureCatalog().hashCode(); } catch (Exception e) { System.err.println("[DeyCapes] seed catalog failed: " + e.getMessage()); }
+                    try { deyCapesService.seedTextures(); } catch (Exception e) { System.err.println("[DeyCapes] seed textures failed: " + e.getMessage()); }
                     return null;
                 }
             };
@@ -9614,8 +9614,9 @@ public class LauncherApp extends Application {
                     if (!owned.contains(c.id())) continue;
                     Image img = null;
                     try {
-                        img = new Image(deyCapesService.readCapeTexture(c.texturePath()));
-                    } catch (Exception ignored) {
+                        img = new Image(deyCapesService.readCapeTextureWithFallback(c.id(), c.texturePath()));
+                    } catch (Exception ex) {
+                        System.err.println("[DeyCapes] Could not load cape " + c.id() + ": " + ex.getMessage());
                     }
                     rows.add(new DeyCapeRow("dey:" + c.id(), c.name(), capeFrontImage(img)));
                 }

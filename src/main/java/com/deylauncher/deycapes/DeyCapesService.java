@@ -162,6 +162,34 @@ public class DeyCapesService {
     }
 
     /**
+     * Reads a cape texture, preferring the live GitHub copy and falling back to the PNG
+     * bundled inside the launcher jar when GitHub is unreachable, the token lacks the right
+     * scope, or the file simply has not been seeded into the repo yet. The bundled PNGs are
+     * exactly what {@link #seedTextures()} uploads, so the fallback renders the same default
+     * art instead of a blank cape. Failures are always logged -- never silently swallowed --
+     * and the original GitHub error is rethrown only when there is no bundled fallback to
+     * offer (e.g. a custom cape that does not ship in this jar).
+     */
+    public java.io.InputStream readCapeTextureWithFallback(String capeId, String texturePath) throws Exception {
+        try {
+            return readCapeTexture(texturePath);
+        } catch (Exception ex) {
+            String basename = texturePath.substring(texturePath.lastIndexOf('/') + 1);
+            String resource = "/deycapes-textures/" + basename;
+            try (var in = DeyCapesService.class.getResourceAsStream(resource)) {
+                if (in != null) {
+                    System.err.println("[DeyCapes] GitHub cape texture " + texturePath + " unavailable ("
+                            + ex.getMessage() + "); fell back to bundled " + resource);
+                    return new java.io.ByteArrayInputStream(in.readAllBytes());
+                }
+            }
+            System.err.println("[DeyCapes] GitHub cape texture " + texturePath + " unavailable ("
+                    + ex.getMessage() + "); no bundled fallback for cape " + capeId);
+            throw ex;
+        }
+    }
+
+    /**
      * Ensures the repo's capes/ folder contains every bundled cape texture. Reads
      * the PNGs shipped inside this launcher jar (see resources/deycapes-textures/)
      * and uploads any that are missing from the repo, so a fresh repo is seeded by
