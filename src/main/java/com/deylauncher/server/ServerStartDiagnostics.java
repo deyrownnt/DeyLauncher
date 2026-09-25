@@ -35,7 +35,17 @@ public final class ServerStartDiagnostics {
                             + "\"Back up world & start fresh\", then start the server again -- the old "
                             + "world is kept in this folder as a backup.");
         }
-        if (containsAny(line, "incompatible mod set", "incompatible mods", "requires minecraft",
+        if (containsAny(line, "immediate reason: [hard_dep", "hard_dep_no_candidate", "no_candidate",
+                "which is missing")) {
+            return new Hint("missing-mod-dependency",
+                    "A mod is installed but a library it requires is not, and Fabric refuses to start "
+                            + "the whole server over one missing hard dependency. DeyLauncher installs "
+                            + "those automatically whenever it can find them for this Minecraft version; "
+                            + "when it cannot, it moves the mod that needs it into this server's "
+                            + "mods-disabled/ folder. Start the server again -- see the [DeyLauncher] "
+                            + "lines above for exactly which mod and which dependency were involved.");
+        }
+        if (containsAny(line, "incompatible mod set", "requires minecraft",
                 "requires forge", "requires neoforge", "mixin apply failed", "mixin transformation failed")) {
             return new Hint("mods-version",
                     "A mod in the mods/ folder was built for a different Minecraft version, so the "

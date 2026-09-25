@@ -20,10 +20,11 @@ import java.util.zip.ZipFile;
  *
  * <p>Two entry points, one engine:
  * <ul>
- *   <li>{@link #installForClient} -- into {@code ~/.deylauncher/instances/<mc>-<loader>}, i.e. the same
- *       instance folder Play uses, so the pack is immediately launchable. Also writes the instance's
- *       {@code modpack.json} (including the full file manifest, so a later launch can RESTORE anything
- *       that goes missing) and its {@code icon.png}.</li>
+ *   <li>{@link #installForClient} -- into the instance folder the caller chose (the launcher asks
+ *       {@link ModpackMeta#installDirFor}, which gives each pack its OWN folder under
+ *       {@code ~/.deylauncher/instances/} so packs never share a {@code mods/} directory). Also writes the
+ *       instance's {@code modpack.json} (including the full file manifest, so a later launch can RESTORE
+ *       anything that goes missing) and its {@code icon.png}.</li>
  *   <li>{@link #installForServer} -- into an owned server's folder, taking only the files a server can
  *       actually use (its {@code mods/} or {@code plugins/} folder, plus {@code config/}).</li>
  * </ul>

@@ -1,75 +1,46 @@
-# Setting up Friends (GitHub backend)
+# DeyLauncher GitHub backend (Friends, capes, option kits)
 
-Friends needs one shared, private GitHub repo that every DeyLauncher
-install talks to. This is a one-time setup, done by whoever runs the
-"backend" for your DeyLauncher group (probably you). Nobody pastes a
-token into chat with me -- you do all of this yourself, then just tell
-the launcher (or the build) where to find it.
+DeyLauncher uses GitHub for the shared friends roster, the Dey capes, and the shared option-kit sets. That used to mean a one-time manual `Setup GitHub properties` step for every machine. It no longer does: a freshly downloaded DeyLauncher has the shared backend wired up for everyone, online and offline accounts alike. Open the Friends tab and it just works.
 
-## 1. Create a dedicated bot GitHub account
+## How it works
 
-Not your personal account. A brand new, free GitHub account that owns
-nothing except what we're about to create. If it's ever compromised,
-nothing of yours is at risk.
+On startup, `GitHubConfig.load()` resolves the backend credentials in priority order:
 
-## 2. Create one private repo
+1. The current user can override on a single machine with a local file at `~/.deylauncher/github.properties`. This is only for pointing a build at a different repo, or for the person operating the shared backend.
+2. If there is no local override, the launcher uses the backend embedded in the jar itself. The build XOR+Base64 obfuscates the credentials (key `DeyLauncher-backend-v1`) into the resource `/deylauncher-backend.dat`. That is a speed bump against casually reading the token out of the jar, not real encryption. The real containment is that the token is a fine-grained credential scoped to a single repo with Contents read and write and nothing else.
+3. If neither is present, features that need GitHub report `not set up` and degrade gracefully.
 
-Name it whatever you like, e.g. `deylauncher-data`. Keep it **Private**.
-That's it for now -- DeyLauncher creates `friends.json` inside it
-automatically on first use.
+Because of step 2, every distributed DeyLauncher build ships with working Friends, capes, and option kits out of the box -- no key, no file, and no setup dialog on the user side.
 
-## 3. Generate a fine-grained Personal Access Token
+## The shared backend token
 
-On the bot account: **Settings > Developer settings > Personal access
-tokens > Fine-grained tokens > Generate new token**.
+The embedded token belongs to the public DeyLauncher bot account `onpishi` / `DeyLauncher-Friends`. It is the same fine-grained PAT the project already keeps in its GitHub secrets and uses to publish releases, so it is safe to embed (Contents read and write to that one repo, no other scope). The token is never logged and never copied into a Minecraft instance.
 
-- **Repository access**: "Only select repositories" -> pick the one repo
-  you just made. Not "All repositories."
-- **Permissions**: under "Repository permissions," set **Contents** to
-  **Read and write**. Leave everything else at "No access."
-- Set an expiration (90 days is reasonable -- you'll need to regenerate
-  and update it when it expires).
-- Generate it, and copy the token now -- GitHub only shows it once.
+## Running your own backend (optional, for group organizers)
 
-## 4. Configure DeyLauncher locally
+If your group wants its own private friends repo instead of the shared public one:
 
-### Local setup only
+1. Create a fine-grained PAT on the bot account: `Settings` > `Developer settings` > `Personal access tokens` > `Fine-grained tokens` > `Generate new token`. Repository access: only your private repo. Permissions: Contents -> Read and write. No other permission. Set a reasonable expiration.
+2. Add that token to the deyrownnt/DeyLauncher repo as the secret named `DEYLAUNCHER_GITHUB_PROPS`. The value may be just the token itself, or a full `key=value` properties block (`token`, `owner`, `repo`, `friendsPath`, and so on).
+3. CI reads that secret at build time and bakes it into `deylauncher-backend.dat` via the `embedGithubCredentials` Gradle task. The token never lives in the repository: it comes only from the GitHub secret at build time.
 
-Create this file on your own machine:
-
-```
-~/.deylauncher/github.properties
-```
+A single user can also point just their own install at a different backend by writing `~/.deylauncher/github.properties`:
 
 ```properties
-token=github_pat_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-owner=your-bot-account-username
-repo=deylauncher-data
+token=github_pat_...
+owner=your-bot-account
+repo=your-private-repo
 friendsPath=friends.json
 ```
 
-Save it. Restart DeyLauncher (or just open Friends) and it picks this up
-automatically.
+Restart DeyLauncher (or open Friends) and it picks the local override up automatically.
 
-Never put this file in the project, source control, a CI build secret that is copied into an artifact, or
-a distributed launcher. DeyLauncher intentionally reads it only from the current user's home directory and
-never copies it into a Minecraft instance. Each person who needs write access must use their own least-
-privileged, repo-scoped credential; a public launcher needs a server-side service or per-user OAuth instead.
+## What this protects
 
-## 5. What this protects
-
-Microsoft’s OAuth client ID is intentionally public: it identifies the desktop app and is required by
-Microsoft’s device-code flow. It is not an account credential. Microsoft refresh tokens, Minecraft access
-tokens, and GitHub tokens are private credentials; they must never be committed or shipped in a jar/app image.
+The Microsoft OAuth client ID is intentionally public: it identifies the desktop app and is required by the Microsoft device-code flow. It is not an account credential. The GitHub token is a private credential and must never be committed or hard-coded in source -- its containment is the fine-grained, repo-scoped permission and the build-time embedding from a CI secret, never a value checked into the repository.
 
 ## What DeyLauncher actually does with this
 
-- One `GET` to read the whole friends graph (friend lists, pending
-  requests, presence/status, shared server addresses).
-- One `PUT` to write changes, with automatic retry if two people save
-  at the same moment (GitHub rejects the second write with a conflict;
-  DeyLauncher re-fetches, reapplies the change, and retries).
-- No polling loop, no heartbeat spam -- presence publishes only on app
-  start, on invisible-mode toggle, and when the Friends page opens.
-  This matters because every install currently shares this one token's
-  rate limit (5,000 requests/hour).
+- One `GET` to read the whole friends graph (friend lists, pending requests, presence/status, shared server addresses).
+- One `PUT` to write changes, with automatic retry if two people save at the same moment (GitHub rejects the second write with a conflict; DeyLauncher re-fetches, reapplies the change, and retries).
+- No polling loop, no heartbeat spam. Presence publishes only on app start, on invisible-mode toggle, and when the Friends page opens, so a single shared token stays well under GitHub rate limits.

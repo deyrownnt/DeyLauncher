@@ -22,7 +22,19 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Check whether the shared Friends backend is configured
+        env:
+          DEYLAUNCHER_GITHUB_PROPS: ${{ secrets.DEYLAUNCHER_GITHUB_PROPS }}
+        run: |
+          if [ -z "$DEYLAUNCHER_GITHUB_PROPS" ]; then
+            echo "::warning title=No shared Friends backend::Repository secret DEYLAUNCHER_GITHUB_PROPS is not set, so Friends/capes/option-kits will show 'not set up' in this build."
+          else
+            echo "Shared Friends backend: configured (the value is never printed)."
+          fi
+
       - name: Build
+        env:
+          DEYLAUNCHER_GITHUB_PROPS: ${{ secrets.DEYLAUNCHER_GITHUB_PROPS }}
         run: ./gradlew clean prepareJpackage
 
       - name: Create Linux app-image
@@ -49,6 +61,7 @@ jobs:
             --name DeyLauncher \
             --icon src/main/resources/app-icon.png \
             --dest dist \
+            --java-options "-Djava.awt.headless=false" \
             --java-options "--enable-native-access=javafx.graphics,ALL-UNNAMED"
 
       - name: Create Linux archive
@@ -77,7 +90,20 @@ jobs:
           distribution: temurin
           java-version: '17'
 
+      - name: Check whether the shared Friends backend is configured
+        shell: pwsh
+        env:
+          DEYLAUNCHER_GITHUB_PROPS: ${{ secrets.DEYLAUNCHER_GITHUB_PROPS }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:DEYLAUNCHER_GITHUB_PROPS)) {
+            Write-Warning 'Repository secret DEYLAUNCHER_GITHUB_PROPS is not set, so Friends/capes/option-kits will show ''not set up'' in this build.'
+          } else {
+            Write-Host 'Shared Friends backend: configured (the value is never printed).'
+          }
+
       - name: Build
+        env:
+          DEYLAUNCHER_GITHUB_PROPS: ${{ secrets.DEYLAUNCHER_GITHUB_PROPS }}
         run: .\gradlew.bat clean prepareJpackage
 
       - name: Create Windows app-image

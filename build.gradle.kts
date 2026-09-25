@@ -1,5 +1,6 @@
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.Base64
 
 plugins {
     id("java")
@@ -12,7 +13,7 @@ group = "com.deylauncher"
 // Single source of truth for the app version. It is baked into the jar/resource that
 // AppUpdater.currentVersion() reads at runtime, so the self-updater always knows exactly
 // which version is installed -- and CI's jpackage step discovers this same fat jar by name.
-version = "0.1.8"
+version = "0.1.10"
 
 repositories {
     mavenCentral()
@@ -114,6 +115,72 @@ tasks.processResources {
     }
     from(versionFile)
 
+}
+
+// ---------------------------------------------------------------------------------------------
+// Shared GitHub backend credentials (Friends / capes / option kits / friend-visible servers).
+// ---------------------------------------------------------------------------------------------
+// Baked into the app so a freshly downloaded launcher has all of those working with NO key and NO
+// file from the user. Source priority:
+//
+//   1. the CI secret, exposed as the environment variable DEYLAUNCHER_GITHUB_PROPS
+//      (GitHub -> Settings -> Secrets and variables -> Actions). This is why no token is ever
+//      committed to the repository.
+//   2. secrets/embedded-github.properties on the developer's own machine (git-ignored).
+//
+// The value is XOR+Base64'd before it is written, so it is not a plain "github_pat_..." string
+// sitting inside the shipped jar. That is OBFUSCATION, NOT SECURITY: any desktop app can be
+// unpacked and reversed by whoever holds it. What actually contains the damage is that this is a
+// fine-grained token scoped to ONE repo (onpishi/DeyLauncher-Friends, Contents read/write) with a
+// short expiry -- see GITHUB_SETUP.md. Never widen that scope, and rotate it if it leaks.
+val embeddedBackendFile = layout.buildDirectory.file("generated-backend/deylauncher-backend.dat")
+val embeddedBackendKey = "DeyLauncher-backend-v1"
+
+/** XOR with the fixed key, then Base64. Must stay byte-for-byte compatible with GitHubConfig.deobfuscate. */
+fun packEmbeddedBackend(propsText: String): String {
+    val key = embeddedBackendKey.toByteArray(Charsets.UTF_8)
+    val raw = propsText.toByteArray(Charsets.UTF_8)
+    val out = ByteArray(raw.size)
+    for (i in raw.indices) out[i] = (raw[i].toInt() xor key[i % key.size].toInt()).toByte()
+    return Base64.getEncoder().encodeToString(out)
+}
+
+val embedGithubCredentials = tasks.register("embedGithubCredentials") {
+    val outFile = embeddedBackendFile.get().asFile
+    outputs.file(outFile)
+    // Always regenerate: the value may come from a secret, and registering a secret as a task input
+    // would leak it into build logs / build scans / the up-to-date checksum.
+    outputs.upToDateWhen { false }
+
+    doLast {
+        val fromEnv = System.getenv("DEYLAUNCHER_GITHUB_PROPS")
+        val secretFile = file("secrets/embedded-github.properties")
+        val raw = when {
+            !fromEnv.isNullOrBlank() -> fromEnv
+            secretFile.isFile -> secretFile.readText()
+            else -> null
+        }
+        if (raw.isNullOrBlank()) {
+            outFile.delete()
+            logger.lifecycle("DeyLauncher: no shared GitHub backend configured for this build -- " +
+                    "Friends will show 'not set up'. Set the DEYLAUNCHER_GITHUB_PROPS secret " +
+                    "(CI) or create secrets/embedded-github.properties (local).")
+            return@doLast
+        }
+        // A bare token is accepted too, so the secret only has to hold the PAT itself.
+        val propsText = if (raw.contains('=')) raw.trim() + "\n" else
+            "token=${raw.trim()}\nowner=onpishi\nrepo=DeyLauncher-Friends\nfriendsPath=friends.json\n"
+        outFile.parentFile.mkdirs()
+        outFile.writeText(packEmbeddedBackend(propsText))
+        logger.lifecycle("DeyLauncher: embedded the shared GitHub backend into this build " +
+                "(the value itself is never printed).")
+    }
+}
+
+tasks.processResources {
+    dependsOn(embedGithubCredentials)
+    // Lands at the classpath root, which is where GitHubConfig looks for it.
+    from(embeddedBackendFile) { rename { "deylauncher-backend.dat" } }
 }
 
 tasks.register("printClasspath") {

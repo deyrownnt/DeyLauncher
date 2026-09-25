@@ -17,20 +17,30 @@ public class AddedServersStore {
         public String name;
         public String address;
         public long lastJoinedAt = 0;
+        /** Optional Modrinth modpack URL/slug this server plays with. Null/blank for a server with no
+         *  associated pack. When set, joining checks whether that pack is already installed and, if
+         *  not, offers to install it automatically before playing. */
+        public String modpackUrl;
 
         public AddedServer() {}
 
         public static AddedServer create(String name, String address) {
+            return create(name, address, null);
+        }
+
+        public static AddedServer create(String name, String address, String modpackUrl) {
             AddedServer s = new AddedServer();
             s.id = UUID.randomUUID().toString();
             s.name = name;
             s.address = address;
+            s.modpackUrl = (modpackUrl == null || modpackUrl.isBlank()) ? null : modpackUrl.trim();
             return s;
         }
 
         public String id() { return id; }
         public String name() { return name; }
         public String address() { return address; }
+        public String modpackUrl() { return modpackUrl; }
     }
 
     private final Path file;
@@ -53,8 +63,21 @@ public class AddedServersStore {
     }
 
     public void add(String name, String address) {
+        add(name, address, null);
+    }
+
+    public void add(String name, String address, String modpackUrl) {
         var current = list();
-        current.add(AddedServer.create(name, address));
+        current.add(AddedServer.create(name, address, modpackUrl));
+        save(current);
+    }
+
+    /** Attaches/clears the modpack this bookmarked server plays with. Blank clears it. */
+    public void setModpackUrl(String id, String modpackUrl) {
+        var current = list();
+        for (var s : current) {
+            if (s.id().equals(id)) s.modpackUrl = (modpackUrl == null || modpackUrl.isBlank()) ? null : modpackUrl.trim();
+        }
         save(current);
     }
 

@@ -99,6 +99,46 @@ public class GameLauncher {
                 pb.environment(), version.nativesDir(), version.versionJson()) && log != null) {
             log.accept("Wayland session detected: requesting GLFW's native Wayland backend.");
         }
+        // The other half of the same Wayland story: Java's AWT/Swing cannot draw on Wayland at all, and
+        // on Linux a missing DISPLAY is read by the JDK as "this process is headless" -- which is what
+        // turned an AWT mod's startup window (EarlyLoadingBar's PreLaunchWindow) into a HeadlessException
+        // on Wayland sessions that don't export DISPLAY. buildCommand already pinned the headless flag for
+        // this launch (see awtHeadlessMode); this hands the child an X display to actually connect to,
+        // plus that display's XAUTHORITY when the session doesn't export one (both are needed: a DISPLAY
+        // without the cookie is refused with "Authorization required"). Only the child is touched, and only
+        // gaps are filled in -- an existing DISPLAY/XAUTHORITY is never overwritten. GLFW is not affected:
+        // if "Run natively on Wayland" is on, GLFW_PLATFORM=wayland takes precedence over DISPLAY, and if
+        // it is off, DISPLAY makes the game go through XWayland exactly as it does on any machine whose
+        // session does export DISPLAY.
+        X11Display.Prepared x = X11Display.prepareForChild(System.getProperty("os.name", ""), pb.environment());
+        // And the one thing that could silently defeat ALL of the above: the JVM applies _JAVA_OPTIONS
+        // after the command line, so a -Djava.awt.headless=true in it wins over the flag we just pinned
+        // (measured). Only that one setting is stripped, only for the child, and nothing else in the
+        // variable is touched.
+        String forcedHeadless = JvmEnvOptions.dropAwtHeadlessOverrides(pb.environment());
+        if (log != null) {
+            boolean noXDisplay = "true".equals(awtHeadlessMode(System.getProperty("os.name", ""),
+                    X11Display.resolvableDisplay()));
+            if (x != null && x.display() != null) {
+                log.accept("This session exports no DISPLAY: pointing the game at the X server on "
+                        + x.display() + " so its Java/Swing mods (Early Loading Bar) can open their window.");
+            }
+            if (x != null && x.xAuthority() != null) {
+                log.accept("Passing that X server's XAUTHORITY (" + x.xAuthority()
+                        + ") to the game so its Java/Swing mods can connect.");
+            }
+            if (forcedHeadless != null) {
+                log.accept("Your environment asks for headless Java (" + forcedHeadless
+                        + "), which the JVM applies after the command line and would beat this launch's "
+                        + "-Djava.awt.headless setting: that one setting was removed for the game process "
+                        + "so its Swing mods can open a window.");
+            }
+            if (noXDisplay) {
+                log.accept("No X display is reachable for this launch: a Java/Swing mod that opens its own "
+                        + "window (Early Loading Bar's pre-launch bar) cannot be given one, and the crash "
+                        + "note explains the way out (XWayland/X11 session, or removing that cosmetic mod).");
+            }
+        }
         return pb.start();
     }
 
@@ -136,25 +176,25 @@ public class GameLauncher {
         JsonObject args = version.versionJson().has("arguments")
                 ? version.versionJson().getAsJsonObject("arguments") : null;
 
-        // Headless mode: lets AWT/Swing-based mods fail cleanly instead of trying to open a window
-        // when there is genuinely no display server (CI, a real headless box). It must be added
-        // before the version JSON's JVM args so it takes effect early.
-        //
-        // This flag is deliberately set ONLY when no display exists. Earlier versions also forced it
-        // on every Linux launch (and later on every Fabric/Quilt launch) as a "safety net" -- but
-        // forcing it on a normal desktop session is exactly what made mods that pop an AWT/Swing
-        // window during startup die with HeadlessException, e.g. EarlyLoadingBar's PreLaunchWindow
-        // (java.awt.GraphicsEnvironment#checkHeadless throws as soon as java.awt.headless=true).
-        // Minecraft's own window is GLFW/LWJGL, so no mod loader needs this flag to start.
-        if (isHeadlessEnvironment()) {
-            command.add("-Djava.awt.headless=true");
-        }
-
         if (args != null && args.has("jvm")) {
             addResolvedArgs(command, args.getAsJsonArray("jvm"), placeholders, features);
         } else {
             command.add("-cp");
             command.add(placeholders.get("classpath"));
+        }
+
+        // Headless mode, pinned explicitly on Linux (see awtHeadlessMode below). Deliberately added as the
+        // LAST JVM option, right before the main class: a -D repeated later wins, and the version JSON's
+        // own JVM arguments are the only other place a -Djava.awt.headless could come from. Leaving this
+        // flag unset is NOT "the safe default" either: on Linux the JDK's own rule is "headless unless
+        // DISPLAY is set", so a Wayland session that exports no DISPLAY silently gave a Swing mod's startup
+        // window (EarlyLoadingBar's PreLaunchWindow) a HeadlessException even though Minecraft's own GLFW
+        // window was fine. Windows/macOS get no flag at all, exactly as before. (The environment can also
+        // try to force this property -- _JAVA_OPTIONS is applied after the command line; see
+        // JvmEnvOptions, which strips that for the child.)
+        String awtHeadless = awtHeadlessMode(System.getProperty("os.name", ""), X11Display.resolvableDisplay());
+        if (awtHeadless != null) {
+            command.add("-Djava.awt.headless=" + awtHeadless);
         }
 
         command.add(version.mainClass());
@@ -240,44 +280,30 @@ public class GameLauncher {
     }
 
     /**
-     * Detects if we're running in a headless environment (no display server). Only then is
-     * {@code -Djava.awt.headless=true} handed to the game, so an AWT/Swing mod that opens a window
-     * during startup (EarlyLoadingBar) still works on a normal desktop session.
-     */
-    private static boolean isHeadlessEnvironment() {
-        return isHeadless(System.getProperty("os.name", ""), System.getenv("DISPLAY"),
-                System.getenv("WAYLAND_DISPLAY"), System.getenv("XDG_SESSION_TYPE"));
-    }
-
-    /**
-     * Testable core of {@link #isHeadlessEnvironment()}: the OS name and the three display-related
-     * environment values are supplied instead of read from the JVM.
+     * The exact {@code -Djava.awt.headless} value the game's JVM should be started with, or {@code null}
+     * when we say nothing at all.
      *
-     * <p>Only Linux is ever reported as headless: on Windows/macOS the launcher has no display probe,
-     * and forcing the flag there would break the same Swing mods it is meant to protect.
+     * <p>Only Linux is ever told anything: Windows and macOS already default to non-headless and the
+     * launcher has no display probe for them, so adding a flag there could only break the very Swing mods
+     * ({@code EarlyLoadingBar}) this is about.
+     *
+     * <p>On Linux the value is <b>always</b> pinned, never left to the JDK, because the JDK's own rule is
+     * "headless unless {@code DISPLAY} is set" -- a Unix-only check, which is why the same modpack was
+     * fine on Windows and died on Wayland. {@code false} whenever AWT has an X display it can use: the
+     * launcher's own {@code DISPLAY}, or the XWayland socket {@link X11Display} found for the child
+     * (see {@link #launch} -- both are folded into the {@code xDisplay} argument). {@code true} only when
+     * there is genuinely no X display, which keeps a real headless box (CI, a server, a tty) failing
+     * cleanly instead of trying to reach an X server that isn't there.
+     *
+     * <p>{@code WAYLAND_DISPLAY} deliberately does NOT count as a display here: Java's AWT has no Wayland
+     * backend, so for Swing mods a Wayland-only session is exactly as display-less as a tty is -- the
+     * game's own GLFW window is a different story and is unaffected either way (see {@link WaylandSupport}).
      */
-    static boolean isHeadless(String osName, String display, String waylandDisplay, String sessionType) {
-        String os = osName == null ? "" : osName.toLowerCase();
-        if (!os.contains("linux")) return false;
-
-        // No display at all = headless.
-        if (isBlank(display) && isBlank(waylandDisplay)
-                && (sessionType == null || sessionType.equals("tty"))) {
-            return true;
-        }
-
-        // DISPLAY set but not a usable X display (some CI containers set a bare host name).
-        if (!isBlank(display) && !display.startsWith(":") && !display.contains(":")) {
-            return true;
-        }
-
-        return false;
+    static String awtHeadlessMode(String osName, String xDisplay) {
+        String os = osName == null ? "" : osName.toLowerCase(Locale.ROOT);
+        if (!os.contains("linux")) return null;
+        return X11Display.hasUsableDisplay(xDisplay) ? "false" : "true";
     }
-
-    private static boolean isBlank(String s) {
-        return s == null || s.isBlank();
-    }
-
 
     /**
      * The full ${...} substitution table for one launch. Package-private so a test can assert that

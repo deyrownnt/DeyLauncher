@@ -77,6 +77,20 @@ public final class LaunchDiagnostics {
     private static final String WAYLAND_DISPLAY_MISSING_FOR_X11 = "the display environment variable is missing";
 
     /**
+     * What a Java mod's AWT/Swing failure leaves in the game's output when the process has no display it
+     * can draw in: {@code java.awt.HeadlessException} (the JDK's own answer on Linux whenever
+     * {@code DISPLAY} is unset -- the check is Unix-only, which is why the same modpack is fine on
+     * Windows), plus the {@code AWTError} the toolkit throws instead when headless mode is explicitly
+     * off but there is still no X server to connect to. That second shape is what this launcher's own
+     * fix leaves behind on a machine with no XWayland at all, so both must be recognized.
+     */
+    private static final String[] AWT_NO_DISPLAY_MARKERS = {
+            "headlessexception",
+            "can't connect to x11 window server",
+            "no x11 display variable was set",
+    };
+
+    /**
      * True when the captured output shows this specific, well-understood Wayland-native failure: a
      * feature-unavailable GLFW error about input focus. Distinct from every other window/GL failure this
      * class recognizes because the fix for it is the OPPOSITE of the general Linux graphics advice --
@@ -111,6 +125,20 @@ public final class LaunchDiagnostics {
      */
     public static boolean isNativeWaylandBackfire(List<String> tail) {
         return isWaylandFocusUnsupported(tail) || isWaylandDisplayMissingForX11(tail);
+    }
+
+    /**
+     * True when a Java mod's AWT/Swing window could not be created because the game's process had no
+     * display to draw in. This is deliberately its own family of failure: the game's own window never
+     * needs X11 (GLFW talks to the compositor directly, see {@link WaylandSupport}), so this says nothing
+     * about the GPU, the driver or the mods as a whole -- only about a mod that opens a real Java window
+     * before the game starts (Early Loading Bar's pre-launch bar is the one that does). Its output also
+     * contains none of the GLX/OpenGL/GLFW/native-crash markers the other branches look for, which is why
+     * it used to end with no diagnosis at all.
+     */
+    public static boolean isAwtNoDisplayFailure(List<String> tail) {
+        if (tail == null || tail.isEmpty()) return false;
+        return containsAny(String.join("\n", tail).toLowerCase(Locale.ROOT), AWT_NO_DISPLAY_MARKERS);
     }
 
     /**
@@ -170,6 +198,19 @@ public final class LaunchDiagnostics {
 
         String joined = String.join("\n", tail).toLowerCase(Locale.ROOT);
 
+        String lower = osName == null ? "" : osName.toLowerCase(Locale.ROOT);
+        boolean windows = lower.contains("win");
+        boolean mac = lower.contains("mac") || lower.contains("darwin");
+
+        // A Java mod's own AWT/Swing window, checked FIRST and before the graphics-marker gate below:
+        // its output contains none of those markers (no GLX/OpenGL/GLFW/native-crash text), so it used to
+        // fall straight through and leave the user with nothing but an exit code. It is also a different
+        // failure than everything else here -- the game's own window was fine -- so it must not inherit
+        // the "update your GPU driver / try the software renderer" advice.
+        if (isAwtNoDisplayFailure(tail)) {
+            return awtNoDisplayAdvice(windows, mac);
+        }
+
         boolean glx = containsAny(joined, "glxbadfbconfig", "glx: failed to create context");
         boolean opengl = containsAny(joined, "does not support opengl", "failed to create backend opengl", "backendcreationexception");
         boolean windowFail = containsAny(joined, "failed to create window", "glfw error", "failed to initialize glfw");
@@ -209,10 +250,6 @@ public final class LaunchDiagnostics {
                     + "\"Run natively on Wayland\" for this instance (DeyLauncher's automatic retry now does "
                     + "this for you the next time you press Play).";
         }
-
-        String lower = osName == null ? "" : osName.toLowerCase(Locale.ROOT);
-        boolean windows = lower.contains("win");
-        boolean mac = lower.contains("mac") || lower.contains("darwin");
 
         String layer = nativeLayer(tail, joined);
         boolean graphicsLayer = layer != null || containsAny(joined,
@@ -258,6 +295,51 @@ public final class LaunchDiagnostics {
               .append(" (next to Minecraft's own crash reports). DeyLauncher redacts your account token ")
               .append("from it and restricts it to your user account, so it is safe to keep -- but treat ")
               .append("it as private if you share it.");
+        }
+        return sb.toString();
+    }
+
+    /**
+     * The explanation for a Java-mod AWT/Swing window failure (see {@link #isAwtNoDisplayFailure}).
+     * Deliberately its own wording rather than the graphics advice further down: nothing here is about
+     * the GPU or the driver, and on Linux the thing that actually needs changing is not a DeyLauncher
+     * switch at all -- it is whether the session gives AWT an X server (XWayland, or an Xorg login).
+     * Where it cannot, the one remaining lever is the mod that wants the window, which is cosmetic only.
+     */
+    private static String awtNoDisplayAdvice(boolean windows, boolean mac) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("The game started, but a Java mod that opens its own window during startup -- an ")
+          .append("AWT/Swing window, Early Loading Bar's pre-launch progress bar being the usual one -- ")
+          .append("could not be drawn, because the game's process had no display Java's toolkit can use ")
+          .append("(\"java.awt.HeadlessException\"). Minecraft's own window is not affected: it is created ")
+          .append("by GLFW/LWJGL, which talks to the display server directly, so the GPU, the driver and ")
+          .append("the mod loader are not involved -- and software rendering cannot change this either.\n");
+        if (windows) {
+            sb.append("On Windows this only happens when -Djava.awt.headless=true was set for the game ")
+              .append("(DeyLauncher does not set it there): remove it from this version's own JVM ")
+              .append("arguments if you added it.");
+        } else if (mac) {
+            sb.append("On macOS this only happens when -Djava.awt.headless=true was set for the game: ")
+              .append("remove it from this version's own JVM arguments if you added it.");
+        } else {
+            sb.append("On Linux Java's AWT has no Wayland backend at all: Swing can only draw through ")
+              .append("X11, and the JDK treats a missing DISPLAY as \"this process is headless\". ")
+              .append("DeyLauncher now passes -Djava.awt.headless=false as the last JVM option, points the ")
+              .append("game at a live X/XWayland socket when it finds one, and hands over that server's ")
+              .append("XAUTHORITY when the session doesn't export one (the launch log says so when it does), ")
+              .append("so seeing this again means no X server was reachable at launch time.\n")
+              .append("One more thing can force headless mode from outside: the JVM reads _JAVA_OPTIONS / ")
+              .append("JAVA_TOOL_OPTIONS / JDK_JAVA_OPTIONS for extra options, and _JAVA_OPTIONS is applied ")
+              .append("AFTER the command line, so a -Djava.awt.headless=true there beats any launcher ")
+              .append("setting. DeyLauncher strips that one setting from the game's own environment, but ")
+              .append("removing it from your shell/session is worth doing if you (or a \"Java on ")
+              .append("Wayland\" guide) put it there -- it affects every Java program you start.\n")
+              .append("That is fixed outside the launcher: turn XWayland on for your Wayland session ")
+              .append("(KDE Plasma: System Settings > Display & Monitor > Compositor; on GNOME it is on ")
+              .append("already), or log in to an X11/Xorg session.\n")
+              .append("If neither is possible, the mod that wants this window is purely cosmetic -- remove ")
+              .append("\"earlyloadingbar\" (Early Loading Bar) from this instance's mods folder. The game ")
+              .append("then starts normally and only the pre-launch progress bar is missing.");
         }
         return sb.toString();
     }

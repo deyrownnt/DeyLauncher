@@ -11,7 +11,7 @@ import java.util.List;
 
 /**
  * The record of "which modpack is installed into this client instance", written to
- * {@code ~/.deylauncher/instances/<version>-<loader>/modpack.json} after a successful install.
+ * {@code ~/.deylauncher/instances/<folder>/modpack.json} after a successful install.
  *
  * It exists for two reasons:
  * <ol>
@@ -20,6 +20,14 @@ import java.util.List;
  *       made for (an {@code .mrpack} pins e.g. {@code fabric-loader 0.15.11}) instead of blindly
  *       grabbing the newest one -- which is what "fully compatible with the modpack" actually needs.</li>
  * </ol>
+ *
+ * <p><b>Storage vs. selection.</b> Each pack lives in its OWN folder under {@code instances/} so two
+ * packs never share a {@code mods/} directory ({@link #installDirFor}); that folder's name is the
+ * pack's identity on disk ({@link #instanceId}). That is purely a question of WHERE FILES ARE. It says
+ * nothing about which Minecraft version or loader the user has selected in the launcher -- the
+ * {@code mcVersion}/{@code loader} recorded here are the pack's compatibility information (what it
+ * was installed for), never a lock on the launcher's selectors. See {@link ModpackSelection}.</p>
+ *
  * Follows the same plain-Gson file shape as {@code ServerStore}'s server.json.
  */
 public class ModpackMeta {
@@ -34,6 +42,15 @@ public class ModpackMeta {
     public String source;        // the pack file/folder this instance was built from
     public String note;
     public long installedAt;
+
+    /**
+     * The name of this pack's folder under {@code instances/} -- its identity on disk. Deliberately
+     * NOT stored in modpack.json (it is {@code transient}): it is simply the folder the record was read
+     * from or written to, so it can never disagree with where the files really are, and a record written
+     * by an older build (including one that still carries a {@code profileId} key, which is ignored)
+     * needs no migration. Null only for a record that hasn't been placed in a folder yet.
+     */
+    public transient String instanceId;
 
     /**
      * Every file this pack owns on disk (its downloads and its bundled overrides), with the URL/hash/
@@ -67,6 +84,151 @@ public class ModpackMeta {
         }
         String suffix = (loader == null || loader.equalsIgnoreCase("Vanilla")) ? "" : "-" + loader.toLowerCase();
         return launcherRoot.resolve("instances").resolve(mcVersion + suffix);
+    }
+
+    /**
+     * The folder THIS pack's files live in: {@code instances/<instanceId>}. A record that was never
+     * placed in a folder (built in code, not yet written) falls back to the plain
+     * {@code instances/<mc>-<loader>} path, which is where packs installed by older builds used to live --
+     * for those the folder name IS that path, so both cases resolve identically. (The launcher moves
+     * such packs into folders of their own at startup: {@link #separateLegacyPacks}.)
+     */
+    public Path instanceDir(Path launcherRoot) {
+        if (instanceId != null && !instanceId.isBlank()) {
+            return launcherRoot.resolve("instances").resolve(instanceId);
+        }
+        return instanceDirFor(launcherRoot, mcVersion, loader);
+    }
+
+    /**
+     * True when this pack was installed for exactly this Minecraft version + loader (case-insensitive;
+     * a missing loader means "Vanilla", like everywhere else). This is compatibility information: it
+     * answers "would this pack's mods run under that selection?", nothing more.
+     */
+    public boolean targets(String mcVersion, String loader) {
+        return mcVersion != null && this.mcVersion != null && this.mcVersion.equalsIgnoreCase(mcVersion)
+                && loaderOrVanilla(this.loader).equalsIgnoreCase(loaderOrVanilla(loader));
+    }
+
+    private static String loaderOrVanilla(String loader) {
+        return loader == null || loader.isBlank() ? "Vanilla" : loader;
+    }
+
+    /**
+     * Where a pack that is about to be installed should live.
+     *
+     * <ul>
+     *   <li>The SAME pack for the same version + loader that is already installed keeps its folder, so
+     *       reinstalling or updating it replaces its own stale files in place (see
+     *       {@code ModpackInstaller}) and keeps the player's config and options, instead of piling up a
+     *       duplicate every time.</li>
+     *   <li>Any other pack gets a new folder named after it that nothing else uses, so two packs -- even
+     *       for the same Minecraft version and loader -- never share a {@code mods/} directory.</li>
+     * </ul>
+     * Pure lookup: nothing is created here.
+     */
+    public static Path installDirFor(Path launcherRoot, String packName, String mcVersion, String loader) {
+        String wanted = packName == null ? "" : packName.trim();
+        for (ModpackMeta installed : listInstalled(launcherRoot)) {
+            if (installed.name.trim().equalsIgnoreCase(wanted) && installed.targets(mcVersion, loader)) {
+                return installed.instanceDir(launcherRoot);
+            }
+        }
+        return freshFolder(launcherRoot.resolve("instances"), packName);
+    }
+
+    /** A folder under {@code instances} named after the pack that nothing else uses yet (pure lookup). */
+    private static Path freshFolder(Path instances, String packName) {
+        String base = folderSlug(packName);
+        String candidate = base;
+        for (int n = 2; Files.exists(instances.resolve(candidate)); n++) {
+            candidate = base + "-" + n;
+        }
+        return instances.resolve(candidate);
+    }
+
+    /**
+     * Gives every pack that an older build installed INTO the plain {@code instances/<mc>-<loader>} folder
+     * a folder of its own, so that folder goes back to being the ordinary Vanilla / DEY instance for that
+     * Minecraft version and loader.
+     *
+     * <p>Why: before packs got their own folders, installing a pack for 1.20.1 + Fabric put its mods
+     * into {@code instances/1.20.1-fabric} -- the very folder the plain 1.20.1 Fabric profile (and the
+     * DEY 1.20.1 profile, which adds its own mods on top) launches. Selecting plain 1.20.1 therefore
+     * loaded the pack's mods. Moving the whole folder (mods, config, options, the pack record) under
+     * the pack's own name ends that: the pack keeps a modlist that is only ever its own, and
+     * plain 1.20.1 starts from an empty folder. Nothing is deleted or rewritten -- it is one rename per
+     * pack, and the pack record needs no edit because a pack's folder is its identity
+     * ({@link #instanceId}). Worlds are unaffected: {@code saves/} is a link into the shared pool.</p>
+     *
+     * <p>Idempotent and best-effort: a pack that already has its own folder is skipped, and a folder that
+     * can't be renamed right now (something has it open) is left exactly where it is and tried again on
+     * the next start.</p>
+     *
+     * @return one human-readable line per pack moved or that could not be moved; empty when there was
+     *         nothing to do
+     */
+    public static List<String> separateLegacyPacks(Path launcherRoot) {
+        List<String> notes = new ArrayList<>();
+        Path instances = launcherRoot.resolve("instances");
+        if (!Files.isDirectory(instances)) return notes;
+        List<Path> dirs = new ArrayList<>();
+        try (var stream = Files.list(instances)) {
+            stream.filter(Files::isDirectory).forEach(dirs::add);
+        } catch (IOException e) {
+            return notes;
+        }
+        dirs.sort(null); // stable order, so two same-named packs always get the same folder names
+        for (Path dir : dirs) {
+            ModpackMeta meta = read(dir);
+            if (meta == null || meta.name == null || meta.name.isBlank() || !meta.knowsTarget()) continue;
+            Path plain = instanceDirFor(launcherRoot, meta.mcVersion, meta.loader);
+            if (!dir.getFileName().toString().equalsIgnoreCase(plain.getFileName().toString())) continue;
+            Path own = freshFolder(instances, meta.name);
+            try {
+                Files.move(dir, own);
+                notes.add("Modpack \"" + meta.name + "\" now has its own folder (" + own.getFileName()
+                        + "); " + dir.getFileName() + " is a plain " + meta.mcVersion + " instance again.");
+            } catch (IOException | RuntimeException e) {
+                notes.add("Couldn't give modpack \"" + meta.name + "\" its own folder yet (" + e.getMessage()
+                        + ") -- it still shares " + dir.getFileName() + " and will be moved on the next start.");
+            }
+        }
+        return notes;
+    }
+
+    /** A filesystem-safe folder name for a pack name (never empty, never a path, never a reserved device name). */
+    static String folderSlug(String name) {
+        String slug = (name == null || name.isBlank()) ? "modpack" : name;
+        slug = slug.replaceAll("[^A-Za-z0-9._-]", "-").replaceAll("-{2,}", "-");
+        slug = slug.replaceAll("^[-.]+|[-.]+$", "");
+        if (slug.length() > 60) slug = slug.substring(0, 60).replaceAll("[-.]+$", "");
+        if (slug.isEmpty()) return "modpack";
+        if (slug.matches("(?i)(con|prn|aux|nul|com[0-9]|lpt[0-9])(\\..*)?")) return "pack-" + slug;
+        return slug;
+    }
+
+    /**
+     * The pack's icon on disk, or null when it has none: the cached copy {@link #iconPath} points at, or
+     * -- when that cache was cleared or moved -- the {@code icon.png} the installer copied into the
+     * pack's own folder ({@link PackIcons#copyIntoInstance}). Never throws on an odd stored path; a
+     * missing icon is cosmetic.
+     */
+    public Path iconFile(Path launcherRoot) {
+        try {
+            if (iconPath != null && !iconPath.isBlank()) {
+                Path cached = Path.of(iconPath);
+                if (Files.isRegularFile(cached)) return cached;
+            }
+        } catch (RuntimeException invalidPath) {
+            // fall through to the copy inside the instance
+        }
+        try {
+            Path inInstance = instanceDir(launcherRoot).resolve("icon.png");
+            return Files.isRegularFile(inInstance) ? inInstance : null;
+        } catch (RuntimeException noFolder) {
+            return null;
+        }
     }
 
     /** True when this record knows enough to locate its own instance folder (see {@link #instanceDirFor}). */
@@ -110,6 +272,7 @@ public class ModpackMeta {
     }
 
     public void write(Path instanceDir) {
+        this.instanceId = folderName(instanceDir);
         try {
             Files.createDirectories(instanceDir);
             Files.writeString(fileFor(instanceDir), GSON.toJson(this));
@@ -138,10 +301,17 @@ public class ModpackMeta {
         Path meta = fileFor(instanceDir);
         if (!Files.exists(meta)) return null;
         try {
-            return GSON.fromJson(Files.readString(meta), ModpackMeta.class);
+            ModpackMeta read = GSON.fromJson(Files.readString(meta), ModpackMeta.class);
+            if (read != null) read.instanceId = folderName(instanceDir);
+            return read;
         } catch (Exception e) {
             return null;
         }
+    }
+
+    private static String folderName(Path instanceDir) {
+        Path name = instanceDir.getFileName();
+        return name == null ? null : name.toString();
     }
 
     /** Every instance that has a modpack.json, newest install first. */
@@ -161,15 +331,17 @@ public class ModpackMeta {
     }
 
     /**
-     * The loader version a pack pinned for this version+loader, or null when the instance has no
-     * pack (or the pack didn't pin one) -- in which case the caller keeps its normal
+     * The loader build this pack pinned, or null when it pinned none or the pin doesn't apply to this
+     * launch (a different loader or Minecraft version) -- in which case the caller keeps its normal
      * "newest stable build" behaviour.
+     *
+     * <p>An instance method on purpose: the record to ask is the one living in the folder that is about
+     * to launch (see {@link ModpackSelection#resolve}), never one found by searching every folder for a
+     * matching version + loader.</p>
      */
-    public static String pinnedLoaderVersion(Path launcherRoot, String mcVersion, String loader) {
-        if (mcVersion == null || mcVersion.isBlank() || loader == null) return null;
-        ModpackMeta meta = read(instanceDirFor(launcherRoot, mcVersion, loader));
-        if (meta == null || meta.loaderVersion == null || meta.loaderVersion.isBlank()) return null;
-        if (meta.loader == null || !meta.loader.equalsIgnoreCase(loader)) return null;
-        return meta.loaderVersion;
+    public String pinnedLoaderVersion(String mcVersion, String loader) {
+        if (loaderVersion == null || loaderVersion.isBlank()) return null;
+        if (loader == null || !targets(mcVersion, loader)) return null;
+        return loaderVersion;
     }
 }

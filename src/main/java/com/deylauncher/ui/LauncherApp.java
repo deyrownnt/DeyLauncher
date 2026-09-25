@@ -15,6 +15,7 @@ import com.deylauncher.launch.LaunchDiagnostics;
 import com.deylauncher.launch.ServerAddressMatch;
 import com.deylauncher.launch.ServerSessionTracker;
 import com.deylauncher.launch.WaylandSupport;
+import com.deylauncher.modloader.AwtHelperInstaller;
 import com.deylauncher.modloader.FabricInstaller;
 import com.deylauncher.modloader.FabricApiInstaller;
 import com.deylauncher.modloader.ForgeInstaller;
@@ -90,6 +91,20 @@ public class LauncherApp extends Application {
     private ComboBox<String> modLoaderBox;
     private Button modsBtn;
     private Button modpackBtn;   // icon button beside the DEY/VANILLA switch -- the modpack menu
+    // Which installed modpack PROFILE (if any) is selected, and the ONE mapping from "what is selected" to
+    // "which instance folder runs". A pack profile shows its own fixed version + loader (selectors locked,
+    // derived in refreshModpackUi and nowhere else); Vanilla/DEY profiles use the selectors freely.
+    private final ModpackSelection modpackSelection = new ModpackSelection();
+    /** What the startup pass that gives legacy packs their own folder did (logged once the UI exists). */
+    private java.util.List<String> packSeparationNotes = java.util.List.of();
+    private Label modLoaderLabel, versionLabel; // "LOADER"/"VERSION" captions; say so when a modpack fixes them
+    private ScrollPane tileScroll;      // scrolls the tile list so many modpacks never push the window layout off-screen
+    private VBox modpackTileBox;      // sidebar section: one profile tile per installed modpack
+    private StackPane playCard;       // the details card; wraps the content so a pack's artwork can sit behind its right side
+    private VBox playContent;         // the card's content column (heading, selectors, Mods, Play)
+    private ImageView packBackdrop;   // optional faded artwork behind the card's right side (pack profiles only)
+    private String packBackdropKey = "";
+    private static final String MODPACK_BUTTON_TIP = "Modpacks -- add one, or drag & drop a .mrpack / .zip";
     private Button playButton;
     private WaveLaunchBar launchProgress;
     private Scene scene;
@@ -106,6 +121,11 @@ public class LauncherApp extends Application {
     private FriendNotesStore friendNotes; // per-friend personal notes, saved only on this PC
     private ServerStore serverStore;
     private AddedServersStore addedServersStore;
+    /** address -> the Minecraft version string the last successful status ping reported for it. Used
+     *  as the default version when joining that server (added server or a friend's), so joining
+     *  launches with the SERVER's own version rather than whatever happens to be selected in the
+     *  launcher right now; see {@link #resolveJoinVersion} / {@link #joinAddedOrFriendServer}. */
+    private final java.util.Map<String, String> pingedServerVersion = new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.Map<String, ServerProcessManager> runningServers = new java.util.HashMap<>(); // serverId -> process manager, for whatever's live this session
     private final java.util.Map<String, PlayitTunnel> serverTunnels = new java.util.HashMap<>(); // serverId -> playit agent for Internet sharing this session
 
@@ -235,6 +255,9 @@ public class LauncherApp extends Application {
         this.friendNotes = new FriendNotesStore(gameFiles.root);
         this.serverStore = new ServerStore(gameFiles.root);
         this.addedServersStore = new AddedServersStore(gameFiles.root);
+        // Before anything lists packs or resolves an instance folder: a pack an older build put into the
+        // plain <mc>-<loader> folder gets its own folder, so plain Vanilla/DEY never shows its mods.
+        this.packSeparationNotes = ModpackMeta.separateLegacyPacks(gameFiles.root);
         GitHubConfig githubConfig = GitHubConfig.load();
         this.friendsService = githubConfig.isConfigured() ? new FriendsService(githubConfig) : null;
         this.deyCapesService = githubConfig.isConfigured() ? new DeyCapesService(githubConfig) : null;
@@ -294,12 +317,20 @@ public class LauncherApp extends Application {
         // The top bar (brand, nav, account/settings, and the - [] x controls) must always stay fully
         // visible at any allowed window size -- so the minimum width accounts for the FULL rendered
         // top bar, including the update button the moment it becomes available (see topBarMinWidth).
-        stage.setMinWidth(Math.max(860, topBarMinWidth()));
+        // This is an initial estimate; recomputeTopBarMinWidth() is called again below after show()
+        // so the floor reflects the real CSS-applied sizes (see comment at show()).
+        recomputeTopBarMinWidth();
         stage.setMinHeight(560);
         stage.centerOnScreen();
         enableWindowChrome(stage, windowStack, topBar); // drag by the top bar, resize from any edge
         stage.setOnCloseRequest(e -> doCleanExit());
         stage.show();
+        // CSS isn't applied until the first layout pulse after show(), so the estimate above used
+        // default styles and may have underestimated. Measure again once the real styles are in so
+        // the minimum can't let the top bar get clipped -- and this keeps being re-applied whenever
+        // the top bar later changes (update button, account name, UI scale). Double runLater so the
+        // first pulse has had a chance to lay out the nodes before we read prefWidth.
+        Platform.runLater(() -> Platform.runLater(this::recomputeTopBarMinWidth));
         if (prefs.launcherStartFullscreen) stage.setFullScreen(true);
 
         loadVersionsAsync();
@@ -311,6 +342,7 @@ public class LauncherApp extends Application {
         // file, so it must not depend on the friends service being available (startPresenceTasks
         // returns early without one), and it has to run before anything can publish presence.
         clearLegacyAutoSavedAddress();
+        for (String note : packSeparationNotes) log(note);
         publishPresenceQuietly();
         startPresenceTasks();
         checkForUpdatesAsync();
@@ -658,6 +690,31 @@ public class LauncherApp extends Application {
         return needed;
     }
 
+    /** Recomputes the window's minimum width from the top bar's actual rendered size — called
+     *  whenever the top bar can change (update button appears, account name changes, UI scale
+     *  changes) so the minimum can't let the bar get clipped at any permitted window size. */
+    private void recomputeTopBarMinWidth() {
+        double needed = topBarMinWidth();
+        if (needed > 0) stage.setMinWidth(Math.max(860, needed));
+    }
+
+    /** Advances a drag pointer anchor by the window's ACTUAL on-screen movement, discarding
+     *  any delta the compositor rejected (e.g. clamping the window at a screen edge). This is
+     *  the rebasing step that keeps a custom-window drag synchronized with the real Stage
+     *  position instead of accumulating a one-way desync.
+     *
+     *  <p>Extracted as a pure function so the no-jump guarantee is unit-tested without a Stage.
+     *  Equivalent to <code>anchor + (newActual - prevActual)</code>.
+     *
+     *  @param anchor     the pointer anchor the window is being dragged relative to (screen coords)
+     *  @param prevActual the window's position at the start of the previous drag event (post-clamp)
+     *  @param newActual  the window's position at the start of the current event (post-clamp)
+     *  @return the rebased anchor
+     */
+    static double rebaseAnchor(double anchor, double prevActual, double newActual) {
+        return anchor + (newActual - prevActual);
+    }
+
     // ---- Window controls (- [] x) for the borderless main window ----
     private HBox buildWindowControls() {
         Button min = new Button();
@@ -763,6 +820,7 @@ public class LauncherApp extends Application {
             updateBtn.setTooltip(new Tooltip("Update DeyLauncher to " + info.tag()));
             updateBtn.setManaged(true);
             updateBtn.setVisible(true);
+            recomputeTopBarMinWidth(); // update button is now live -- the min width must cover it
             FadeTransition in = new FadeTransition(Duration.millis(320), updateBtn);
             in.setFromValue(0); in.setToValue(1);
             ScaleTransition pop = new ScaleTransition(Duration.millis(320), updateBtn);
@@ -1244,9 +1302,12 @@ public class LauncherApp extends Application {
                     Button joinBtn = new Button();
                     setButtonIcon(joinBtn, IconFactory.Icon.PLAY, "Join");
                     joinBtn.getStyleClass().add("pill-button");
-                    joinBtn.setOnAction(e -> {
-                        selectNavTab(navHomeBtn);
-                        onPlay(address);
+                    joinBtn.setOnAction(e -> joinAddedOrFriendServer(address, null, null));
+                    joinBtn.setOnMousePressed(ev -> {
+                        if (ev.getButton() == javafx.scene.input.MouseButton.SECONDARY) {
+                            ev.consume();
+                            showJoinVersionPicker(joinBtn, address, null);
+                        }
                     });
                     row.getChildren().add(joinBtn);
                 }
@@ -1922,17 +1983,253 @@ public class LauncherApp extends Application {
         });
     }
 
-    /** A "Join Server" button that pulses a green glow while the profile is open. */
+    /** A "Join Server" button that pulses a green glow while the profile is open. Left-click joins with
+     *  the server's own default version; right-click opens a picker to join with a different one. */
     private Button glowingJoinButton(String address) {
         Button b = new Button("Join Server");
         b.getStyleClass().add("pill-button");
         setButtonIcon(b, IconFactory.Icon.PLAY, "Join");
         ensureJoinGlow(b);
-        b.setOnAction(e -> {
-            selectNavTab(navHomeBtn);
-            onPlay(address);
+        b.setOnAction(e -> joinAddedOrFriendServer(address, null, null));
+        b.setOnMousePressed(ev -> {
+            if (ev.getButton() == javafx.scene.input.MouseButton.SECONDARY) {
+                ev.consume();
+                showJoinVersionPicker(b, address, null);
+            }
         });
         return b;
+    }
+
+    /**
+     * Best default version to join {@code address} with: {@code override} when the right-click version
+     * picker was used, else whatever the last status ping reported (a raw SLP string like "Paper
+     * 1.20.1" is cleaned up to the version id it actually names), else null -- meaning "leave the
+     * launcher's currently selected version alone" (nothing has ever pinged this address yet).
+     */
+    private String resolveJoinVersion(String address, String override) {
+        if (override != null && !override.isBlank()) return override;
+        String pinged = pingedServerVersion.get(address);
+        if (pinged == null || pinged.isBlank()) return null;
+        if (findVersionEntry(pinged) != null) return pinged;
+        for (VersionManifest.VersionEntry v : allVersions) {
+            if (pinged.contains(v.id())) return v.id();
+        }
+        return null;
+    }
+
+    /** Points the version selector at {@code versionId}, adding it to the dropdown first if the full
+     *  manifest hasn't loaded it yet. No-op for a blank/null id. */
+    private void applyJoinVersion(String versionId) {
+        if (versionId == null || versionId.isBlank()) return;
+        if (!versionBox.getItems().contains(versionId)) versionBox.getItems().add(versionId);
+        versionBox.setValue(versionId);
+    }
+
+    /**
+     * Joins a bookmarked or friend-hosted server at {@code address}. Defaults to that server's own
+     * pinged Minecraft version (right-click a Join button to override with {@code versionOverride}
+     * instead), and -- when the bookmark carries a {@code modpackUrl} -- makes sure that modpack is
+     * installed and selected first, offering to auto-install it (with a themed progress dialog) the
+     * first time it's missing.
+     *
+     * <p>With no modpack attached, DEY is always tried first (it's the launcher's own curated Fabric
+     * build -- Sodium/Iris/Fabric API on top of a plain Fabric client -- and connects to a vanilla or
+     * Purpur server exactly like a plain Fabric client would, since DEY never touches the network
+     * protocol). Vanilla is only the fallback for a version DEY has no build for (see
+     * {@link #deyAvailableFor}) -- never the default.
+     */
+    private void joinAddedOrFriendServer(String address, String modpackUrl, String versionOverride) {
+        if (identityStore.getActive() == null) {
+            log("Set up an account first (Account button) before joining a server.");
+            return;
+        }
+        String versionId = resolveJoinVersion(address, versionOverride);
+        applyJoinVersion(versionId);
+
+        if (modpackUrl == null || modpackUrl.isBlank()) {
+            boolean useDey = deyAvailableFor(versionId);
+            setMode(useDey);
+            modLoaderBox.setValue(useDey ? "Fabric" : "Vanilla");
+            selectNavTab(navHomeBtn);
+            onPlay(address);
+            return;
+        }
+        ensureServerModpackThenJoin(address, modpackUrl, versionId);
+    }
+
+    /** Whether DEY has a build for {@code versionId} -- true for anything one of {@link #DEY_PRESETS}
+     *  covers (1.16 and up release builds; see DEY_PRESETS) or when the version isn't known yet
+     *  (nothing has pinged this server so far -- DEY is the right default until proven otherwise).
+     *  False only for an older or snapshot version DEY genuinely has no build for, which is the one
+     *  case {@link #joinAddedOrFriendServer} falls back to Vanilla for. */
+    private boolean deyAvailableFor(String versionId) {
+        if (versionId == null || versionId.isBlank()) return true;
+        for (VersionPreset preset : DEY_PRESETS) {
+            if (presetCouldMatch(preset, versionId)) return true;
+        }
+        return false;
+    }
+
+    /** Resolves the server's modpack (a Modrinth link/slug) in the background, then hands off to
+     *  {@link #onServerModpackResolved} on the FX thread. Any failure to resolve it just logs and
+     *  joins without the pack, rather than blocking the player from playing at all. */
+    private void ensureServerModpackThenJoin(String address, String modpackUrl, String versionId) {
+        log("This server plays with a modpack -- checking \"" + modpackUrl + "\"...");
+        Task<Path> fetchTask = new Task<>() {
+            @Override protected Path call() throws Exception { return downloadModrinthPack(modpackUrl); }
+        };
+        fetchTask.setOnFailed(e -> {
+            Throwable ex = fetchTask.getException();
+            log("Couldn't resolve this server's modpack (" + modpackUrl + "): "
+                    + (ex == null ? "unknown error" : ex.getMessage()) + " -- joining without it.");
+            Platform.runLater(() -> { selectNavTab(navHomeBtn); onPlay(address); });
+        });
+        fetchTask.setOnSucceeded(e -> {
+            Path packPath = fetchTask.getValue();
+            Task<ModpackInfo> readTask = new Task<>() {
+                @Override protected ModpackInfo call() throws Exception {
+                    ModpackInfo info = ModpackReader.read(packPath);
+                    Path icon = PackIcons.resolve(info, gameFiles.root);
+                    return icon == null ? info : info.withIcon(icon);
+                }
+            };
+            readTask.setOnFailed(ev -> {
+                Throwable ex = readTask.getException();
+                log("Couldn't read this server's modpack: " + (ex == null ? "unknown error" : ex.getMessage())
+                        + " -- joining without it.");
+                Platform.runLater(() -> { selectNavTab(navHomeBtn); onPlay(address); });
+            });
+            readTask.setOnSucceeded(ev -> Platform.runLater(() ->
+                    onServerModpackResolved(readTask.getValue(), address, versionId)));
+            new Thread(readTask, "server-modpack-read").start();
+        });
+        new Thread(fetchTask, "server-modpack-fetch").start();
+    }
+
+    /** Once the server's modpack is known: reuse it if it's already installed, otherwise ask before
+     *  installing it (the player might not want a big download to start without warning). */
+    private void onServerModpackResolved(ModpackInfo info, String address, String versionId) {
+        String mc = (versionId != null && !versionId.isBlank()) ? versionId : resolveModpackVersion(info);
+        String loader = resolveModpackLoader(info);
+        for (ModpackMeta installed : ModpackMeta.listInstalled(gameFiles.root)) {
+            if (installed.name.trim().equalsIgnoreCase(info.name().trim()) && installed.targets(mc, loader)) {
+                selectModpack(installed);
+                log("\"" + info.name() + "\" is already installed -- joining " + address + " with it.");
+                selectNavTab(navHomeBtn);
+                onPlay(address);
+                return;
+            }
+        }
+        Alert confirm = new Alert(Alert.AlertType.CONFIRMATION,
+                "This server plays with the modpack \"" + info.name() + "\", which isn't installed yet. "
+                        + "Install it now and join?", ButtonType.YES, ButtonType.NO);
+        confirm.setHeaderText("Install \"" + info.name() + "\"?");
+        confirm.showAndWait().ifPresent(bt -> {
+            if (bt == ButtonType.YES) {
+                installServerModpackThenJoin(info, mc, loader, address);
+            } else {
+                selectNavTab(navHomeBtn);
+                onPlay(address);
+            }
+        });
+    }
+
+    /** Installs {@code info} behind a small themed progress dialog (same wave-orange styling as the
+     *  Install Modpack window), then selects the freshly-installed pack and launches straight into
+     *  {@code address} once it's done. Any install failure still joins -- without the pack -- rather
+     *  than leaving the player stuck. */
+    private void installServerModpackThenJoin(ModpackInfo info, String mc, String loader, String address) {
+        if (mc == null || mc.isBlank()) {
+            log("Couldn't tell which Minecraft version \"" + info.name() + "\" needs -- joining without it.");
+            selectNavTab(navHomeBtn);
+            onPlay(address);
+            return;
+        }
+        Path instanceDir = ModpackMeta.installDirFor(gameFiles.root, info.name(), mc, loader);
+
+        Label titleLabel = new Label("Installing \"" + info.name() + "\"");
+        titleLabel.getStyleClass().add("mod-name");
+        Label status = new Label("Preparing...");
+        status.getStyleClass().add("notice-label");
+        status.setWrapText(true);
+        ProgressBar bar = new ProgressBar(0);
+        bar.setMaxWidth(Double.MAX_VALUE);
+        bar.getStyleClass().add("play-progress");
+        VBox content = new VBox(14, titleLabel, status, bar);
+        content.setPadding(new Insets(24));
+        content.getStyleClass().add("mods-dialog-content");
+        Stage win = buildBorderlessStage("Installing Modpack", content, stage, Modality.NONE, 420, 160, 460, 180);
+        win.centerOnScreen();
+        win.show();
+        win.toFront();
+
+        Task<ModpackInstaller.Result> task = new Task<>() {
+            @Override protected ModpackInstaller.Result call() throws Exception {
+                return new ModpackInstaller().installForClient(info, mc, loader, instanceDir,
+                        f -> Platform.runLater(() -> bar.setProgress(f)),
+                        msg -> Platform.runLater(() -> status.setText(msg)));
+            }
+        };
+        task.setOnSucceeded(e -> Platform.runLater(() -> {
+            win.close();
+            ModpackInstaller.Result result = task.getValue();
+            rebuildModpackTiles();
+            ModpackMeta installedPack = ModpackMeta.read(instanceDir);
+            if (installedPack != null) selectModpack(installedPack);
+            log("Modpack \"" + info.name() + "\" installed for this server -- " + result.summary());
+            selectNavTab(navHomeBtn);
+            onPlay(address);
+        }));
+        task.setOnFailed(e -> Platform.runLater(() -> {
+            win.close();
+            Throwable ex = task.getException();
+            log("Couldn't install \"" + info.name() + "\": " + (ex == null ? "unknown error" : ex.getMessage())
+                    + " -- joining without it.");
+            selectNavTab(navHomeBtn);
+            onPlay(address);
+        }));
+        new Thread(task, "server-modpack-install").start();
+    }
+
+    /** Small themed popup (right-click a Join button) listing recent release versions so the player can
+     *  override which one to join {@code address} with, instead of the server's own pinged default. */
+    private void showJoinVersionPicker(Node anchor, String address, String modpackUrl) {
+        Popup popup = new Popup();
+        popup.setAutoHide(true);
+
+        VBox box = new VBox(6);
+        box.setPadding(new Insets(12));
+        box.getStyleClass().addAll("root-pane", darkMode ? "theme-dark" : "theme-light", "device-code-box");
+        box.getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
+        box.getStylesheets().add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
+        box.getChildren().add(sectionLabel("JOIN WITH VERSION"));
+
+        String defaultVersion = pingedServerVersion.get(address);
+        VBox list = new VBox(2);
+        java.util.List<VersionManifest.VersionEntry> releases = allVersions.stream()
+                .filter(v -> v.type() == null || v.type().equalsIgnoreCase("release"))
+                .limit(40)
+                .toList();
+        if (releases.isEmpty()) releases = allVersions;
+        for (VersionManifest.VersionEntry v : releases) {
+            Button item = new Button(v.id() + (v.id().equals(defaultVersion) ? "  (server default)" : ""));
+            item.getStyleClass().add("mod-row");
+            item.setMaxWidth(Double.MAX_VALUE);
+            item.setOnAction(ev -> {
+                popup.hide();
+                joinAddedOrFriendServer(address, modpackUrl, v.id());
+            });
+            list.getChildren().add(item);
+        }
+        ScrollPane scroll = new ScrollPane(list);
+        scroll.setFitToWidth(true);
+        scroll.setPrefHeight(220);
+        scroll.setMaxHeight(260);
+        box.getChildren().add(scroll);
+
+        popup.getContent().add(box);
+        var bounds = anchor.localToScreen(anchor.getBoundsInLocal());
+        popup.show(anchor, bounds.getMinX(), bounds.getMaxY() + 4);
     }
 
     /** The live parts of a server card/row a background ping updates in place. */
@@ -1969,6 +2266,7 @@ public class LauncherApp extends Application {
                 ui.badge().getStyleClass().setAll("badge-online");
                 Node dot = ui.badge().getGraphic();
                 if (dot instanceof Circle c) c.getStyleClass().setAll("status-dot-online");
+                if (st.version() != null && !st.version().isBlank()) pingedServerVersion.put(address, st.version());
                 if (ui.joinBtn() != null) ensureJoinGlow(ui.joinBtn());
                 if (st.faviconDataUri() != null && ui.faviconCache() != null && ui.refreshIcon()) {
                     ImageView iv = serverIconImageView(ui.iconTile());
@@ -2013,6 +2311,9 @@ public class LauncherApp extends Application {
         task.setOnSucceeded(e -> {
             if (iconTile.getScene() == null) return; // popup closed / row gone -- drop the result
             ServerStatusPing.Status st = task.getValue();
+            if (st.online() && st.version() != null && !st.version().isBlank()) {
+                pingedServerVersion.put(address, st.version());
+            }
             if (st.online() && st.faviconDataUri() != null) {
                 cacheFavicon(st.faviconDataUri(), cache);
                 try {
@@ -2275,9 +2576,12 @@ public class LauncherApp extends Application {
             joinBtn.getStyleClass().add("pill-button");
             setButtonIcon(joinBtn, IconFactory.Icon.PLAY, "Join");
             ensureJoinGlow(joinBtn); // the friend is online on this server right now, so it's joinable
-            joinBtn.setOnAction(ev -> {
-                selectNavTab(navHomeBtn);
-                onPlay(entry.serverAddress);
+            joinBtn.setOnAction(ev -> joinAddedOrFriendServer(entry.serverAddress, null, null));
+            joinBtn.setOnMousePressed(ev -> {
+                if (ev.getButton() == javafx.scene.input.MouseButton.SECONDARY) {
+                    ev.consume();
+                    showJoinVersionPicker(joinBtn, entry.serverAddress, null);
+                }
             });
 
             HBox row = new HBox(10, avatarView, dot, name, serverBox, spacer, joinBtn);
@@ -2457,11 +2761,26 @@ public class LauncherApp extends Application {
         Button joinBtn = new Button();
         joinBtn.getStyleClass().add("pill-button");
         setButtonIcon(joinBtn, IconFactory.Icon.PLAY, "Join");
+        Tooltip.install(joinBtn, new Tooltip("Joins with this server's own version"
+                + (s.modpackUrl() == null ? "" : " and modpack") + ". Right-click to pick a different version."));
         joinBtn.setOnAction(e -> {
             addedServersStore.touchLastJoined(s.id());
-            selectNavTab(navHomeBtn);
-            onPlay(s.address());
+            joinAddedOrFriendServer(s.address(), s.modpackUrl(), null);
         });
+        joinBtn.setOnMousePressed(ev -> {
+            if (ev.getButton() == javafx.scene.input.MouseButton.SECONDARY) {
+                ev.consume();
+                addedServersStore.touchLastJoined(s.id());
+                showJoinVersionPicker(joinBtn, s.address(), s.modpackUrl());
+            }
+        });
+        Button modpackEditBtn = new Button();
+        setButtonIconOnly(modpackEditBtn, IconFactory.Icon.MODPACK);
+        modpackEditBtn.getStyleClass().add("pill-button");
+        Tooltip.install(modpackEditBtn, new Tooltip(s.modpackUrl() == null
+                ? "Attach a modpack this server plays with"
+                : "Modpack: " + s.modpackUrl() + " -- click to change"));
+        modpackEditBtn.setOnAction(e -> editAddedServerModpack(s));
         Button removeBtn = new Button("Remove");
         removeBtn.getStyleClass().add("pill-button");
         removeBtn.setOnAction(e -> {
@@ -2469,7 +2788,7 @@ public class LauncherApp extends Application {
             renderServersPageContent();
         });
 
-        HBox row = new HBox(12, iconTile, textBox, status, spacer, joinBtn, removeBtn);
+        HBox row = new HBox(12, iconTile, textBox, status, spacer, joinBtn, modpackEditBtn, removeBtn);
         row.setAlignment(Pos.CENTER_LEFT);
         row.getStyleClass().add("mod-row");
         pingServerAsync(s.address(), new ServerCardUi(status, joinBtn, iconTile, iconCache, 40,
@@ -2509,6 +2828,38 @@ public class LauncherApp extends Application {
         });
     }
 
+    /** Small dialog to attach/change/clear the modpack a bookmarked server plays with, from its
+     *  Servers-page row (the modpack-icon button next to Join/Remove). */
+    private void editAddedServerModpack(AddedServersStore.AddedServer s) {
+        Dialog<Void> dialog = new Dialog<>();
+        dialog.setTitle("Server Modpack");
+        dialog.getDialogPane().getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
+        dialog.getDialogPane().getStylesheets().add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
+        dialog.getDialogPane().getStyleClass().addAll("root-pane", darkMode ? "theme-dark" : "theme-light");
+        dialog.getDialogPane().getButtonTypes().addAll(ButtonType.CLOSE);
+
+        TextField modpackField = new TextField(s.modpackUrl() == null ? "" : s.modpackUrl());
+        modpackField.setPromptText("Modrinth modpack link/slug -- blank to remove");
+        modpackField.getStyleClass().add("input-field");
+        Label hint = new Label("Set this if \"" + s.name() + "\" requires a modpack. Joining will offer to "
+                + "install it automatically the first time, then reuse it after that.");
+        hint.getStyleClass().add("notice-label");
+        hint.setWrapText(true);
+        Button saveBtn = new Button("Save");
+        saveBtn.getStyleClass().addAll("settings-apply-button", "settings-apply-button-ready");
+        saveBtn.setOnAction(e -> {
+            addedServersStore.setModpackUrl(s.id(), modpackField.getText());
+            renderServersPageContent();
+            dialog.hide();
+        });
+
+        VBox content = new VBox(14, sectionLabel("MODPACK"), modpackField, hint, saveBtn);
+        content.setPadding(new Insets(24));
+        dialog.getDialogPane().setContent(content);
+        dialog.getDialogPane().setPrefWidth(420);
+        dialog.showAndWait();
+    }
+
     private void openAddServerDialog() {
         Dialog<Void> dialog = new Dialog<>();
         dialog.setTitle("Add Server");
@@ -2523,17 +2874,25 @@ public class LauncherApp extends Application {
         TextField addressField = new TextField();
         addressField.setPromptText("Address, e.g. mc.example.com:25565");
         addressField.getStyleClass().add("input-field");
+        TextField modpackField = new TextField();
+        modpackField.setPromptText("Optional -- Modrinth modpack link/slug this server plays with");
+        modpackField.getStyleClass().add("input-field");
+        Label modpackHint = new Label("Set this if the server requires a modpack. Joining will offer to "
+                + "install it automatically the first time, then reuse it after that.");
+        modpackHint.getStyleClass().add("notice-label");
+        modpackHint.setWrapText(true);
         Button saveBtn = new Button("Save");
         saveBtn.getStyleClass().addAll("settings-apply-button", "settings-apply-button-ready");
         saveBtn.setOnAction(e -> {
             if (addressField.getText().isBlank()) return;
             String name = nameField.getText().isBlank() ? addressField.getText() : nameField.getText();
-            addedServersStore.add(name, addressField.getText().trim());
+            addedServersStore.add(name, addressField.getText().trim(), modpackField.getText());
             renderServersPageContent();
             dialog.hide();
         });
 
-        VBox content = new VBox(14, sectionLabel("NAME"), nameField, sectionLabel("ADDRESS"), addressField, saveBtn);
+        VBox content = new VBox(14, sectionLabel("NAME"), nameField, sectionLabel("ADDRESS"), addressField,
+                sectionLabel("MODPACK"), modpackField, modpackHint, saveBtn);
         content.setPadding(new Insets(24));
         dialog.getDialogPane().setContent(content);
         dialog.getDialogPane().setPrefWidth(420);
@@ -3283,23 +3642,26 @@ public class LauncherApp extends Application {
                         }
                     }
 
-                    // Best-effort pre-start dependency check: a Fabric server missing a library mod
-                    // its mods require dies immediately with "Incompatible mod set". Resolving that
-                    // here turns a confusing crash into a one-line note. It costs nothing when
-                    // nothing is missing, never blocks a start, and any failure is only logged --
-                    // starting the server is still the user's call.
+                    // Pre-start dependency check: a Fabric server missing a library mod its mods
+                    // require dies immediately with "Incompatible mod set". The resolver not only
+                    // installs what it can find, it also sets aside a mod whose dependency has no build
+                    // for this Minecraft version (Fabric refuses to launch the whole server over one,
+                    // so that is the only way it can start at all).
+                    //
+                    // EVERY note is shown, not just the "something was installed" case: an unresolved
+                    // dependency is exactly when the user needs to be told, and staying silent was what
+                    // made the failure look unexplained. It never blocks a start -- a failure here is
+                    // only logged.
                     if (server.type == ServerType.FABRIC && server.minecraftVersion != null) {
                         try {
-                            // Messages are buffered and shown only when something was actually
-                            // installed -- otherwise "all dependencies present" would be printed on
-                            // every single start.
                             java.util.List<String> depNotes = new java.util.ArrayList<>();
                             var deps = new ServerModDependencyResolver().resolveAndInstall(
                                     serverDir, server.minecraftVersion, server.type.displayName(),
                                     null, depNotes::add);
-                            if (deps.installed() > 0) {
-                                depNotes.add("Installed " + deps.installed()
-                                        + " missing mod dependency(ies) before start.");
+                            if (deps.missingDepsFound() > 0) depNotes.add(deps.summary());
+                            depNotes.addAll(deps.warnings());
+                            depNotes.addAll(deps.errors());
+                            if (!depNotes.isEmpty()) {
                                 Platform.runLater(() -> {
                                     for (String note : depNotes) {
                                         serverConsoleArea.appendText("[DeyLauncher] " + note + "\n");
@@ -4283,6 +4645,12 @@ public class LauncherApp extends Application {
                         if (!depResult.warnings().isEmpty()) {
                             log("Server modpack dependency warnings:\n  " + String.join("\n  ", depResult.warnings()));
                         }
+                        if (!depResult.setAsideMods().isEmpty()) {
+                            summary += " -- " + depResult.setAsideMods().size()
+                                    + " mod(s) set aside in mods-disabled/, see the server console";
+                            log("Server modpack mods set aside (their dependency has no build for this "
+                                    + "Minecraft version):\n  " + String.join("\n  ", depResult.setAsideMods()));
+                        }
                         packStatus.setText(summary);
                         installStatus.setText("Modpack installed.");
                         // Always refresh the addons list after both phases.
@@ -5087,11 +5455,14 @@ public class LauncherApp extends Application {
             accountBtnName.setText("No Account");
             accountBtnFace.setImage(null);
             accountBtnDot.getStyleClass().add("dot-none");
-            return;
+        } else {
+            accountBtnName.setText(active.username);
+            accountBtnDot.getStyleClass().add(active.accountType == AccountType.ONLINE ? "dot-online" : "dot-offline");
+            accountBtnFace.setImage(faceIcon(active));
         }
-        accountBtnName.setText(active.username);
-        accountBtnDot.getStyleClass().add(active.accountType == AccountType.ONLINE ? "dot-online" : "dot-offline");
-        accountBtnFace.setImage(faceIcon(active));
+        // The account button's name (and face) can change its rendered width, so the window's
+        // minimum width must be re-checked afterwards to keep the whole top bar visible.
+        if (stage.isShowing()) recomputeTopBarMinWidth();
     }
 
     /** Crops just the front-facing head (8x8 region at (8,8)) out of a skin texture, so the button shows a face, not the whole sheet. */
@@ -5176,7 +5547,7 @@ public class LauncherApp extends Application {
         modpackBtn = new Button();
         setButtonIconOnly(modpackBtn, IconFactory.Icon.MODPACK);
         modpackBtn.getStyleClass().add("icon-button");
-        modpackBtn.setTooltip(new Tooltip("Modpacks -- add one, or drag & drop a .mrpack / .zip"));
+        modpackBtn.setTooltip(new Tooltip(MODPACK_BUTTON_TIP));
         modpackBtn.setOnAction(e -> showModpackMenu());
 
         HBox modeRow = new HBox(6, modeToggleRow, modpackBtn);
@@ -5187,8 +5558,27 @@ public class LauncherApp extends Application {
 
         versionTileList = new VBox(10);
         versionTileList.getStyleClass().add("tile-list");
+        modpackTileBox = new VBox(10);
 
-        VBox left = new VBox(18, modeRow, versionTileList);
+        // The tile list scrolls. With one profile tile per installed modpack it can be arbitrarily long, and
+        // it must never push the window layout (top bar, output pane) off the screen -- so it gets a scroll
+        // pane whose preferred height is 0 (it takes whatever room the row gives it, then scrolls).
+        tileScroll = new ScrollPane(versionTileList);
+        tileScroll.setFitToWidth(true);
+        tileScroll.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
+        tileScroll.setVbarPolicy(ScrollPane.ScrollBarPolicy.AS_NEEDED);
+        tileScroll.setPrefHeight(0);
+        tileScroll.setMinHeight(0);
+        tileScroll.getStyleClass().add("settings-scroll");
+        VBox.setVgrow(tileScroll, Priority.ALWAYS);
+        // Keeps the "exactly as wide as the widest tile label, never truncated" sidebar (see below): a
+        // ScrollPane doesn't size to its content's width, so do it explicitly, now and once the CSS is applied.
+        versionTileList.getChildren().addListener((javafx.collections.ListChangeListener<Node>) c -> fitTileColumn());
+        modpackTileBox.getChildren().addListener((javafx.collections.ListChangeListener<Node>) c -> fitTileColumn());
+        Platform.runLater(this::fitTileColumn);
+
+        VBox left = new VBox(18, modeRow, tileScroll);
+        left.setMinHeight(0);
         left.getStyleClass().add("side-panel");
         left.setPadding(new Insets(20));
         // Width floor, invisible (0 tall, just reserves horizontal room): keeps the sidebar at the
@@ -5218,7 +5608,7 @@ public class LauncherApp extends Application {
         offlineNotice.getStyleClass().add("notice-label");
         this.accountStatusNotice = offlineNotice;
 
-        Label modLoaderLabel = new Label("LOADER");
+        modLoaderLabel = new Label("LOADER");
         modLoaderLabel.getStyleClass().add("field-label");
         modLoaderBox = new ComboBox<>();
         modLoaderBox.getStyleClass().add("input-field");
@@ -5229,7 +5619,7 @@ public class LauncherApp extends Application {
             modsBtn.setManaged(showMods);
         });
 
-        Label versionLabel = new Label("VERSION");
+        versionLabel = new Label("VERSION");
         versionLabel.getStyleClass().add("field-label");
         versionBox = new ComboBox<>();
         versionBox.setPromptText("Loading versions...");
@@ -5261,23 +5651,46 @@ public class LauncherApp extends Application {
                 modLoaderLabel, modLoaderBox,
                 versionLabel, versionBox,
                 modsBtn, playButton, launchProgress);
-        right.setPadding(new Insets(32));
+        right.setPadding(new Insets(36)); // what .play-card's -fx-padding gave it before the card became a wrapper
         right.setAlignment(Pos.CENTER_LEFT);
-        right.getStyleClass().add("play-card");
-        HBox.setHgrow(right, Priority.ALWAYS);
+        playContent = right;
 
-        HBox main = new HBox(20, left, right);
+        // Optional artwork behind the right side of a pack profile's card. The faded image is built with its
+        // own alpha (see fadedBackdrop), so it melts into whatever card colour the theme has -- no rectangle,
+        // no colour matching -- and it never intercepts the mouse.
+        packBackdrop = new ImageView();
+        packBackdrop.setPreserveRatio(true);
+        packBackdrop.setSmooth(true);
+        packBackdrop.setFitWidth(420);
+        packBackdrop.setFitHeight(360);
+        packBackdrop.setMouseTransparent(true);
+        packBackdrop.setVisible(false);
+        packBackdrop.setEffect(new javafx.scene.effect.GaussianBlur(1.5)); // very subtle
+        StackPane.setAlignment(packBackdrop, Pos.CENTER_RIGHT);
+        StackPane.setMargin(packBackdrop, new Insets(0, 12, 0, 0));
+
+        playCard = new StackPane(packBackdrop, right);
+        playCard.getStyleClass().add("play-card");
+        playCard.setStyle("-fx-padding: 0;"); // the padding lives on the content column
+        playCard.setMinHeight(Region.USE_PREF_SIZE); // the card never shrinks below its content (no clipped text)
+        playCard.widthProperty().addListener((o, a, b) -> applyBackdropReserve());
+        HBox.setHgrow(playCard, Priority.ALWAYS);
+
+        HBox main = new HBox(20, left, playCard);
         main.setPadding(new Insets(24, 28, 8, 28));
         main.setAlignment(Pos.TOP_LEFT);
 
         setMode(prefs.lastDeyMode); // reopen in whichever mode you last played (DEY by default)
         restoreLastPlayedVersion();
 
-        // Keep the modpack button showing the active pack's own icon as the selection changes (icon
-        // compatibility: a pack you installed looks like itself right in the launcher).
-        versionBox.valueProperty().addListener((o, a, b) -> refreshModpackButtonIcon(b, modLoaderBox.getValue()));
-        modLoaderBox.valueProperty().addListener((o, a, b) -> refreshModpackButtonIcon(versionBox.getValue(), b));
-        refreshModpackButtonIcon(versionBox.getValue(), modLoaderBox.getValue());
+        // ANY change to the version or loader -- from the dropdowns, a version tile, or code -- goes through
+        // onSelectionChanged, which drops a selected pack whose fixed values the selectors no longer show
+        // (a safety net: while a pack is selected they are locked), then refreshes everything that shows the
+        // profile, including whether the selectors are locked. That single hook, plus the explicit detach in
+        // selectVersionTile/setMode/selectModpack, is the whole lifecycle.
+        versionBox.valueProperty().addListener((o, a, b) -> onSelectionChanged());
+        modLoaderBox.valueProperty().addListener((o, a, b) -> onSelectionChanged());
+        onSelectionChanged();
         return main;
     }
 
@@ -5286,6 +5699,9 @@ public class LauncherApp extends Application {
      * and left-column filter tiles to match. Also recolors the Play button to match whichever
      * mode is active, the same way the mode toggle itself is colored. */
     private void setMode(boolean dey) {
+        if (dey != this.deyMode) {
+            modpackSelection.detach(); // switching modes is explicit navigation: any attached pack is dropped
+        }
         this.deyMode = dey;
         vanillaModeBtn.setSelected(!dey);
         deyModeBtn.setSelected(dey);
@@ -5298,18 +5714,13 @@ public class LauncherApp extends Application {
             modLoaderBox.getItems().addAll("Fabric");
             modLoaderBox.setValue("Fabric");
             modLoaderBox.setDisable(false);
-            mainDescriptionLabel.setText(
-                    "DEY builds run a curated set of performance and quality-of-life mods -- "
-                            + "Sodium + Iris (shaders) + Fabric API install automatically, no setup needed.");
         } else {
             modLoaderBox.getItems().addAll("Vanilla", "Fabric", "Forge", "NeoForge");
             modLoaderBox.setValue("Vanilla");
             modLoaderBox.setDisable(false);
-            mainDescriptionLabel.setText(
-                    "Clean, unmodified loaders -- pick Vanilla, Fabric, Forge, or NeoForge yourself.");
         }
         rebuildVersionTiles();
-        refreshModpackButtonIcon(versionBox.getValue(), modLoaderBox.getValue());
+        onSelectionChanged(); // also re-renders the mode description
     }
 
     /** Rebuilds the left-column filter tiles for the current mode and selects the first one. */
@@ -5323,11 +5734,108 @@ public class LauncherApp extends Application {
             tile.getStyleClass().add("version-tile");
             tile.setMaxWidth(Double.MAX_VALUE);
             tile.setAlignment(Pos.CENTER_LEFT);
+            tile.setUserData(preset);
             tile.setOnAction(e -> selectVersionTile(preset, tile));
             versionTileList.getChildren().add(tile);
             if (firstTile == null) firstTile = tile;
         }
+        // Each installed modpack is its own profile, listed under the version filters.
+        versionTileList.getChildren().add(modpackTileBox);
+        rebuildModpackTiles();
         if (firstTile != null) selectVersionTile(presets[0], firstTile);
+    }
+
+    /** Sizes the tile scroller to its widest tile (+ room for the scroll bar) so labels are never truncated. */
+    private void fitTileColumn() {
+        if (tileScroll == null || versionTileList == null) return;
+        versionTileList.applyCss();
+        tileScroll.setPrefWidth(versionTileList.prefWidth(-1) + 16);
+        tileScroll.setMinWidth(Region.USE_PREF_SIZE);
+    }
+
+    /** Rebuilds the MODPACKS section: one profile tile per installed pack (nothing when there are none). */
+    private void rebuildModpackTiles() {
+        modpackTileBox.getChildren().clear();
+        List<ModpackMeta> installed = ModpackMeta.listInstalled(gameFiles.root);
+        if (installed.isEmpty()) return;
+        modpackTileBox.getChildren().add(sectionLabel("MODPACKS"));
+        for (ModpackMeta meta : installed) modpackTileBox.getChildren().add(buildModpackTile(meta));
+        syncActiveTile();
+    }
+
+    /**
+     * One modpack profile tile: the pack's own artwork (fitted inside a fixed box with its aspect ratio
+     * kept -- never squared off, stretched or cropped) and its name. The tile identifies the pack by its
+     * instance folder, so two packs for the same Minecraft version and loader are two distinct tiles.
+     */
+    private Button buildModpackTile(ModpackMeta meta) {
+        Button tile = new Button(meta.name);
+        tile.getStyleClass().add("version-tile");
+        tile.setMaxWidth(Double.MAX_VALUE);
+        tile.setAlignment(Pos.CENTER_LEFT);
+        tile.setGraphic(packArtworkNode(meta, 56, 32));
+        tile.setGraphicTextGap(10);
+        tile.setUserData(meta.instanceId);
+        StringBuilder tip = new StringBuilder("Modpack profile -- Minecraft ").append(meta.mcVersion);
+        if (meta.loader != null && !meta.loader.isBlank()) tip.append(", ").append(meta.loader);
+        if (meta.loaderVersion != null && !meta.loaderVersion.isBlank()) tip.append(' ').append(meta.loaderVersion);
+        tile.setTooltip(new Tooltip(tip.toString()));
+        tile.setOnAction(e -> {
+            if (!selectModpack(meta)) {
+                log("Couldn't select \"" + meta.name + "\" -- it has no Minecraft version recorded.");
+            }
+        });
+        return tile;
+    }
+
+    /**
+     * The pack's artwork in a fixed maxW x maxH box, aspect ratio preserved (fit inside, centred). A
+     * missing, unreadable or corrupt icon gives the generic modpack glyph in the same box -- it can never
+     * throw, so a bad icon file cannot take the sidebar (or the launcher) down with it.
+     */
+    private Node packArtworkNode(ModpackMeta meta, double maxW, double maxH) {
+        Node content;
+        try {
+            Image img = loadPackIcon(meta.iconFile(gameFiles.root), Math.max(maxW, maxH));
+            if (img != null) {
+                ImageView iv = new ImageView(img);
+                iv.setPreserveRatio(true);
+                iv.setSmooth(true);
+                iv.setFitWidth(maxW);
+                iv.setFitHeight(maxH);
+                content = iv;
+            } else {
+                content = icon(IconFactory.Icon.MODPACK, 20);
+            }
+        } catch (RuntimeException e) {
+            content = icon(IconFactory.Icon.MODPACK, 20);
+        }
+        StackPane box = new StackPane(content);
+        box.setPrefSize(maxW, maxH);
+        box.setMinSize(maxW, maxH);
+        box.setMaxSize(maxW, maxH);
+        return box;
+    }
+
+    /** Highlights exactly one sidebar tile: the selected pack's, or -- when no pack is selected -- the active version filter's. */
+    private void syncActiveTile() {
+        ModpackMeta pack = modpackSelection.attached();
+        for (Node n : versionTileList.getChildren()) {
+            if (n instanceof Button b && b.getUserData() instanceof VersionPreset p) {
+                setTileActive(b, pack == null && p == activePreset);
+            }
+        }
+        if (modpackTileBox == null) return;
+        for (Node n : modpackTileBox.getChildren()) {
+            if (n instanceof Button b && b.getUserData() instanceof String id) {
+                setTileActive(b, pack != null && id.equals(pack.instanceId));
+            }
+        }
+    }
+
+    private static void setTileActive(Button tile, boolean active) {
+        tile.getStyleClass().remove("version-tile-active");
+        if (active) tile.getStyleClass().add("version-tile-active");
     }
 
     /** A tile is a filter, not a single version -- selecting one narrows the Version dropdown
@@ -5337,13 +5845,223 @@ public class LauncherApp extends Application {
     }
 
     private void selectVersionTile(VersionPreset preset, Button tile, String preferredVersionId) {
-        for (var node : versionTileList.getChildren()) {
-            node.getStyleClass().remove("version-tile-active");
-        }
-        tile.getStyleClass().add("version-tile-active");
         activePreset = preset;
+        // Clicking a Vanilla/DEY tile is the explicit way back out of a modpack profile: it is always
+        // available (tiles are never disabled), drops the pack, and refreshModpackUi below unlocks the selectors.
+        modpackSelection.detach();
         mainHeadingLabel.setText("Minecraft " + preset.label());
         applyVersionFilter(preset, preferredVersionId);
+        onSelectionChanged();
+    }
+
+    // ---- Profiles: Vanilla / DEY / one per installed modpack ------------------------------------------
+    // Vanilla and DEY profiles use the Version and Loader dropdowns freely. A modpack is its OWN profile:
+    // its Minecraft version and loader come from the pack and are fixed, so while it is selected the
+    // dropdowns just display them, locked. Selection identifies the pack by its INSTANCE FOLDER (never by
+    // "the first pack with this version + loader"), and Play, the Mods window, options kits, the icon and
+    // the pinned loader build all read ONE snapshot -- currentLaunchTarget() -- so what is shown is what
+    // launches. Leaving a pack is always possible: any Vanilla/DEY tile or the mode switch detaches it,
+    // and the lock is DERIVED from "is a pack selected" in refreshModpackUi, so it can't be left stuck.
+
+    /** What is selected right now, resolved to the instance folder that would run. */
+    private ModpackSelection.Target currentLaunchTarget() {
+        String version = versionBox.getValue() != null ? versionBox.getValue() : "1.21.1";
+        return modpackSelection.resolve(gameFiles.root, version, modLoaderBox.getValue());
+    }
+
+    /** Hook for every change to the version, loader or mode: keeps the attached pack honest, then redraws. */
+    private void onSelectionChanged() {
+        modpackSelection.reconcile(versionBox.getValue(), modLoaderBox.getValue(), deyMode);
+        refreshModpackUi();
+    }
+
+    /**
+     * Selects an installed modpack as the current profile: VANILLA mode (DEY would inject its own mods on top),
+     * the selectors showing the pack's own Minecraft version and loader, the pack attached and the selectors locked.
+     *
+     * @return false only if the pack records no Minecraft version, in which case nothing is selected
+     */
+    private boolean selectModpack(ModpackMeta pack) {
+        modpackSelection.detach(); // never carry the previous profile across a switch
+        if (pack.mcVersion == null || pack.mcVersion.isBlank()) {
+            onSelectionChanged();
+            return false;
+        }
+        if (deyMode) setMode(false);
+        String loader = pack.loader == null || pack.loader.isBlank() ? "Vanilla" : pack.loader;
+        if (!selectVersionAndLoader(pack.mcVersion, loader)) {
+            // The version isn't in the launcher's list (Mojang's list not loaded yet, offline, or since removed).
+            // A fixed profile doesn't need it to be: show the pack's own values directly.
+            if (!versionBox.getItems().contains(pack.mcVersion)) versionBox.getItems().add(0, pack.mcVersion);
+            versionBox.setValue(pack.mcVersion);
+            if (!modLoaderBox.getItems().contains(loader)) modLoaderBox.getItems().add(loader);
+            modLoaderBox.setValue(loader);
+        }
+        // Attached LAST, after the selectors have settled, so no intermediate selector event can drop it.
+        boolean attached = modpackSelection.attach(pack, versionBox.getValue(), modLoaderBox.getValue(), deyMode);
+        onSelectionChanged(); // locks the selectors, retitles the card, shows the artwork, highlights the tile
+        return attached;
+    }
+
+    /**
+     * Redraws everything that depends on the current profile. This is the ONLY place that decides whether the
+     * Version/Loader selectors are locked: they are locked exactly while a modpack profile is selected.
+     */
+    private void refreshModpackUi() {
+        if (modpackBtn == null || mainDescriptionLabel == null || versionBox == null || modLoaderBox == null
+                || modLoaderLabel == null || versionLabel == null) return;
+        ModpackSelection.Target target = currentLaunchTarget(); // may drop a pack whose record vanished
+        ModpackMeta profile = modpackSelection.attached();
+        versionBox.setDisable(profile != null);
+        modLoaderBox.setDisable(profile != null);
+        modLoaderLabel.setText(profile != null ? "LOADER  (FIXED BY MODPACK)" : "LOADER");
+        versionLabel.setText(profile != null ? "VERSION  (FIXED BY MODPACK)" : "VERSION");
+        if (profile != null) {
+            mainHeadingLabel.setText(profile.name);
+        } else if (activePreset != null) {
+            mainHeadingLabel.setText("Minecraft " + activePreset.label());
+        }
+        refreshModpackButton(target);
+        renderProfileDetails(target, profile != null);
+        updatePackBackdrop(profile);
+        syncActiveTile();
+    }
+
+    /**
+     * The modpack button shows the pack's OWN icon whenever the folder that will launch holds a pack
+     * that has one, at a fixed 24px box with its aspect ratio preserved (so any icon shape fits without
+     * resizing the button). A pack with no usable icon keeps the generic glyph; either way an orange ring
+     * marks that a pack is what will launch. A missing or corrupt icon file never blanks the button.
+     */
+    private void refreshModpackButton(ModpackSelection.Target target) {
+        ModpackMeta pack = target.pack();
+        Image icon = pack == null ? null : loadPackIcon(pack.iconFile(gameFiles.root), 24);
+        if (icon != null) {
+            ImageView iv = new ImageView(icon);
+            iv.setFitWidth(24);
+            iv.setFitHeight(24);
+            iv.setPreserveRatio(true);
+            iv.setSmooth(true);
+            StackPane box = new StackPane(iv); // fixed footprint: a wide or tall icon can't change the button's size
+            box.setPrefSize(24, 24);
+            box.setMinSize(24, 24);
+            box.setMaxSize(24, 24);
+            modpackBtn.setGraphic(box);
+            modpackBtn.setText("");
+            modpackBtn.setGraphicTextGap(0);
+        } else {
+            setButtonIconOnly(modpackBtn, IconFactory.Icon.MODPACK);
+        }
+        modpackBtn.getStyleClass().remove("modpack-attached");
+        if (pack != null) modpackBtn.getStyleClass().add("modpack-attached");
+        modpackBtn.getTooltip().setText(pack == null ? MODPACK_BUTTON_TIP
+                : "Modpack: " + pack.name + " -- click to switch, add or remove modpacks");
+    }
+
+    /** The details-panel text: the modpack's facts when a pack profile is selected, otherwise the mode's usual blurb. */
+    private void renderProfileDetails(ModpackSelection.Target target, boolean profile) {
+        String base = deyMode
+                ? "DEY builds run a curated set of performance and quality-of-life mods -- "
+                    + "Sodium + Iris (shaders) + Fabric API install automatically, no setup needed."
+                : "Clean, unmodified loaders -- pick Vanilla, Fabric, Forge, or NeoForge yourself.";
+        ModpackMeta pack = target.pack();
+        if (pack == null) {
+            mainDescriptionLabel.setText(base);
+            return;
+        }
+        if (!profile) { // a pack installed by an older launcher, living in this plain version+loader folder
+            mainDescriptionLabel.setText("This folder holds the modpack \"" + pack.name + "\".\n" + base);
+            return;
+        }
+        StringBuilder facts = new StringBuilder();
+        if (pack.version != null && !pack.version.isBlank()) facts.append("Version ").append(pack.version).append("  \u00b7  ");
+        facts.append("Minecraft ").append(pack.mcVersion);
+        if (pack.loader != null && !pack.loader.isBlank() && !pack.loader.equalsIgnoreCase("Vanilla")) {
+            facts.append("  \u00b7  ").append(pack.loader);
+            if (pack.loaderVersion != null && !pack.loaderVersion.isBlank()) facts.append(' ').append(pack.loaderVersion);
+        }
+        mainDescriptionLabel.setText(facts.toString());
+    }
+
+    /** Shows (or hides) the pack's artwork faded into the right side of the details card. Optional decoration: any failure hides it. */
+    private void updatePackBackdrop(ModpackMeta profile) {
+        try {
+            Path file = profile == null ? null : profile.iconFile(gameFiles.root);
+            String key = file == null ? "" : profile.instanceId + "|" + file + "|" + file.toFile().lastModified();
+            if (!key.equals(packBackdropKey)) {
+                packBackdropKey = key;
+                Image src = file == null ? null : loadPackIcon(file, 256);
+                Image faded = src == null ? null : fadedBackdrop(src);
+                packBackdrop.setImage(faded);
+            }
+            packBackdrop.setVisible(packBackdrop.getImage() != null);
+        } catch (RuntimeException e) {
+            packBackdropKey = "";
+            packBackdrop.setImage(null);
+            packBackdrop.setVisible(false);
+        }
+        applyBackdropReserve();
+    }
+
+    /** With artwork showing, the content column stops short of it so text and controls stay on the left. */
+    private void applyBackdropReserve() {
+        if (playContent == null || packBackdrop == null || playCard == null) return;
+        double reserve = 0;
+        Image art = packBackdrop.getImage();
+        if (packBackdrop.isVisible() && art != null && art.getHeight() > 0) {
+            // the artwork's real on-screen width (fit inside its box, ratio kept); its faded left ~40% may sit under the column
+            double shown = Math.min(packBackdrop.getFitWidth(), packBackdrop.getFitHeight() * art.getWidth() / art.getHeight());
+            reserve = Math.min(playCard.getWidth() * 0.42, 12 + shown * 0.8);
+        }
+        playContent.setPadding(new Insets(36, 36 + reserve, 36, 36));
+    }
+
+    /**
+     * Copies the artwork with its own alpha fade: strongly from the left (so it dissolves into the card behind
+     * the text), gently at the right, top and bottom -- so no rectangular edge is ever visible and it works on
+     * any theme colour without matching one. Size and aspect ratio are untouched.
+     */
+    private static Image fadedBackdrop(Image src) {
+        int w = (int) src.getWidth();
+        int h = (int) src.getHeight();
+        javafx.scene.image.PixelReader pr = src.getPixelReader();
+        if (w < 2 || h < 2 || pr == null) return null;
+        javafx.scene.image.WritableImage out = new javafx.scene.image.WritableImage(w, h);
+        javafx.scene.image.PixelWriter pw = out.getPixelWriter();
+        for (int y = 0; y < h; y++) {
+            double v = y / (h - 1.0);
+            double fy = smoothstep(0, 0.3, v) * smoothstep(0, 0.3, 1 - v);
+            for (int x = 0; x < w; x++) {
+                double u = x / (w - 1.0);
+                double f = smoothstep(0, 0.8, u) * smoothstep(0, 0.28, 1 - u) * fy * 0.9;
+                int argb = pr.getArgb(x, y);
+                int alpha = (int) Math.round((argb >>> 24) * f);
+                pw.setArgb(x, y, (alpha << 24) | (argb & 0xFFFFFF));
+            }
+        }
+        return out;
+    }
+
+    private static double smoothstep(double edge0, double edge1, double x) {
+        double t = Math.max(0, Math.min(1, (x - edge0) / (edge1 - edge0)));
+        return t * t * (3 - 2 * t);
+    }
+
+    /**
+     * Loads a pack icon for display in a box about {@code boxPx} wide (decoded at 2x for crisp hi-DPI
+     * output), or null when the file is missing or is not a usable image. JavaFX does not throw for an
+     * undecodable image -- it returns one flagged as an error -- so that is checked explicitly.
+     */
+    private Image loadPackIcon(Path file, double boxPx) {
+        if (file == null || !Files.isRegularFile(file)) return null;
+        try {
+            Image img = new Image(file.toUri().toString(), boxPx * 2, boxPx * 2, true, true);
+            if (!img.isError() && img.getWidth() > 0) return img;
+        } catch (Exception ignored) {
+            // fall through to the ImageIO decoder
+        }
+        Image viaImageIo = decodeCachedIcon(file);
+        return viaImageIo != null && !viaImageIo.isError() && viaImageIo.getWidth() > 0 ? viaImageIo : null;
     }
 
     private void applyVersionFilter(VersionPreset preset) {
@@ -5498,10 +6216,10 @@ public class LauncherApp extends Application {
         if (bounds != null) popup.show(modpackBtn, bounds.getMinX(), bounds.getMaxY() + 6);
     }
 
-    /** One installed pack in the modpack menu, with the pack's own icon. Clicking it selects that
-     *  pack's Minecraft version + loader in the launcher, which is what makes it "the pack you play".
+    /** One installed pack in the modpack menu, with the pack's own icon. Clicking it points the launcher at
+     *  that pack (its Minecraft version + loader, in VANILLA mode) and attaches it -- the selectors stay editable.
      *  A trailing delete icon button removes the pack entirely -- its modpack.json, its mods, and
-     *  every other file installed under that version+loader's instance folder. */
+     *  every other file in that pack's own instance folder. */
     private HBox modpackMenuRow(ModpackMeta meta, Popup popup) {
         StringBuilder detail = new StringBuilder();
         if (meta.mcVersion != null && !meta.mcVersion.isBlank()) detail.append("Minecraft ").append(meta.mcVersion);
@@ -5514,13 +6232,12 @@ public class LauncherApp extends Application {
         row.setMaxWidth(Double.MAX_VALUE);
         HBox.setHgrow(row, Priority.ALWAYS);
         row.setAlignment(Pos.CENTER_LEFT);
-        row.setGraphic(modIconNode(meta.iconPath == null ? null : Path.of(meta.iconPath), 36));
+        row.setGraphic(modIconNode(meta.iconFile(gameFiles.root), 36));
         row.setGraphicTextGap(10);
         row.setTooltip(new Tooltip("Play this modpack"));
         row.setOnAction(e -> {
             popup.hide();
-            if (deyMode) setMode(false); // a pack is a VANILLA-mode setup; DEY would inject its own mods
-            if (!selectVersionAndLoader(meta.mcVersion, meta.loader)) {
+            if (!selectModpack(meta)) {
                 log("Couldn't switch to \"" + meta.name + "\" -- Minecraft " + meta.mcVersion
                         + " isn't in the launcher's version list yet.");
             }
@@ -5565,7 +6282,7 @@ public class LauncherApp extends Application {
      * on demand from the modpack menu so a pack can be verified without starting the game.
      */
     private void repairInstalledModpack(ModpackMeta meta) {
-        Path instanceDir = ModpackMeta.instanceDirFor(gameFiles.root, meta.mcVersion, meta.loader);
+        Path instanceDir = meta.instanceDir(gameFiles.root);
         log("Checking \"" + meta.name + "\" for missing files...");
         Task<ModpackVerifier.Report> task = new Task<>() {
             @Override
@@ -5601,10 +6318,13 @@ public class LauncherApp extends Application {
      *  the worlds themselves, so this walk deletes the link but never touches shared world data. */
     private void deleteInstalledModpack(ModpackMeta meta) {
         try {
-            Path instanceDir = ModpackMeta.instanceDirFor(gameFiles.root, meta.mcVersion, meta.loader);
+            Path instanceDir = meta.instanceDir(gameFiles.root);
             deleteFileTree(instanceDir);
             log("Deleted modpack \"" + meta.name + "\" and its mods.");
-            refreshModpackButtonIcon(versionBox.getValue(), modLoaderBox.getValue());
+            // If that pack was the one attached, it's gone now: drop it so nothing points at a missing folder.
+            modpackSelection.detachIfInstance(meta.instanceId);
+            rebuildModpackTiles();
+            onSelectionChanged();
         } catch (Exception ex) {
             log("Failed to delete modpack \"" + meta.name + "\": " + ex.getMessage());
         }
@@ -5769,7 +6489,10 @@ public class LauncherApp extends Application {
                 status.setText("Pick a Minecraft version in the launcher first, then install this pack.");
                 return;
             }
-            Path instanceDir = ModpackMeta.instanceDirFor(gameFiles.root, mc, loader);
+            // Each pack lives in its OWN instance folder (independent mods, config and metadata), and
+            // reinstalling the same pack for the same target reuses its folder. That is storage only: it
+            // has no bearing on which version or loader the launcher has selected.
+            Path instanceDir = ModpackMeta.installDirFor(gameFiles.root, info.name(), mc, loader);
             installBtn.setDisable(true);
             installBtn.getStyleClass().remove("settings-apply-button-ready");
             bar.setVisible(true);
@@ -5913,8 +6636,8 @@ public class LauncherApp extends Application {
 
     /**
      * Reports a finished install, then points the launcher straight at the pack (VANILLA mode +
-     * the pack's version/loader) so pressing PLAY starts it -- and logs every file that failed, so a
-     * partial install is never silently passed off as a complete one.
+     * the pack's version/loader, pack attached) so pressing PLAY starts it -- and logs every file that
+     * failed, so a partial install is never silently passed off as a complete one.
      */
     private void finishModpackInstall(ModpackInstaller.Result result, ModpackInfo info, String mc,
                                       String loader, Path instanceDir, Label status, ProgressBar bar,
@@ -5926,9 +6649,17 @@ public class LauncherApp extends Application {
 
         // A modpack is a plain (VANILLA-mode) version + loader setup. DEY mode would add its own
         // curated Sodium/Iris/Fabric API on top, which is not what the pack author intended.
-        if (deyMode) setMode(false);
-        boolean selected = selectVersionAndLoader(mc, loader);
-        refreshModpackButtonIcon(mc, loader);
+        // selectModpack handles both (switches mode, points the selectors at the pack, attaches it).
+        rebuildModpackTiles(); // the new (or re-installed) pack's profile tile
+        ModpackMeta installedPack = ModpackMeta.read(instanceDir);
+        boolean selected;
+        if (installedPack != null) {
+            selected = selectModpack(installedPack);
+        } else { // the record couldn't be written -- still leave the selectors on the pack's version/loader
+            if (deyMode) setMode(false);
+            selected = selectVersionAndLoader(mc, loader);
+            onSelectionChanged();
+        }
         log("Modpack \"" + info.name() + "\" installed into " + instanceDir + " -- " + result.summary());
         if (!selected) {
             log("Minecraft " + mc + " isn't selectable in the Version dropdown yet -- pick it there once it appears.");
@@ -6018,39 +6749,6 @@ public class LauncherApp extends Application {
         return mcVersion.equals(versionBox.getValue());
     }
 
-    /**
-     * Shows the ACTIVE pack's own icon on the modpack button (falling back to the generic box glyph),
-     * so the launcher visibly reflects the pack you're about to play -- icon compatibility in the one
-     * place you always see, right next to the DEY / VANILLA switch.
-     */
-    private void refreshModpackButtonIcon(String mcVersion, String loader) {
-        if (modpackBtn == null) return;
-        Path icon = null;
-        if (mcVersion != null && !mcVersion.isBlank()) {
-            ModpackMeta meta = ModpackMeta.read(ModpackMeta.instanceDirFor(gameFiles.root, mcVersion, loader));
-            if (meta != null && meta.iconPath != null && !meta.iconPath.isBlank()) {
-                Path candidate = Path.of(meta.iconPath);
-                if (Files.exists(candidate)) icon = candidate;
-            }
-        }
-        if (icon != null) {
-            try {
-                ImageView iv = new ImageView(new Image(icon.toUri().toString()));
-                iv.setFitWidth(24);
-                iv.setFitHeight(24);
-                iv.setPreserveRatio(true);
-                iv.setSmooth(true);
-                modpackBtn.setGraphic(iv);
-                modpackBtn.setText("");
-                modpackBtn.setGraphicTextGap(0);
-                return;
-            } catch (Exception ignored) {
-                // Unreadable icon -- fall through to the generic glyph.
-            }
-        }
-        setButtonIconOnly(modpackBtn, IconFactory.Icon.MODPACK);
-    }
-
     /** Downloads a Modrinth modpack's .mrpack from a pasted link/slug, returning where it landed. */
     private Path downloadModrinthPack(String urlOrSlug) throws Exception {
         String slug = urlOrSlug.trim();
@@ -6115,17 +6813,19 @@ public class LauncherApp extends Application {
     }
 
     // ---- Mods dialog: drag-and-drop add, enable/disable toggle, delete ----
+    /** The instance folder the current selection launches (see {@link #currentLaunchTarget}) -- the attached
+     *  pack's own folder, or the plain version+loader one. */
     private java.nio.file.Path currentInstanceDir() {
-        var files = new GameFiles();
-        String versionId = versionBox.getValue() != null ? versionBox.getValue() : "1.21.1";
-        String loader = modLoaderBox.getValue();
-        String suffix = (loader == null || loader.equals("Vanilla")) ? "" : "-" + loader.toLowerCase();
-        return files.root.resolve("instances").resolve(versionId + suffix);
+        return currentLaunchTarget().instanceDir();
     }
 
     private void openModsDialog() {
-        ModsManager mods = new ModsManager(currentInstanceDir());
-        String windowTitle = "Mods -- " + versionBox.getValue() + " (" + modLoaderBox.getValue() + ")";
+        // One snapshot for the whole window: it keeps acting on THIS folder even if the version/loader
+        // dropdowns change while it is open (ModsManager.instanceDir() is what its later actions read).
+        ModpackSelection.Target opened = currentLaunchTarget();
+        ModsManager mods = new ModsManager(opened.instanceDir());
+        String windowTitle = "Mods -- " + versionBox.getValue() + " (" + modLoaderBox.getValue() + ")"
+                + (opened.pack() == null ? "" : "  \u00b7  " + opened.pack().name);
         String mcVersion = versionBox.getValue();
         String modLoader = modLoaderBox.getValue();
 
@@ -6349,7 +7049,7 @@ public class LauncherApp extends Application {
             }
         });
 
-        fixBtn.setOnAction(e -> runFixIncompatibleMods(mods, fixBtn, fixStatus, refresh, mcVersion));
+        fixBtn.setOnAction(e -> runFixIncompatibleMods(mods, fixBtn, fixStatus, refresh, mcVersion, modLoader));
 
         deleteSelectedBtn.setOnAction(e -> {
             if (selectedFiles.isEmpty()) return;
@@ -6393,9 +7093,9 @@ public class LauncherApp extends Application {
         });
 
         fixSelectedBtn.setOnAction(e -> runFixOrUpdateSelected(
-                mods, selectedFiles, problemFiles, mcVersion, true, refresh, fixSelectedBtn));
+                mods, selectedFiles, problemFiles, mcVersion, modLoader, true, refresh, fixSelectedBtn));
         updateSelectedBtn.setOnAction(e -> runFixOrUpdateSelected(
-                mods, selectedFiles, problemFiles, mcVersion, false, refresh, updateSelectedBtn));
+                mods, selectedFiles, problemFiles, mcVersion, modLoader, false, refresh, updateSelectedBtn));
 
         VBox content = new VBox(12, dropZone, fixStatus, selectionBox, scroll, buttonRow);
         content.setPadding(new Insets(20));
@@ -6954,14 +7654,14 @@ public class LauncherApp extends Application {
      * {@link #runFixIncompatibleMods}.
      */
     private void runFixOrUpdateSelected(ModsManager mods, java.util.Set<String> selectedFiles,
-                                        java.util.Set<String> problemFiles, String mcVersion,
+                                        java.util.Set<String> problemFiles, String mcVersion, String loader,
                                         boolean fixOnly, Runnable refresh, Button triggerBtn) {
         if (mcVersion == null || mcVersion.isBlank() || selectedFiles.isEmpty()) return;
         List<String> targets = new ArrayList<>(selectedFiles);
         java.util.Set<String> problemsSnapshot = new java.util.LinkedHashSet<>(problemFiles);
-        // Read both on the FX thread (this method runs there); a background task must not read the UI.
-        boolean packManaged = ModpackMeta.read(currentInstanceDir()) != null;
-        String loader = modLoaderBox.getValue();
+        // mcVersion and loader are the ones the Mods window was opened for (never the live dropdowns, which
+        // may have moved on since), and packManaged asks the folder it was opened on -- so all three agree.
+        boolean packManaged = ModpackMeta.read(mods.instanceDir()) != null;
         triggerBtn.setDisable(true);
         Task<String> task = new Task<>() {
             @Override
@@ -7169,15 +7869,14 @@ public class LauncherApp extends Application {
      * </ul>
      */
     private void runFixIncompatibleMods(ModsManager mods, Button fixBtn, Label fixStatus,
-                                        Runnable refresh, String mcVersion) {
+                                        Runnable refresh, String mcVersion, String loader) {
         if (mcVersion == null || mcVersion.isBlank()) return;
         fixBtn.setDisable(true);
         fixStatus.setText("Checking each installed mod against Minecraft " + mcVersion + "...");
         fixStatus.setVisible(true);
         fixStatus.setManaged(true);
-        boolean packManaged = ModpackMeta.read(currentInstanceDir()) != null;
-        // Read on the FX thread (this method runs there); the background task must not touch the combo box.
-        String loader = modLoaderBox.getValue();
+        // loader/mcVersion are the ones the Mods window was opened for; packManaged asks that same folder.
+        boolean packManaged = ModpackMeta.read(mods.instanceDir()) != null;
         Task<String> task = new Task<>() {
             @Override
             protected String call() {
@@ -7353,6 +8052,9 @@ public class LauncherApp extends Application {
         final boolean[] west = new boolean[1], east = new boolean[1],
                        north = new boolean[1], south = new boolean[1];
         final boolean[] resizing = new boolean[1], dragging = new boolean[1];
+        final double DRAG_THRESHOLD = 6;  // px of movement a drag must clear before the window starts following the cursor
+        final boolean[] dragBegan = new boolean[1]; // true once the threshold was crossed (press is armed, real move begins)
+        final double[] prevActualX = new double[1], prevActualY = new double[1]; // stage coords at last re-anchor
         final boolean[] snapping = new boolean[1]; // window's top edge at the screen top -> maximize on release
         final double MAX_SNAP = 8;                // px from the screen's top edge that counts as "snap to full screen"
         final double[] prevBounds = new double[4]; // last non-maximized x,y,w,h, so a maximized window can be restored on grab / double-click
@@ -7506,7 +8208,7 @@ public class LauncherApp extends Application {
             // maximizes, and that maximize is skipped when the top edge was deliberately used to slide the
             // window off the top of the screen. The focus/hidden watchdogs clear these flags before they
             // call in here, so a watchdog teardown never snaps or maximizes.
-            if (dragging[0] && !win.isFullScreen()) {
+            if (dragBegan[0] && !win.isFullScreen()) {
                 if (snapEdge[0] != 0) applyHalfTile.run();
                 else if (snapping[0] && !topPushed[0]) win.setMaximized(true);
             }
@@ -7515,6 +8217,7 @@ public class LauncherApp extends Application {
             snapping[0] = false;
             snapEdge[0] = 0;
             topPushed[0] = false;
+            dragBegan[0] = false;
             applySnapCue.run();
             if (!win.isMaximized() && !win.isFullScreen()) {
                 prevBounds[0] = win.getX(); prevBounds[1] = win.getY();
@@ -7697,6 +8400,7 @@ public class LauncherApp extends Application {
                 stopPush.run();
                 topPushed[0] = false;
                 pushRefused[0] = false; // a new gesture gets a fresh chance, even after a refusal
+                dragBegan[0] = false;   // a fresh press hasn't crossed the drag threshold yet
                 if (snapEdge[0] != 0) { snapEdge[0] = 0; applySnapCue.run(); }
                 double[] p = new double[2];
                 readLocal.accept(e, p);
@@ -7718,6 +8422,7 @@ public class LauncherApp extends Application {
                     prevBounds[0] = win.getX(); prevBounds[1] = win.getY();
                     prevBounds[2] = win.getWidth(); prevBounds[3] = win.getHeight();
                     lastPtr[0] = e.getScreenX(); lastPtr[1] = e.getScreenY();
+                    prevActualX[0] = e.getScreenX(); prevActualY[0] = e.getScreenY();
                     dragging[0] = true; resizing[0] = false;
                     halfTiled[0] = false; // maximizing replaced any half-tile state
                     return;
@@ -7749,6 +8454,7 @@ public class LauncherApp extends Application {
                         halfTiled[0] = false;
                     }
                     lastPtr[0] = e.getScreenX(); lastPtr[1] = e.getScreenY();
+                    prevActualX[0] = e.getScreenX(); prevActualY[0] = e.getScreenY();
                     dragging[0] = true; resizing[0] = false;
                     // The edge gesture is armed by the drag events, never by the press alone: a plain
                     // click on a window sitting against an edge must not slide or tile it.
@@ -7808,15 +8514,42 @@ public class LauncherApp extends Application {
                     win.setWidth(nw);
                     win.setHeight(nh);
                 } else if (dragging[0]) {
-                    // Delta-based drag: move the window by the pointer's movement since the last event,
-                    // not by its absolute screen position. This keeps tracking smooth and lets the window
-                    // be moved to ANY position -- including partly below the bottom of the screen.
-                    double dx = e.getScreenX() - lastPtr[0];
-                    double dy = e.getScreenY() - lastPtr[1];
+                    // Absorb the first n px of movement as "still deciding if this is a click or a drag".
+                    // Only once the pointer has moved past DRAG_THRESHOLD do we move the window -- a
+                    // plain click on the title bar no longer shuffles it a few pixels. Once committed,
+                    // the re-anchor point is snapshotted as the anchor so the window tracks the pointer's
+                    // actual position rather than accumulating per-event deltas (which float-point errors
+                    // can make drift over a long drag). After that, each drag event re-anchors from the
+                    // pointer's actual position.
+                    if (!dragBegan[0]) {
+                        double moved = Math.hypot(e.getScreenX() - start[0], e.getScreenY() - start[1]);
+                        if (moved < DRAG_THRESHOLD) return;
+                        dragBegan[0] = true;
+                        // Rebase: the drag's effective origin is the press point, so the first real
+                        // movement carries the full distance travelled since the click.
+                        lastPtr[0] = start[0];
+                        lastPtr[1] = start[1];
+                        prevActualX[0] = start[0];
+                        prevActualY[0] = start[1];
+                    }
+                    // Move the window by anchoring it to the pointer's actual position -- this
+                    // eliminates the per-event delta summation that lets float-point error creep
+                    // in over a long drag (drift). The offset from pointer to window-origin is
+                    // snapshotted at the moment the threshold is crossed and re-based every event
+                    // afterwards, so an external nudge (e.g. the off-edge slide timer below) is
+                    // absorbed, not fought. checkBand still reads lastPtr for its edge test, so
+                    // keep it in lock-step with the pointer.
                     lastPtr[0] = e.getScreenX();
                     lastPtr[1] = e.getScreenY();
-                    win.setX(win.getX() + dx);
-                    win.setY(win.getY() + dy);
+                    double anchorX = e.getScreenX() - (prevActualX[0] - win.getX());
+                    double anchorY = e.getScreenY() - (prevActualY[0] - win.getY());
+                    win.setX(anchorX);
+                    win.setY(anchorY);
+                    // Re-anchor from the latest position so any external nudge (e.g. the off-edge
+                    // slide timer below) is absorbed into the anchor, not double-counted on the next
+                    // event.
+                    prevActualX[0] = e.getScreenX();
+                    prevActualY[0] = e.getScreenY();
 
                     // Drag-to-top maximize: when the window's top edge reaches the top of the screen under
                     // the pointer, flag it so release fills that screen's full bounds. Dragging back down
@@ -9602,6 +10335,7 @@ public class LauncherApp extends Application {
             // time, so it needs to be swapped out here too or the scale only visibly changes on the
             // window behind it until you close and reopen Settings.
             restyleWindow.run();
+            recomputeTopBarMinWidth(); // UI scale change shrinks/grows the top bar -- keep the floor in sync
             prefs.save();
         };
         uiScaleSlider.valueProperty().addListener((o, a, b) -> livePreview.run());
@@ -9779,8 +10513,12 @@ public class LauncherApp extends Application {
             allVersions.addAll(task.getValue());
             // Re-apply whichever tile is currently selected now that the real list is in --
             // before this, the dropdown only had SYNTHETIC_26 (and whatever a tile click added).
-            if (activePreset != null) applyVersionFilter(activePreset);
-            restoreLastPlayedVersion(); // correct the best-effort restore now that types are known
+            // A selected modpack profile owns the selectors (its own fixed version + loader): the arriving
+            // list must not rewrite them underneath it.
+            if (modpackSelection.attached() == null) {
+                if (activePreset != null) applyVersionFilter(activePreset);
+                restoreLastPlayedVersion(); // correct the best-effort restore now that types are known
+            }
             log("Loaded " + task.getValue().size() + " versions from Mojang.");
         });
         task.setOnFailed(e -> log("Failed to load version list: " + task.getException()));
@@ -9807,6 +10545,11 @@ public class LauncherApp extends Application {
         }
 
         String modLoader = modLoaderBox.getValue();
+        // Resolve what is selected to the instance that will run ONCE, here on the FX thread, and launch
+        // from this snapshot only. Anything the user changes in the dropdowns while the launch is
+        // downloading can't redirect it to a different folder or loader build than the one just clicked.
+        final ModpackSelection.Target launchTarget = currentLaunchTarget();
+        final boolean deyAtLaunch = deyMode;
         // Remember exactly what was played so the launcher reopens here next time.
         prefs.lastVersionId = versionId;
         prefs.lastDeyMode = deyMode;
@@ -9883,7 +10626,7 @@ public class LauncherApp extends Application {
                     // using it is what makes a pack run exactly as its author intended. If that build
                     // can't be installed any more, fall back to the newest stable one instead of
                     // failing the launch.
-                    String pinnedFabric = ModpackMeta.pinnedLoaderVersion(files.root, entry.id(), "Fabric");
+                    String pinnedFabric = launchTarget.pinnedLoaderVersion();
                     versionJson = null;
                     if (pinnedFabric != null) {
                         try {
@@ -9905,7 +10648,7 @@ public class LauncherApp extends Application {
                     // Same idea as Fabric above: a pack's own Forge build wins, otherwise the
                     // recommended/latest one. (Forge's installer is far too slow to retry blindly, so
                     // a pinned-but-broken build surfaces its own error rather than being retried here.)
-                    String forgeVersion = ModpackMeta.pinnedLoaderVersion(files.root, entry.id(), "Forge");
+                    String forgeVersion = launchTarget.pinnedLoaderVersion();
                     if (forgeVersion == null) forgeVersion = forge.recommendedOrLatestVersion(entry.id());
                     if (forgeVersion == null) throw new IllegalStateException(
                             "Forge has no build for " + entry.id() + " yet.");
@@ -9923,7 +10666,7 @@ public class LauncherApp extends Application {
                     // newest one NeoForge publishes FOR THIS Minecraft version -- stable preferred,
                     // beta only when that is all that exists yet (26.3's first builds are betas, and
                     // refusing them would mean "NeoForge doesn't work" on the newest version).
-                    String neoVersion = ModpackMeta.pinnedLoaderVersion(files.root, entry.id(), "NeoForge");
+                    String neoVersion = launchTarget.pinnedLoaderVersion();
                     if (neoVersion == null) neoVersion = neoForge.latestVersion(entry.id());
                     if (neoVersion == null) throw new IllegalStateException(
                             "NeoForge has no build for " + entry.id() + " yet.");
@@ -9943,17 +10686,37 @@ public class LauncherApp extends Application {
                 var prepared = files.prepare(versionJson,
                         f -> report.accept(0.30 + f * 0.56)); // download phase: 30% -> 86%
 
-                // Replace buggy libglfw.so (GLFW 3.4.0 in LWJGL 3.3.1) with fixed version (GLFW 3.4.1 in LWJGL 3.3.2+)
-                // for modpacks on Wayland sessions to avoid SIGSEGV in glfwCreateWindow.
-                // Sodium requires LWJGL 3.3.1 at runtime, so we keep the version JSON but patch the native JAR
-                // in the libraries directory BEFORE extraction, so LWJGL always gets the fixed version.
+                // Replace the buggy libglfw.so (GLFW 3.4.0 in LWJGL 3.3.1) with the fixed build
+                // (GLFW 3.4.1 from LWJGL 3.3.2) to avoid the SIGSEGV in glfwCreateWindow that
+                // crashes Minecraft on this Wayland session. This MUST run AFTER
+                // files.prepare()/extractNatives() has unpacked the natives directory.
+                //
+                // IMPORTANT: the game launches with -Dorg.lwjgl.system.SharedLibraryExtractPath=<natives>,
+                // so at startup LWJGL RE-EXTRACTS libglfw.so out of its native JAR into that directory,
+                // OVERWRITING the extracted file. Patching the on-disk file alone is therefore clobbered
+                // at runtime -- the stock 3.3.1 native is written back over the patched one and crashes
+                // again at libglfw.so+0x2257b. (Verified in a dead-run harness: natives/libglfw.so went
+                // 45b46d18 -> 8413d674 between patch-time and load-time, and hs_err re-appeared.)
+                // The correct target is the native JAR ITSELF: patchNativeGlfwInJar rewrites the
+                // libglfw.so entry in lwjgl-glfw-3.3.1-natives-linux.jar so LWJGL's runtime extraction
+                // yields the fixed .so. The extracted file is still patched below too, as a no-op
+                // belt-and-suspenders in case a future LWJGL ever skips extraction. Mojang's size-only
+                // download check (see GameFiles.downloadTo) merely re-fetches the original JAR on the next
+                // prepare() and we re-patch it, so this stays consistent across launches. Sodium requires
+                // LWJGL 3.3.1 at runtime, so the version JSON is kept as-is and only the native lib is
+                // swapped inside its 3.3.1 native JAR.
                 if (isLinuxWaylandSession() && WaylandSupport.usesBuggyLwjgl(versionJson)) {
-                    log("Patching native libglfw.so in libraries directory for Wayland compatibility");
-                    GameFiles.patchNativeGlfwInJar(files.root.resolve("libraries"), msg -> log(msg));
+                    log("Patching native libglfw.so for Wayland compat (GLFW 3.4.0 -> 3.4.1, JAR + extracted file)");
+                    GameFiles.patchNativeGlfwInJar(prepared.launcherRoot().resolve("libraries"), msg -> log(msg));
+                    WaylandSupport.patchNativeGlfw(prepared.nativesDir(), msg -> log(msg));
                 }
 
-                var gameDir = files.root.resolve("instances").resolve(entry.id()
-                        + (modLoader.equals("Vanilla") ? "" : "-" + modLoader.toLowerCase()));
+                // The instance this launch runs in: the attached pack's own folder, or the plain
+                // <version>[-<loader>] one -- decided once, at click time (launchTarget above).
+                var gameDir = launchTarget.instanceDir();
+                Platform.runLater(() -> log(launchTarget.pack() != null
+                        ? "Instance: " + gameDir.getFileName() + " (modpack \"" + launchTarget.pack().name + "\")"
+                        : "Instance: " + gameDir.getFileName()));
                 java.nio.file.Files.createDirectories(gameDir);
 
                 // Every DEY and VANILLA instance, any Minecraft version, shares one pool of
@@ -9982,10 +10745,28 @@ public class LauncherApp extends Application {
                     }
                 }
 
+                // ---- AWT/Swing prelaunch helper (Early Loading Bar's HeadlessException on Linux+Fabric).
+                // Unconditional on deyMode -- this fixes a Fabric+Linux platform issue that affects ANY
+                // installed modpack (VANILLA mode, like Rising Legends), not just DEY's own bundled mods.
+                // See AwtHelperInstaller for the full story; it only installs when this launch is Linux +
+                // Fabric AND the pack's own mods folder already carries the known trigger mod, so a pack
+                // that never opens an AWT window during startup is never handed a mod it has no use for. ----
+                try {
+                    String awtHelper = AwtHelperInstaller.ensureInstalled(
+                            System.getProperty("os.name", ""), modLoader, gameDir.resolve("mods"));
+                    if (awtHelper != null) {
+                        Platform.runLater(() -> log("Installed " + awtHelper
+                                + " (prevents Early Loading Bar's HeadlessException on Linux/Fabric)."));
+                    }
+                } catch (Exception awtEx) {
+                    String msg = awtEx.getMessage();
+                    Platform.runLater(() -> log("Couldn't install the AWT-init helper (continuing): " + msg));
+                }
+
                 // DeyCapes integration only receives public repository coordinates. Never copy a GitHub
                 // credential into a game instance: instance folders, logs and mod jars are user-accessible.
                 // Private cape repositories require a server-side/public proxy rather than a shipped token.
-                if (deyMode && modLoader.equals("Fabric") && deyCapesService != null && !"Vanilla".equals(modLoader)) {
+                if (deyAtLaunch && modLoader.equals("Fabric") && deyCapesService != null && !"Vanilla".equals(modLoader)) {
                     try {
                         var cfgDir = gameDir.resolve("config").resolve("deycapes");
                         java.nio.file.Files.createDirectories(cfgDir);
@@ -10003,7 +10784,7 @@ public class LauncherApp extends Application {
                     }
                 }
 
-                if (deyMode) {
+                if (deyAtLaunch) {
                     // All four bundled mods in one coordinated pass: Sodium/Iris are resolved as a
                     // COMPATIBLE pair (never "the newest of each" independently -- that is the DEY 26.2
                     // crash), Fabric API is newest, DeyCapes stays the local bundled jar. See ModPairResolver.
@@ -10127,14 +10908,22 @@ public class LauncherApp extends Application {
      * static check DeyLauncher can do ahead of time. In every one of these cases it is native Wayland
      * itself that broke this run, and the only real fix is running THIS launch through XWayland instead
      * -- see {@link #retrySettings}.
+     *
+     * <p>{@code awtNoDisplay} is the one failure that is never retried: a Java mod's own AWT/Swing window
+     * (Early Loading Bar) had no X display to be drawn in (see
+     * {@link LaunchDiagnostics#isAwtNoDisplayFailure}). Neither launch switch can give AWT a display, the
+     * game itself is unaffected, and {@link #retrySettings} explains that at length.
      */
-    private record LaunchOutcome(int exit, String diagnosis, boolean nativeWaylandBackfired) {}
+    private record LaunchOutcome(int exit, String diagnosis, boolean nativeWaylandBackfired,
+                                 boolean awtNoDisplay) {}
 
     /**
      * The single retry worth making after a failed run, or null when a retry would change nothing.
      *
      * <p>Only fires when {@link LaunchDiagnostics} actually recognized a graphics/window failure (a normal
-     * exit diagnoses nothing). The preference order is deliberate:
+     * exit diagnoses nothing). A Java mod's AWT/Swing window failure is recognized but never retried (see
+     * the first check in the body): no launch switch can give AWT a display it doesn't have. The
+     * preference order is deliberate:
      * <ol>
      *   <li><b>Turn native Wayland back OFF</b> -- when THIS run already had it on and it is what crashed
      *       ({@link LaunchOutcome#nativeWaylandBackfired}). Checked first and unconditionally, because
@@ -10155,6 +10944,14 @@ public class LauncherApp extends Application {
     private GameLauncher.LaunchSettings retrySettings(LaunchOutcome first, GameLauncher.LaunchSettings settings,
                                                       GameFiles.PreparedVersion prepared) {
         if (first.diagnosis() == null) return null;
+
+        // A Java mod that found no display to open its window in (Early Loading Bar with no reachable X
+        // server: see LaunchDiagnostics#isAwtNoDisplayFailure) cannot be helped by either switch below.
+        // Mesa's software renderer gives the game a window through llvmpipe; GLFW's Wayland backend gives
+        // it one through Wayland. Neither gives Java's AWT -- which has no Wayland backend and can only
+        // draw through X11 -- an X display it does not have, so the retry would burn another full game
+        // start to reproduce the identical HeadlessException. The diagnosis names the real remedies.
+        if (first.awtNoDisplay()) return null;
 
         // Checked FIRST and unconditionally: this run already had native Wayland on and it is what
         // crashed (see LaunchOutcome#nativeWaylandBackfired's doc) -- e.g. a MODPACK pinned to an older
@@ -10242,7 +11039,11 @@ public class LauncherApp extends Application {
         boolean nativeWaylandBackfired = s.nativeWayland()
                 && (LaunchDiagnostics.isNativeWaylandBackfire(recentList)
                     || LaunchDiagnostics.isGlfwWindowLayerCrash(recentList));
-        return new LaunchOutcome(exit, diagnosis, nativeWaylandBackfired);
+        // A Java mod with no display to draw in is the one failure no launch switch can move: it is not a
+        // graphics fault, and neither the software renderer nor GLFW's Wayland backend gives AWT an X
+        // display it doesn't have. Flagged so retrySettings does not waste a second full game start on it.
+        boolean awtNoDisplay = LaunchDiagnostics.isAwtNoDisplayFailure(recentList);
+        return new LaunchOutcome(exit, diagnosis, nativeWaylandBackfired, awtNoDisplay);
     }
 
     // ---- Cross-platform icon helpers ----
@@ -10467,15 +11268,20 @@ public class LauncherApp extends Application {
 
     /** Loads a cached icon tile: JavaFX natively for PNG/etc, ImageIO (twelvemonkeys) for WebP leftovers. */
     private javafx.scene.image.Image decodeCachedIcon(java.nio.file.Path iconPath) {
+        // JavaFX does not throw for an image it can't decode -- it returns one flagged isError() -- so that
+        // is what has to be checked before falling back to ImageIO (WebP leftovers etc.). Returning the
+        // errored image used to leave a blank tile over the placeholder glyph.
         try {
-            return new javafx.scene.image.Image(iconPath.toUri().toString());
+            javafx.scene.image.Image fx = new javafx.scene.image.Image(iconPath.toUri().toString());
+            if (!fx.isError() && fx.getWidth() > 0) return fx;
         } catch (Exception notNative) {
-            try {
-                java.awt.image.BufferedImage bi = javax.imageio.ImageIO.read(iconPath.toFile());
-                return bi == null ? null : bufferedToFx(bi);
-            } catch (Exception e) {
-                return null;
-            }
+            // fall through to ImageIO
+        }
+        try {
+            java.awt.image.BufferedImage bi = javax.imageio.ImageIO.read(iconPath.toFile());
+            return bi == null ? null : bufferedToFx(bi);
+        } catch (Exception e) {
+            return null;
         }
     }
 

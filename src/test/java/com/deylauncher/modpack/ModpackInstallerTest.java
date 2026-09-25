@@ -115,4 +115,40 @@ class ModpackInstallerTest {
         return "{\"minecraft\":{\"version\":\"1.20.1\"},\"name\":\"" + name + "\","
                 + "\"files\":[{\"projectID\":" + projectId + ",\"fileID\":" + fileId + ",\"required\":true}]}";
     }
+
+    @Test
+    void twoPacksForTheSameVersionAndLoaderStayIsolatedOnDisk(@TempDir Path root, @TempDir Path packs) throws Exception {
+        Path packA = packs.resolve("pack-a");
+        Files.createDirectories(packA);
+        Files.writeString(packA.resolve("modlist.html"),
+                "<ul><li><a href=\"https://www.curseforge.com/minecraft/mc-mods/a\">Mod A</a></li></ul>");
+        Files.writeString(packA.resolve("manifest.json"), manifestFor("Pack A", 1, 101));
+        Path packB = packs.resolve("pack-b");
+        Files.createDirectories(packB);
+        Files.writeString(packB.resolve("modlist.html"),
+                "<ul><li><a href=\"https://www.curseforge.com/minecraft/mc-mods/b\">Mod B</a></li></ul>");
+        Files.writeString(packB.resolve("manifest.json"), manifestFor("Pack B", 2, 202));
+
+        CurseForgeFiles cf = new CurseForgeFiles(null, url -> url.contains("/101")
+                ? "{\"data\":{\"fileName\":\"mod-a.jar\",\"fileLength\":4,\"gameVersions\":[\"Client\",\"1.20.1\"]}}"
+                : "{\"data\":{\"fileName\":\"mod-b.jar\",\"fileLength\":4,\"gameVersions\":[\"Client\",\"1.20.1\"]}}");
+        ModpackInstaller installer = new ModpackInstaller(
+                new ModpackResolver(cf, new ModrinthClient()), ModpackVerifierTest.WRITER);
+
+        // Exactly what the launcher does: ask installDirFor where each pack goes.
+        Path dirA = ModpackMeta.installDirFor(root, "Pack A", "1.20.1", "Forge");
+        assertTrue(installer.installForClient(ModpackReader.read(packA), "1.20.1", "Forge", dirA, null, null).ok());
+        Path dirB = ModpackMeta.installDirFor(root, "Pack B", "1.20.1", "Forge");
+        assertTrue(installer.installForClient(ModpackReader.read(packB), "1.20.1", "Forge", dirB, null, null).ok());
+
+        assertFalse(dirA.equals(dirB));
+        assertTrue(Files.exists(dirA.resolve("mods/mod-a.jar")));
+        assertFalse(Files.exists(dirA.resolve("mods/mod-b.jar")), "Pack B's mods must not leak into Pack A");
+        assertTrue(Files.exists(dirB.resolve("mods/mod-b.jar")));
+        assertFalse(Files.exists(dirB.resolve("mods/mod-a.jar")), "Pack A's mods must not leak into Pack B");
+
+        assertEquals("Pack A", ModpackMeta.read(dirA).name);
+        assertEquals(dirB, ModpackMeta.read(dirB).instanceDir(root), "each record resolves back to its own folder");
+        assertEquals(2, ModpackMeta.listInstalled(root).size());
+    }
 }
