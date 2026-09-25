@@ -21,7 +21,7 @@ The embedded token belongs to the public DeyLauncher bot account `onpishi` / `De
 If your group wants its own private friends repo instead of the shared public one:
 
 1. Create a fine-grained PAT on the bot account: `Settings` > `Developer settings` > `Personal access tokens` > `Fine-grained tokens` > `Generate new token`. Repository access: only your private repo. Permissions: Contents -> Read and write. No other permission. Set a reasonable expiration.
-2. Add that token to the deyrownnt/DeyLauncher repo as the secret named `DEYLAUNCHER_GITHUB_PROPS`. The value may be just the token itself, or a full `key=value` properties block (`token`, `owner`, `repo`, `friendsPath`, and so on).
+2. Add that token to the deyrownnt/DeyLauncher repo as the secret named `DEYLAUNCHER_GITHUB_TOKEN`. The value may be just the token itself, or a full `key=value` properties block (`token`, `owner`, `repo`, `friendsPath`, and so on).
 3. CI reads that secret at build time and bakes it into `deylauncher-backend.dat` via the `embedGithubCredentials` Gradle task. The token never lives in the repository: it comes only from the GitHub secret at build time.
 
 A single user can also point just their own install at a different backend by writing `~/.deylauncher/github.properties`:

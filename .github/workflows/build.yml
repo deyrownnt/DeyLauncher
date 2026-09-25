@@ -24,17 +24,17 @@ jobs:
 
       - name: Check whether the shared Friends backend is configured
         env:
-          DEYLAUNCHER_GITHUB_PROPS: ${{ secrets.DEYLAUNCHER_GITHUB_PROPS }}
+          DEYLAUNCHER_GITHUB_TOKEN: ${{ secrets.DEYLAUNCHER_GITHUB_TOKEN }}
         run: |
-          if [ -z "$DEYLAUNCHER_GITHUB_PROPS" ]; then
-            echo "::warning title=No shared Friends backend::Repository secret DEYLAUNCHER_GITHUB_PROPS is not set, so Friends/capes/option-kits will show 'not set up' in this build."
+          if [ -z "$DEYLAUNCHER_GITHUB_TOKEN" ]; then
+            echo "::warning title=No shared Friends backend::Repository secret DEYLAUNCHER_GITHUB_TOKEN is not set, so Friends/capes/option-kits will show 'not set up' in this build."
           else
             echo "Shared Friends backend: configured (the value is never printed)."
           fi
 
       - name: Build
         env:
-          DEYLAUNCHER_GITHUB_PROPS: ${{ secrets.DEYLAUNCHER_GITHUB_PROPS }}
+          DEYLAUNCHER_GITHUB_TOKEN: ${{ secrets.DEYLAUNCHER_GITHUB_TOKEN }}
         run: ./gradlew clean prepareJpackage
 
       - name: Create Linux app-image
@@ -93,17 +93,17 @@ jobs:
       - name: Check whether the shared Friends backend is configured
         shell: pwsh
         env:
-          DEYLAUNCHER_GITHUB_PROPS: ${{ secrets.DEYLAUNCHER_GITHUB_PROPS }}
+          DEYLAUNCHER_GITHUB_TOKEN: ${{ secrets.DEYLAUNCHER_GITHUB_TOKEN }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:DEYLAUNCHER_GITHUB_PROPS)) {
-            Write-Warning 'Repository secret DEYLAUNCHER_GITHUB_PROPS is not set, so Friends/capes/option-kits will show ''not set up'' in this build.'
+          if ([string]::IsNullOrWhiteSpace($env:DEYLAUNCHER_GITHUB_TOKEN)) {
+            Write-Warning 'Repository secret DEYLAUNCHER_GITHUB_TOKEN is not set, so Friends/capes/option-kits will show ''not set up'' in this build.'
           } else {
             Write-Host 'Shared Friends backend: configured (the value is never printed).'
           }
 
       - name: Build
         env:
-          DEYLAUNCHER_GITHUB_PROPS: ${{ secrets.DEYLAUNCHER_GITHUB_PROPS }}
+          DEYLAUNCHER_GITHUB_TOKEN: ${{ secrets.DEYLAUNCHER_GITHUB_TOKEN }}
         run: .\gradlew.bat clean prepareJpackage
 
       - name: Create Windows app-image

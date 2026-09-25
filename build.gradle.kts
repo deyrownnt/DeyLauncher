@@ -123,7 +123,7 @@ tasks.processResources {
 // Baked into the app so a freshly downloaded launcher has all of those working with NO key and NO
 // file from the user. Source priority:
 //
-//   1. the CI secret, exposed as the environment variable DEYLAUNCHER_GITHUB_PROPS
+//   1. the CI secret, exposed as the environment variable DEYLAUNCHER_GITHUB_TOKEN
 //      (GitHub -> Settings -> Secrets and variables -> Actions). This is why no token is ever
 //      committed to the repository.
 //   2. secrets/embedded-github.properties on the developer's own machine (git-ignored).
@@ -153,7 +153,7 @@ val embedGithubCredentials = tasks.register("embedGithubCredentials") {
     outputs.upToDateWhen { false }
 
     doLast {
-        val fromEnv = System.getenv("DEYLAUNCHER_GITHUB_PROPS")
+        val fromEnv = System.getenv("DEYLAUNCHER_GITHUB_TOKEN")
         val secretFile = file("secrets/embedded-github.properties")
         val raw = when {
             !fromEnv.isNullOrBlank() -> fromEnv
@@ -163,7 +163,7 @@ val embedGithubCredentials = tasks.register("embedGithubCredentials") {
         if (raw.isNullOrBlank()) {
             outFile.delete()
             logger.lifecycle("DeyLauncher: no shared GitHub backend configured for this build -- " +
-                    "Friends will show 'not set up'. Set the DEYLAUNCHER_GITHUB_PROPS secret " +
+                    "Friends will show 'not set up'. Set the DEYLAUNCHER_GITHUB_TOKEN secret " +
                     "(CI) or create secrets/embedded-github.properties (local).")
             return@doLast
         }
