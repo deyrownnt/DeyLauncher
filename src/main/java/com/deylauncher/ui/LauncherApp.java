@@ -9415,20 +9415,11 @@ public class LauncherApp extends Application {
 
         HBox actionRow = new HBox(10, importBtn, removeBtn);
         actionRow.setAlignment(Pos.CENTER);
-        Button applyCapeBtn = new Button();
-        setButtonIcon(
-                applyCapeBtn,
-                IconFactory.Icon.CHECK,
-                "APPLY CAPE"
-        );
-        applyCapeBtn.getStyleClass().add("settings-apply-button");
-        updateCapeApplyButton(applyCapeBtn);
-        right.getChildren().addAll(previewHost, modelRow, actionRow, applyCapeBtn, capeLimitNote);
+        right.getChildren().addAll(previewHost, modelRow, actionRow, capeLimitNote);
 
         Runnable[] refresh = new Runnable[1];
-        refresh[0] = () -> refreshSkinsTab(profilesBox, capesBox, deyCapesBox, refresh, classicBtn, slimBtn, applyCapeBtn);
+        refresh[0] = () -> refreshSkinsTab(profilesBox, capesBox, deyCapesBox, refresh, classicBtn, slimBtn);
         refresh[0].run();
-        applyCapeBtn.setOnAction(e -> onApplyCape(applyCapeBtn, refresh));
 
         modelGroup.selectedToggleProperty().addListener((o, a, b) -> {
             PlayerIdentity act = identityStore.getActive();
@@ -9451,7 +9442,7 @@ public class LauncherApp extends Application {
 
     /** Rebuilds skin profile rows, cape rows, and the 3D preview from current disk/account state. */
     private void refreshSkinsTab(TilePane profilesBox, TilePane capesBox, TilePane deyCapesBox, Runnable[] refresh,
-                                  RadioButton classicBtn, RadioButton slimBtn, Button applyCapeBtn) {
+                                  RadioButton classicBtn, RadioButton slimBtn) {
         profilesBox.getChildren().clear();
         capesBox.getChildren().clear();
         deyCapesBox.getChildren().clear();
@@ -9464,7 +9455,7 @@ public class LauncherApp extends Application {
             profilesBox.getChildren().add(none);
             skinPreview.update(defaultSteveImage(), SkinModel.CLASSIC, null);
             capeDirty = false;
-            updateCapeApplyButton(applyCapeBtn);
+
             Label deyNone = new Label("Set up an account to manage Dey capes.");
             deyNone.getStyleClass().add("notice-label");
             deyNone.setWrapText(true);
@@ -9545,7 +9536,7 @@ public class LauncherApp extends Application {
                     }
                     Button noneTile = skinTile("No cape", transparentCapeImage(), selectedCapeId == null);
                     noneTile.getStyleClass().add("cape-tile");
-                    noneTile.setOnAction(ev -> chooseNoCape(applyCapeBtn, refresh));
+                    noneTile.setOnAction(ev -> chooseNoCape(refresh));
                     capesBox.getChildren().add(noneTile);
                     for (var cape : result.capes()) {
                         // Load the source sheet once, but show only its front cape panel in
@@ -9556,10 +9547,9 @@ public class LauncherApp extends Application {
                         }
                         Button tile = skinTile(cape.alias(), capeFrontImage(image), cape.id().equals(selectedCapeId));
                         tile.getStyleClass().add("cape-tile");
-                        tile.setOnAction(ev -> chooseCape(cape, image, applyCapeBtn, refresh));
+                        tile.setOnAction(ev -> chooseCape(cape, image, refresh));
                         capesBox.getChildren().add(tile);
                     }
-                    updateCapeApplyButton(applyCapeBtn);
                 }
             });
             task.setOnFailed(e -> {
@@ -9573,7 +9563,7 @@ public class LauncherApp extends Application {
         }
 
         // ---- Dey capes: github-backed, owned-only, rendered by the DeyCapes mod ----
-        refreshDeyCapes(deyCapesBox, active, applyCapeBtn, refresh);
+        refreshDeyCapes(deyCapesBox, active, refresh);
 
         // ---- 3D preview ----
         java.nio.file.Path skinPath = identityStore.skinFile(active.uuid);
@@ -9590,7 +9580,7 @@ public class LauncherApp extends Application {
     private record DeyCapeRow(String id, String name, Image image) {}
 
     /** Populates the DEY CAPES section: only capes the active player owns, per the github ownership file. */
-    private void refreshDeyCapes(TilePane deyCapesBox, PlayerIdentity active, Button applyCapeBtn, Runnable[] refresh) {
+    private void refreshDeyCapes(TilePane deyCapesBox, PlayerIdentity active, Runnable[] refresh) {
         if (deyCapesService == null || !deyCapesService.configured()) {
             Label note = new Label("Dey capes need GitHub set up (see GITHUB_SETUP.md in the repo root).");
             note.getStyleClass().add("notice-label");
@@ -9638,7 +9628,7 @@ public class LauncherApp extends Application {
                 boolean selected = row.id.equals(selectedCapeId);
                 Button tile = skinTile(row.name, row.image, selected);
                 tile.getStyleClass().add("cape-tile");
-                tile.setOnAction(ev -> chooseDeyCape(row.id, row.image, applyCapeBtn, refresh));
+                                tile.setOnAction(ev -> chooseDeyCape(row.id, row.image, refresh));
                 deyCapesBox.getChildren().add(tile);
             }
         });
@@ -9684,53 +9674,36 @@ public class LauncherApp extends Application {
         return tile;
     }
 
-    /** Picks a cape locally. Mojang is contacted only by the explicit Apply button. */
-    private void chooseCape(MinecraftSkinService.CapeInfo cape, Image image, Button applyCapeBtn, Runnable[] refresh) {
+    /** Picks a cape locally. Auto-applies on selection (no separate Apply button). */
+    private void chooseCape(MinecraftSkinService.CapeInfo cape, Image image, Runnable[] refresh) {
         selectedCapeId = cape.id();
         selectedCapeImage = image;
         capeDirty = !java.util.Objects.equals(selectedCapeId, equippedCapeId);
-        updateCapeApplyButton(applyCapeBtn);
         refresh[0].run();
+        onApplyCape(refresh);
     }
 
-    private void chooseDeyCape(String deyCapeId, Image image, Button applyCapeBtn, Runnable[] refresh) {
+    private void chooseDeyCape(String deyCapeId, Image image, Runnable[] refresh) {
         selectedCapeId = deyCapeId;
         selectedCapeImage = image;
         capeDirty = !java.util.Objects.equals(selectedCapeId, equippedCapeId);
-        updateCapeApplyButton(applyCapeBtn);
         refresh[0].run();
+        onApplyCape(refresh);
     }
 
-    private void chooseNoCape(Button applyCapeBtn, Runnable[] refresh) {
+    private void chooseNoCape(Runnable[] refresh) {
         selectedCapeId = null;
         selectedCapeImage = null;
         capeDirty = equippedCapeId != null;
-        updateCapeApplyButton(applyCapeBtn);
         refresh[0].run();
+        onApplyCape(refresh);
     }
 
-    private void updateCapeApplyButton(Button button) {
-        button.getStyleClass().remove("settings-apply-button-ready");
-        if (capeDirty) {
-            button.getStyleClass().add("settings-apply-button-ready");
-            button.setDisable(false);
-            setButtonIcon(
-                button,
-                IconFactory.Icon.CHECK,
-                "APPLY CAPE CHANGE"
-            );
-        } else {
-            button.setDisable(true);
-            setButtonIcon(
-                button,
-                IconFactory.Icon.CHECK,
-                "CAPE APPLIED"
-            );
-        }
-    }
-
-    /** Commits the staged cape selection with one request, avoiding rate-limit spam. */
-    private void onApplyCape(Button applyCapeBtn, Runnable[] refresh) {
+    /** Applies the selected cape immediately: Dey capes are committed by writing the equipped
+     * cape to the shared GitHub file (never touching the player's real Mojang account); Mojang
+     * capes contact the skin service. The staged-selection guard skips a no-op apply (re-selecting
+     * the cape you already have, or clearing while nothing is equipped). */
+    private void onApplyCape(Runnable[] refresh) {
         if (!capeDirty) return;
         final String targetCapeId = selectedCapeId;
         final PlayerIdentity active = identityStore.getActive();
@@ -9762,10 +9735,9 @@ public class LauncherApp extends Application {
                 if (result.success()) {
                     equippedCapeId = targetCapeId;
                     capeDirty = false;
-                    updateCapeApplyButton(applyCapeBtn);
                     refresh[0].run();
                 } else {
-                    new Alert(Alert.AlertType.WARNING, result.message() + " Your selection is still ready to Apply.", ButtonType.OK).showAndWait();
+                    new Alert(Alert.AlertType.WARNING, result.message() + " The cape was not changed.", ButtonType.OK).showAndWait();
                 }
             });
             task.setOnFailed(e -> new Alert(Alert.AlertType.WARNING,
@@ -9787,10 +9759,9 @@ public class LauncherApp extends Application {
             if (result.success()) {
                 equippedCapeId = targetCapeId;
                 capeDirty = false;
-                updateCapeApplyButton(applyCapeBtn);
                 refresh[0].run();
             } else {
-                new Alert(Alert.AlertType.WARNING, result.message() + " Your selection is still ready to Apply.", ButtonType.OK).showAndWait();
+                new Alert(Alert.AlertType.WARNING, result.message() + " The cape was not changed.", ButtonType.OK).showAndWait();
             }
         });
         task.setOnFailed(e -> new Alert(Alert.AlertType.WARNING,
@@ -10781,7 +10752,34 @@ public class LauncherApp extends Application {
                             cfg.store(out, "DeyCapes public repository settings");
                         }
                     } catch (Exception cfgEx) {
-                        Platform.runLater(() -> log("Couldn't write DeyCapes config (continuing without remote capes): " + cfgEx.getMessage()));
+                                                Platform.runLater(() -> log("Couldn't write DeyCapes config (continuing without remote capes): " + cfgEx.getMessage()));
+                    }
+
+                    // Best-effort diagnostic: the in-game DeyCapes mod fetches the cape repo
+                    // ANONYMOUSLY (no GitHub token is ever written into a game instance -- see the
+                    // comment above), so a private or empty repo 401/403/404s inside the mod and Dey
+                    // capes never render in Minecraft, even though the launcher writes ownership
+                    // fine via the embedded token. Probe anonymously so this silent in-game
+                    // failure surfaces in the launcher log instead.
+                    String dcOwner = deyCapesService.gitConfig().owner();
+                    String dcRepo = deyCapesService.gitConfig().repo();
+                    String dcCapesDir = deyCapesService.gitConfig().capesDir();
+                    var dcClient = java.net.http.HttpClient.newHttpClient(); try {
+                        var dcResp = dcClient.send(
+                                java.net.http.HttpRequest.newBuilder(
+                                        java.net.URI.create("https://api.github.com/repos/"
+                                                + dcOwner + "/" + dcRepo + "/contents/" + dcCapesDir))
+                                        .header("Accept", "application/vnd.github+json")
+                                        .GET().build(),
+                                java.net.http.HttpResponse.BodyHandlers.ofString());
+                        if (dcResp.statusCode() == 401 || dcResp.statusCode() == 403 || dcResp.statusCode() == 404) {
+                            Platform.runLater(() -> log("DEY CAPES: the in-game DeyCapes mod cannot read " + dcOwner + "/" + dcRepo
+                                    + " anonymously (HTTP " + dcResp.statusCode() + "). That repo is private or empty -- the mod never "
+                                    + "receives a token, so Dey capes won't render in Minecraft. Make the repo PUBLIC on GitHub, "
+                                    + "or run a server-side proxy. (The launcher still writes cape ownership via its embedded token.)"));
+                        }
+                    } catch (Exception ignored) {
+                        // Best-effort probe; never block launch over it.
                     }
                 }
 
