@@ -40,25 +40,10 @@ public class GitHubConfig {
      */
     private static final String EMBEDDED_KEY = "DeyLauncher-backend-v1";
 
-    /**
-     * Repository holding the PUBLIC cape data ({@code capes.json} + the cape PNGs) that the in-game
-     * DeyCapes mod reads anonymously. It is deliberately separate from the private friends repo: the
-     * mod never receives a GitHub token, so the cape data has to live somewhere world-readable while
-     * {@code friends.json} / {@code options-kits.json} / {@code capes-owned.json} stay private.
-     */
-    public static final String DEFAULT_CAPES_REPO = "DeyLauncher-Capes";
-
     public final String token;
     public final String owner;
     public final String repo;
     public final String friendsPath;
-    /**
-     * Owner of the PUBLIC Dey-cape repository (defaults to {@link #owner}). Split out so the cape data
-     * can be world-readable for the in-game mod while everything else stays in the private repo.
-     */
-    public final String capesOwner;
-    /** PUBLIC Dey-cape repository holding {@code capes.json} + the PNGs (default {@link #DEFAULT_CAPES_REPO}). */
-    public final String capesRepo;
     /** Live equipped-cape map for DeyCapes (default "capes.json"). */
     public final String capesPath;
     /** Who-owns-what audit file for Dey capes (default "capes-owned.json"). */
@@ -69,14 +54,11 @@ public class GitHubConfig {
     public final String optionsKitsPath;
 
     private GitHubConfig(String token, String owner, String repo, String friendsPath,
-                         String capesOwner, String capesRepo,
                          String capesPath, String capesOwnedPath, String capesDir, String optionsKitsPath) {
         this.token = token;
         this.owner = owner;
         this.repo = repo;
         this.friendsPath = friendsPath;
-        this.capesOwner = capesOwner;
-        this.capesRepo = capesRepo;
         this.capesPath = capesPath;
         this.capesOwnedPath = capesOwnedPath;
         this.capesDir = capesDir;
@@ -111,8 +93,8 @@ public class GitHubConfig {
 
     /** The "no backend at all" config, keeping the default repo paths so features degrade predictably. */
     private static GitHubConfig unconfigured() {
-        return new GitHubConfig(null, null, null, "friends.json", null, DEFAULT_CAPES_REPO,
-                "capes.json", "capes-owned.json", "capes", "options-kits.json");
+        return new GitHubConfig(null, null, null, "friends.json", "capes.json", "capes-owned.json",
+                "capes", "options-kits.json");
     }
 
     /** The build-embedded credentials, de-obfuscated; null when this build carries none. */
@@ -168,26 +150,16 @@ public class GitHubConfig {
         return props;
     }
 
-    /** Package-private so a test can pin how a properties block resolves (incl. the cape-repo split). */
-    static GitHubConfig fromProperties(Properties props) {
-        String owner = props.getProperty("owner");
+    private static GitHubConfig fromProperties(Properties props) {
         return new GitHubConfig(
                 props.getProperty("token"),
-                owner,
+                props.getProperty("owner"),
                 props.getProperty("repo"),
                 props.getProperty("friendsPath", "friends.json"),
-                // Cape data defaults to the public cape repo on the same account, so a properties file
-                // that only names the private friends repo still puts capes somewhere DeyCapes can read.
-                orDefault(props.getProperty("capesOwner"), owner),
-                orDefault(props.getProperty("capesRepo"), DEFAULT_CAPES_REPO),
                 props.getProperty("capesPath", "capes.json"),
                 props.getProperty("capesOwnedPath", "capes-owned.json"),
                 props.getProperty("capesDir", "capes"),
                 props.getProperty("optionsKitsPath", "options-kits.json")
         );
-    }
-
-    private static String orDefault(String value, String fallback) {
-        return (value == null || value.isBlank()) ? fallback : value;
     }
 }

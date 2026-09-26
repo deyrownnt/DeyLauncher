@@ -13,7 +13,7 @@ group = "com.deylauncher"
 // Single source of truth for the app version. It is baked into the jar/resource that
 // AppUpdater.currentVersion() reads at runtime, so the self-updater always knows exactly
 // which version is installed -- and CI's jpackage step discovers this same fat jar by name.
-version = "0.1.10"
+version = "0.1.11"
 
 repositories {
     mavenCentral()
@@ -169,8 +169,7 @@ val embedGithubCredentials = tasks.register("embedGithubCredentials") {
         }
         // A bare token is accepted too, so the secret only has to hold the PAT itself.
         val propsText = if (raw.contains('=')) raw.trim() + "\n" else
-            "token=${raw.trim()}\nowner=onpishi\nrepo=DeyLauncher-Friends\nfriendsPath=friends.json\n" +
-                    "capesOwner=onpishi\ncapesRepo=DeyLauncher-Capes\n"
+            "token=${raw.trim()}\nowner=onpishi\nrepo=DeyLauncher-Friends\nfriendsPath=friends.json\n"
         outFile.parentFile.mkdirs()
         outFile.writeText(packEmbeddedBackend(propsText))
         logger.lifecycle("DeyLauncher: embedded the shared GitHub backend into this build " +

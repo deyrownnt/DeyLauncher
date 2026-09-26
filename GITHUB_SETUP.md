@@ -14,27 +14,7 @@ Because of step 2, every distributed DeyLauncher build ships with working Friend
 
 ## The shared backend token
 
-The embedded token belongs to the DeyLauncher bot account `onpishi`. It is the same fine-grained PAT the project already keeps in its GitHub secrets and uses to publish releases, so it is safe to embed (Contents read and write to the two repos below, no other scope). The token is never logged and never copied into a Minecraft instance.
-
-## Two repositories: private launcher data vs public cape data
-
-| Repository | Visibility | Holds | Written by | Read by |
-|---|---|---|---|---|
-| `onpishi/DeyLauncher-Friends` | **private** | `friends.json`, `options-kits.json`, `capes-owned.json` | DeyLauncher (embedded token) | DeyLauncher only |
-| `onpishi/DeyLauncher-Capes` | **public** | `capes.json`, `capes/*.png` | DeyLauncher (embedded token) | DeyLauncher **and the in-game DeyCapes mod** |
-
-The split exists because the in-game DeyCapes mod fetches its data **anonymously**: it is never given the
-GitHub token, by design, since a token copied into a game instance is readable by anyone who can open the
-instance folder. So the data the mod needs lives in a public repository and everything private stays
-private. `capes.json` (the equipped-cape map plus the cape catalog) and the cape PNGs are public on
-purpose -- they are exactly the shared data every player's client has to be able to fetch. The
-`capes-owned.json` ownership audit is *not* needed by the mod, so it stays in the private repo, and no part
-of this ever touches a player's real Mojang account.
-
-The parameters are `capesOwner` / `capesRepo` (default `onpishi` / `DeyLauncher-Capes`); `owner` / `repo`
-still name the private repo. A properties file that mentions only `owner`/`repo` therefore still resolves
-capes to the public cape repo, which is what keeps a minimal backend file from silently pointing DeyCapes
-at a private repo.
+The embedded token belongs to the public DeyLauncher bot account `onpishi` / `DeyLauncher-Friends`. It is the same fine-grained PAT the project already keeps in its GitHub secrets and uses to publish releases, so it is safe to embed (Contents read and write to that one repo, no other scope). The token is never logged and never copied into a Minecraft instance.
 
 ## Running your own backend (optional, for group organizers)
 
@@ -51,11 +31,6 @@ token=github_pat_...
 owner=your-bot-account
 repo=your-private-repo
 friendsPath=friends.json
-# Optional: where the PUBLIC cape data lives. Defaults to <owner>/DeyLauncher-Capes.
-# If you point this somewhere else it must be a PUBLIC repo, because the in-game mod
-# reads it with no credentials at all.
-capesOwner=your-bot-account
-capesRepo=your-public-capes-repo
 ```
 
 Restart DeyLauncher (or open Friends) and it picks the local override up automatically.
