@@ -11,15 +11,24 @@ import java.util.UUID;
 
 /**
  * High-level operations the launcher's Skins tab needs for Dey capes, all backed
- * by the shared GitHub repo (see {@link CapesRepository}). Everything here is
+ * by GitHub (see {@link CapesRepository}). Everything here is
  * deliberately additive to the existing Mojang-capes flow: Dey capes are a
  * DeyLauncher/DeyCapes-mod-only feature and never touch the player's real Mojang
  * account.
+ *
+ * <p>Two repositories, one token, because the in-game mod reads its data
+ * ANONYMOUSLY (it is never given a token): the live catalog + equipped map +
+ * cape PNGs go to the PUBLIC cape repo so DeyCapes can read them, while the
+ * who-owns-what audit file stays in the private friends repo. Both are written
+ * with the same embedded launcher credential.
  */
 public class DeyCapesService {
 
     private final GitHubConfig config;
+    /** PUBLIC cape repo: {@code capes.json} + the {@code capes/*.png} textures DeyCapes downloads. */
     private final CapesRepository repo;
+    /** PRIVATE (friends) repo: {@code capes-owned.json}, which the mod never needs. */
+    private final CapesRepository ownershipRepo;
 
     /** Canonical catalog of the Dey capes shipped with the launcher (textures in the repo's capes/ dir). */
     private static final Map<String, String[]> DEFAULT_CAPES;
@@ -35,7 +44,13 @@ public class DeyCapesService {
 
     public DeyCapesService(GitHubConfig config) {
         this.config = config;
+        // Cape data (capes.json + textures) lives in the PUBLIC cape repo: the in-game mod fetches it
+        // with no credentials, so it can only ever work world-readable.
         this.repo = new CapesRepository(new CapesRepository.GitConfig(
+                config.token, config.capesOwner, config.capesRepo,
+                config.capesPath, config.capesOwnedPath, config.capesDir));
+        // Ownership audit stays in the private friends repo -- DeyCapes does not read it.
+        this.ownershipRepo = new CapesRepository(new CapesRepository.GitConfig(
                 config.token, config.owner, config.repo,
                 config.capesPath, config.capesOwnedPath, config.capesDir));
     }
@@ -45,8 +60,12 @@ public class DeyCapesService {
         return config.isConfigured();
     }
 
+    /**
+     * The PUBLIC cape-repo coordinates the in-game mod is configured with (see {@code github.properties}
+     * in each instance). These are what the launcher hands to DeyCapes -- never the token.
+     */
     public CapesRepository.GitConfig gitConfig() {
-        return new CapesRepository.GitConfig(config.token, config.owner, config.repo,
+        return new CapesRepository.GitConfig(config.token, config.capesOwner, config.capesRepo,
                 config.capesPath, config.capesOwnedPath, config.capesDir);
     }
 
@@ -93,7 +112,7 @@ public class DeyCapesService {
      * uuids are also considered so ownership survives a name change.
      */
     public List<String> ownedCapeIds(String username, String onlineUuid, String offlineUuid) throws Exception {
-        OwnershipData ownership = repo.read(config.capesOwnedPath, OwnershipData.class);
+        OwnershipData ownership = ownershipRepo.read(config.capesOwnedPath, OwnershipData.class);
         if (ownership == null || ownership.ownership == null) return new ArrayList<>();
         java.util.LinkedHashSet<String> owned = new java.util.LinkedHashSet<>();
         addOwnedFor(owned, ownership, username);
@@ -146,8 +165,8 @@ public class DeyCapesService {
                     po.offlineUuid = null;
                     return d;
                 });
-        // Persist ownership so the cape shows up (and stays) for this player.
-        repo.sync(config.capesOwnedPath, OwnershipData.class, new OwnershipData(),
+        // Persist ownership (private friends repo) so the cape shows up, and stays, for this player.
+        ownershipRepo.sync(config.capesOwnedPath, OwnershipData.class, new OwnershipData(),
                 "DeyCapes: record ownership", o -> { o.grant(username, capeId); if (onlineUuid != null) o.grant(onlineUuid, capeId); return o; });
         return data;
     }

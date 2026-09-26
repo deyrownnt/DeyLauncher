@@ -169,7 +169,8 @@ val embedGithubCredentials = tasks.register("embedGithubCredentials") {
         }
         // A bare token is accepted too, so the secret only has to hold the PAT itself.
         val propsText = if (raw.contains('=')) raw.trim() + "\n" else
-            "token=${raw.trim()}\nowner=onpishi\nrepo=DeyLauncher-Friends\nfriendsPath=friends.json\n"
+            "token=${raw.trim()}\nowner=onpishi\nrepo=DeyLauncher-Friends\nfriendsPath=friends.json\n" +
+                    "capesOwner=onpishi\ncapesRepo=DeyLauncher-Capes\n"
         outFile.parentFile.mkdirs()
         outFile.writeText(packEmbeddedBackend(propsText))
         logger.lifecycle("DeyLauncher: embedded the shared GitHub backend into this build " +

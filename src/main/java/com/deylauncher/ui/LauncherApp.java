@@ -9724,8 +9724,20 @@ public class LauncherApp extends Application {
                         boolean online = active != null && active.accountType == AccountType.ONLINE;
                         String onlineUuid = online ? active.uuid : null;
                         deyCapesService.equipCape(active.username, slug, online, onlineUuid);
+                        // The write that actually feeds the in-game mod: capes.json in the PUBLIC cape repo.
+                        var gc = deyCapesService.gitConfig();
+                        Platform.runLater(() -> log("DEY CAPES: " + (slug == null ? "cleared" : "equipped '" + slug + "'")
+                                + " for " + active.username + " in the public cape repo " + gc.owner() + "/" + gc.repo()
+                                + " (" + gc.capesPath() + ")."));
                         return new MinecraftSkinService.SkinChangeResult(true, "Dey cape updated.");
                     } catch (Exception ex) {
+                        // Name the stage explicitly: an authenticated WRITE failure here is a different
+                        // problem from the mod's anonymous READ failing later in the game.
+                        var gc = deyCapesService.gitConfig();
+                        String why = ex.getMessage();
+                        Platform.runLater(() -> log("DEY CAPES: authenticated write to the public cape repo "
+                                + gc.owner() + "/" + gc.repo() + " failed (" + why
+                                + "). The in-game cape will not change."));
                         return new MinecraftSkinService.SkinChangeResult(false, "Couldn't update Dey cape: " + ex.getMessage());
                     }
                 }
@@ -10735,9 +10747,10 @@ public class LauncherApp extends Application {
                     Platform.runLater(() -> log("Couldn't install the AWT-init helper (continuing): " + msg));
                 }
 
-                // DeyCapes integration only receives public repository coordinates. Never copy a GitHub
-                // credential into a game instance: instance folders, logs and mod jars are user-accessible.
-                // Private cape repositories require a server-side/public proxy rather than a shipped token.
+                // DeyCapes integration only ever receives PUBLIC repository coordinates: the cape data
+                // lives in the public cape repo (onpishi/DeyLauncher-Capes by default) precisely so the
+                // mod can read it with no credentials at all. Never copy a GitHub token into a game
+                // instance -- instance folders, logs and mod jars are all user-accessible.
                 if (deyAtLaunch && modLoader.equals("Fabric") && deyCapesService != null && !"Vanilla".equals(modLoader)) {
                     try {
                         var cfgDir = gameDir.resolve("config").resolve("deycapes");
@@ -10772,14 +10785,29 @@ public class LauncherApp extends Application {
                                         .header("Accept", "application/vnd.github+json")
                                         .GET().build(),
                                 java.net.http.HttpResponse.BodyHandlers.ofString());
-                        if (dcResp.statusCode() == 401 || dcResp.statusCode() == 403 || dcResp.statusCode() == 404) {
-                            Platform.runLater(() -> log("DEY CAPES: the in-game DeyCapes mod cannot read " + dcOwner + "/" + dcRepo
-                                    + " anonymously (HTTP " + dcResp.statusCode() + "). That repo is private or empty -- the mod never "
-                                    + "receives a token, so Dey capes won't render in Minecraft. Make the repo PUBLIC on GitHub, "
-                                    + "or run a server-side proxy. (The launcher still writes cape ownership via its embedded token.)"));
+                        final int dcStatus = dcResp.statusCode();
+                        if (dcStatus == 404) {
+                            Platform.runLater(() -> log("DEY CAPES: the public cape repo " + dcOwner + "/" + dcRepo
+                                    + " has no readable " + dcCapesDir + "/ folder yet (HTTP 404). The in-game DeyCapes mod "
+                                    + "reads cape data anonymously, so capes.json and that folder have to exist in a PUBLIC repo."));
+                        } else if (dcStatus == 401 || dcStatus == 403) {
+                            Platform.runLater(() -> log("DEY CAPES: the public cape repo " + dcOwner + "/" + dcRepo
+                                    + " is not anonymously readable (HTTP " + dcStatus + ") -- it is private, or the anonymous "
+                                    + "GitHub rate limit was hit. Dey capes cannot render in Minecraft until it is public: the "
+                                    + "mod is never given a token."));
+                        } else if (dcStatus >= 400) {
+                            Platform.runLater(() -> log("DEY CAPES: GitHub returned HTTP " + dcStatus + " for the public cape repo "
+                                    + dcOwner + "/" + dcRepo + " -- GitHub may be unavailable, so cape data may not reach the "
+                                    + "in-game mod this launch."));
+                        } else {
+                            Platform.runLater(() -> log("DEY CAPES: public cape repo " + dcOwner + "/" + dcRepo
+                                    + " is anonymously readable -- the in-game DeyCapes mod can fetch capes.json and the cape textures."));
                         }
-                    } catch (Exception ignored) {
+                    } catch (Exception dcEx) {
                         // Best-effort probe; never block launch over it.
+                        String dcErr = dcEx.getMessage();
+                        Platform.runLater(() -> log("DEY CAPES: couldn't probe the public cape repo " + dcOwner + "/" + dcRepo
+                                + " (" + dcErr + ") -- cape rendering in Minecraft is unverified this launch."));
                     }
                 }
 

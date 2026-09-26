@@ -35,11 +35,12 @@ public class DeyCapesInstaller {
         if (v.startsWith("1.20")) return "DeyCapes-1.20.jar";
         if (v.equals("1.21") || v.equals("1.21.1")) return "DeyCapes-1.21.1.jar";
         if (v.startsWith("1.21.")) return "DeyCapes-1.21.2+.jar";
-        // Newest 26.x builds are matched BEFORE the generic "26" arm below, so each gets the jar
-        // that actually declares a matching depends.minecraft (26.3 -> ~26.3, else the loader
-        // abort/refuse path kicks in and the version would silently lose capes).
+        // Each 26.x build gets its OWN jar, and 26.0/26.1.x gets NONE: there is no DeyCapes build for
+        // them, and returning the 26.2 jar would nominate a jar whose own depends.minecraft (~26.2)
+        // the version gate below rejects -- "no capes" is the honest answer, and it can never be read
+        // as "install whatever jar has the closest name".
         if (v.startsWith("26.3")) return "DeyCapes-26.3.jar";
-        if (v.startsWith("26")) return "DeyCapes-26.2.jar";
+        if (v.startsWith("26.2")) return "DeyCapes-26.2.jar";
         return null;
     }
 
@@ -66,7 +67,13 @@ public class DeyCapesInstaller {
      */
     public String ensureInstalled(String mcVersion, Path modsDir) throws Exception {
         String targetJar = resolveJarName(mcVersion);
-        if (targetJar == null) return null;
+        if (targetJar == null) {
+            // No DeyCapes build exists for this Minecraft version at all (e.g. 26.0/26.1.x, 1.15).
+            // A leftover DeyCapes jar from another version would hard-fail Fabric's loader, so park it
+            // in mods-disabled (never delete it) exactly as the version gate below does.
+            if (Files.isDirectory(modsDir)) ModsUtil.disableActiveFamily(modsDir, MOD_PREFIX);
+            return null;
+        }
 
         Files.createDirectories(modsDir);
         String targetLower = targetJar.toLowerCase();
@@ -81,8 +88,11 @@ public class DeyCapesInstaller {
             return null;
         }
 
-        if (isInstalled(modsDir, targetJar)) {
-            return null; // already installed and compatible
+        // Already installed AND identical to the copy bundled in this build -> nothing to do. The
+        // comparison matters: a name-only check would pin every instance to the first DeyCapes jar it
+        // ever received, so a repaired/rebuilt bundled jar could never actually reach a player.
+        if (isInstalled(modsDir, targetJar) && bundledMatchesInstalled(targetJar, modsDir.resolve(targetLower))) {
+            return null;
         }
 
         // Update/downgrade: drop any OTHER (wrong-version) DeyCapes jar, then install the target
@@ -99,6 +109,27 @@ public class DeyCapesInstaller {
         }
 
         return copyJar(targetJar, targetLower, modsDir);
+    }
+
+    /** True when the bundled DeyCapes jar is byte-identical to the copy already in the instance. */
+    private boolean bundledMatchesInstalled(String targetJar, Path installed) {
+        byte[] bundled = bundledJarBytes(targetJar);
+        if (bundled == null) return Files.isRegularFile(installed); // no bundled copy to compare against
+        try {
+            return Files.isRegularFile(installed)
+                    && java.util.Arrays.equals(bundled, Files.readAllBytes(installed));
+        } catch (Exception e) {
+            return false; // unreadable -> reinstall from the bundled copy
+        }
+    }
+
+    /** The named jar's bytes from this build's bundled resources, or null when it is not bundled. */
+    private byte[] bundledJarBytes(String targetJar) {
+        try (InputStream in = DeyCapesInstaller.class.getResourceAsStream("/deycapes-jars/" + targetJar)) {
+            return in == null ? null : in.readAllBytes();
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     /** Copies the named jar from bundled resources (preferred) or the dev dist folder. Returns the file name, or null. */

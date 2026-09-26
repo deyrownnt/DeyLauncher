@@ -65,8 +65,59 @@ class GitHubConfigTest {
                     "the embedded owner must be the backend bot account");
             assertTrue(props.getProperty("repo", "").isBlank() == false,
                     "the embedded repo must be named");
-            assertTrue(props.getProperty("token", "").isBlank() == false,
-                    "the embedded token must be present");
+            assertTrue(props.getProperty("capesRepo", "").isBlank() == false
+                            || GitHubConfig.DEFAULT_CAPES_REPO.equals(props.getProperty("capesRepo", "DeyLauncher-Capes")),
+                    "the embedded cape repo must be named (or default to the public cape repo)");
+            GitHubConfig cfg = GitHubConfig.fromProperties(props);
+            assertTrue(!cfg.capesRepo.equals(cfg.repo),
+                    "capes must resolve to the public cape repo, never the private friends repo");
         }
+    }
+
+    /**
+     * The cape split: {@code capes.json} + the cape textures are read ANONYMOUSLY by the in-game mod, so
+     * they live in the public cape repo, while {@code friends.json} / {@code options-kits.json} /
+     * {@code capes-owned.json} stay in the private repo. A properties block that never mentions capes
+     * must still resolve capes to the public repo -- otherwise a minimal (or older) backend file would
+     * silently point DeyCapes back at a private repo and nothing would ever render.
+     */
+    @Test
+    void capeDataResolvesToThePublicCapeRepoWhileFriendsStayPrivate() {
+        Properties props = new Properties();
+        props.setProperty("token", "github_pat_placeholder");
+        props.setProperty("owner", "onpishi");
+        props.setProperty("repo", "DeyLauncher-Friends");
+
+        GitHubConfig cfg = GitHubConfig.fromProperties(props);
+
+        assertEquals("onpishi", cfg.owner);
+        assertEquals("DeyLauncher-Friends", cfg.repo, "friends data must stay in the private repo");
+        assertEquals("onpishi", cfg.capesOwner, "the cape repo lives on the same account by default");
+        assertEquals(GitHubConfig.DEFAULT_CAPES_REPO, cfg.capesRepo,
+                "cape data must go to the public repo the in-game mod can read with no token");
+        assertEquals("capes.json", cfg.capesPath);
+    }
+
+    @Test
+    void anExplicitCapeRepoOverrideIsHonoured() {
+        Properties props = new Properties();
+        props.setProperty("token", "github_pat_placeholder");
+        props.setProperty("owner", "somegroup");
+        props.setProperty("repo", "private-data");
+        props.setProperty("capesOwner", "somegroup");
+        props.setProperty("capesRepo", "public-capes");
+
+        GitHubConfig cfg = GitHubConfig.fromProperties(props);
+
+        assertEquals("private-data", cfg.repo, "an override must not disturb the private repo");
+        assertEquals("public-capes", cfg.capesRepo);
+        assertEquals("somegroup", cfg.capesOwner);
+    }
+
+    @Test
+    void thePublicCapeRepoIsNeverThePrivateFriendsRepo() {
+        assertTrue(!"DeyLauncher-Friends".equals(GitHubConfig.DEFAULT_CAPES_REPO),
+                "the in-game mod reads the cape repo with no credentials, so it must never be "
+                        + "the private friends repo");
     }
 }
