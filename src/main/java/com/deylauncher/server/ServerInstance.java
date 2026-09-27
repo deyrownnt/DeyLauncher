@@ -56,11 +56,60 @@ public class ServerInstance {
      *  Defaults to true (Gson keeps this initializer for existing server.json files). */
     public boolean visibleToFriends = true;
 
+    // ---- Semi self-hosted (one shared server, hosted from any moderator's PC) ----------------------
+    //
+    // All of these default to "off/empty" and are kept as plain fields so a server.json written by an
+    // older build loads unchanged (Gson only overwrites fields that are actually present, so a missing
+    // key keeps the initializer here -- the same trick visibleToFriends above relies on).
+
+    /** Publish this server to a shared servers repo, so it can be hosted from more than one PC. */
+    public boolean semiSelfHosted = false;
+
+    /** The DEY address alias (without the {@code dey|} prefix) players can add, or null. */
+    public String cloudAlias;
+
+    /** The shared id in the cloud -- this server's own {@link #id} once it has been published. */
+    public String cloudServerId;
+
+    /**
+     * Which servers repo holds this server, e.g. {@code DeyLauncher-Servers}. Stored per server (not
+     * only in configuration) so several servers repos can coexist and a server keeps working after
+     * another one is added -- every read and write routes to this exact repo.
+     */
+    public String cloudRepo;
+
+    /** Set when this server was granted to us by somebody else: the real owner's account uuid. */
+    public String linkedOwnerUuid;
+    /** Set when this server was granted to us: our {@link com.deylauncher.servers.ManagerRole} there. */
+    public String linkedRole;
+
+    /** Owner-only policy: a moderator may only host while they can also make it publicly reachable. */
+    public boolean allowModeratorHostOnlyWhenPublic = false;
+
+    /** Owner-only policy: when false the server is no longer offered to its moderators. */
+    public boolean openToModerators = true;
+
     public ServerInstance() {}
 
     public ServerInstance(String name, ServerType type, String minecraftVersion) {
         this.name = name;
         this.type = type;
         this.minecraftVersion = minecraftVersion;
+    }
+
+    /** True when somebody else owns this server and we only moderate it. */
+    public boolean isGrantedToMe(String myUuid) {
+        if (linkedOwnerUuid == null || linkedOwnerUuid.isBlank()) return false;
+        return myUuid == null || !linkedOwnerUuid.equalsIgnoreCase(myUuid);
+    }
+
+    /** The role we hold on a granted server, or null when we own it (or it was never granted). */
+    public com.deylauncher.servers.ManagerRole myRoleOnGrantedServer(String myUuid) {
+        return isGrantedToMe(myUuid) ? com.deylauncher.servers.ManagerRole.fromWire(linkedRole) : null;
+    }
+
+    /** The DEY address for this server, or null when no alias was claimed. */
+    public String deyAddress() {
+        return com.deylauncher.servers.DeyAddress.of(cloudAlias);
     }
 }

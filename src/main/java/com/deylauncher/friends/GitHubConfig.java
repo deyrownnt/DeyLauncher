@@ -52,9 +52,25 @@ public class GitHubConfig {
     public final String capesDir;
     /** Shared "who owns which saved options kits" table (default "options-kits.json"). */
     public final String optionsKitsPath;
+    /**
+     * Comma-separated names of the semi self-hosted servers repos that share this same token
+     * (default {@code DeyLauncher-Servers}). Several may be listed -- a server records which one it
+     * lives in, so adding {@code DeyLauncher-Servers1} here makes its servers discoverable without
+     * moving anything.
+     */
+    public final String serversReposRaw;
+    /** Folder inside each servers repo holding the semi self-hosted data (default "servers"). */
+    public final String serversDir;
+
+    /** The repo that new semi self-hosted servers are published into when nothing else is chosen. */
+    public static final String DEFAULT_SERVERS_REPO = "DeyLauncher-Servers";
+
+    /** The folder semi self-hosted data lives in, inside each servers repo. */
+    public static final String DEFAULT_SERVERS_DIR = "servers";
 
     private GitHubConfig(String token, String owner, String repo, String friendsPath,
-                         String capesPath, String capesOwnedPath, String capesDir, String optionsKitsPath) {
+                         String capesPath, String capesOwnedPath, String capesDir, String optionsKitsPath,
+                         String serversReposRaw, String serversDir) {
         this.token = token;
         this.owner = owner;
         this.repo = repo;
@@ -63,6 +79,34 @@ public class GitHubConfig {
         this.capesOwnedPath = capesOwnedPath;
         this.capesDir = capesDir;
         this.optionsKitsPath = optionsKitsPath;
+        this.serversReposRaw = serversReposRaw;
+        this.serversDir = serversDir;
+    }
+
+    /**
+     * The configured semi self-hosted servers repos, in order, with the primary one first. Always
+     * returns at least one entry, so callers can address "the servers repos" without null checks.
+     */
+    public java.util.List<String> serversRepos() {
+        java.util.List<String> out = new java.util.ArrayList<>();
+        if (serversReposRaw != null) {
+            for (String part : serversReposRaw.split(",")) {
+                String name = part.trim();
+                if (!name.isEmpty() && !out.contains(name)) out.add(name);
+            }
+        }
+        if (out.isEmpty()) out.add(DEFAULT_SERVERS_REPO);
+        return out;
+    }
+
+    /** The repo name new servers are published into by default. */
+    public String primaryServersRepo() {
+        return serversRepos().get(0);
+    }
+
+    /** The folder semi self-hosted data lives in inside each servers repo. */
+    public String serversDirOrDefault() {
+        return (serversDir == null || serversDir.isBlank()) ? DEFAULT_SERVERS_DIR : serversDir.trim();
     }
 
     public boolean isConfigured() {
@@ -94,7 +138,7 @@ public class GitHubConfig {
     /** The "no backend at all" config, keeping the default repo paths so features degrade predictably. */
     private static GitHubConfig unconfigured() {
         return new GitHubConfig(null, null, null, "friends.json", "capes.json", "capes-owned.json",
-                "capes", "options-kits.json");
+                "capes", "options-kits.json", DEFAULT_SERVERS_REPO, DEFAULT_SERVERS_DIR);
     }
 
     /** The build-embedded credentials, de-obfuscated; null when this build carries none. */
@@ -159,7 +203,11 @@ public class GitHubConfig {
                 props.getProperty("capesPath", "capes.json"),
                 props.getProperty("capesOwnedPath", "capes-owned.json"),
                 props.getProperty("capesDir", "capes"),
-                props.getProperty("optionsKitsPath", "options-kits.json")
+                props.getProperty("optionsKitsPath", "options-kits.json"),
+                // serversRepo (singular) is accepted too, so an existing single-repo override keeps
+                // working after the multi-repo support landed.
+                props.getProperty("serversRepos", props.getProperty("serversRepo", DEFAULT_SERVERS_REPO)),
+                props.getProperty("serversDir", DEFAULT_SERVERS_DIR)
         );
     }
 }

@@ -37,7 +37,14 @@ public final class IconFactory {
         FILTER,
         MODPACK,
         SERVER,
-        REFRESH
+        REFRESH,
+        CONTROLLER,
+        PEOPLE,
+        // ---- Top-bar nav tab icons (see the NAV TABS block in theme.css) ----
+        /** Home: filled house with a knocked-out door. */
+        HOUSE,
+        /** Servers: two stacked rack units, each with a boss and a status light knocked out. */
+        SERVER_RACK
     }
 
     public static Node create(Icon icon, double size) {
@@ -81,6 +88,24 @@ public final class IconFactory {
             // other icon here is a vector instead of a "\u21BB"/emoji glyph that may be missing
             // on a given Windows or Linux box.
             case REFRESH -> "M12 5V2L7.5 6.5 12 11V8a5 5 0 1 1-5 5H4a8 8 0 1 0 8-8z";
+            // Game controller: rounded body + two grips, D-pad and face buttons read fine at 22-26px.
+            case CONTROLLER -> "M7.5 6h9a5.5 5.5 0 0 1 5.4 6.6l-.9 4.5a2.6 2.6 0 0 1-4.6 1.1L15 16H9l-1.4 2.2a2.6 2.6 0 0 1-4.6-1.1l-.9-4.5A5.5 5.5 0 0 1 7.5 6zM8 10v1.5H6.5V13H8v1.5h1.5V13H11v-1.5H9.5V10zm7.25 1a1.25 1.25 0 1 0 0 2.5 1.25 1.25 0 0 0 0-2.5zm2.5 3a1.25 1.25 0 1 0 0 2.5 1.25 1.25 0 0 0 0-2.5z";
+            // Two overlapping people (friends list).
+            case PEOPLE -> "M9 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zm7-6a3 3 0 1 1-2.13 5.12A5 5 0 0 1 16 15v1h5v-1a4 4 0 0 0-4.06-4A3 3 0 0 1 16 6zM9 14c-3.33 0-6 1.79-6 4v1h12v-1c0-2.21-2.67-4-6-4z";
+            // Home tab: a filled house -- roof overhang, body, and a door knocked out of the body.
+            // The door is wound the opposite way round from the outline (clockwise outside,
+            // counter-clockwise inside) so the default NON_ZERO fill rule punches it out as a hole
+            // instead of painting it back in. Same trick as the rack's boss/LED cut-outs below.
+            case HOUSE -> "M13 2 L23 11 L19 11 L19 22 L5 22 L5 11 L1 11 Z"
+                    + " M10 22 L14 22 L14 14.5 L10 14.5 Z";
+            // Servers tab: two stacked rack units (a 1U and a 2U), each showing a mounting boss on
+            // the left and a status light on the right as knocked-out holes.
+            case SERVER_RACK -> "M3 3.5 L21 3.5 L21 10 L3 10 Z"
+                    + " M3 12 L21 12 L21 18.5 L3 18.5 Z"
+                    + " M6 8.5 L9.5 8.5 L9.5 5.5 L6 5.5 Z"
+                    + " M16.5 8.5 L19 8.5 L19 5.5 L16.5 5.5 Z"
+                    + " M6 17 L9.5 17 L9.5 14 L6 14 Z"
+                    + " M16.5 17 L19 17 L19 14 L16.5 14 Z";
         };
     }
 }

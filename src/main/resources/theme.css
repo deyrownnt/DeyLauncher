@@ -3,8 +3,13 @@
      BLACK  -- background, nav surfaces, dialogs, dark cards
      WHITE  -- readable surfaces/text, light cards
      ORANGE -- the ONLY accent color: actions, selection, focus,
-               "online"/active status, progress
-   No other hues are used anywhere in this file. Corner radius is
+               active status, progress
+   Three deliberate exceptions, all of them the reference design's
+   own colors rather than new decoration:
+     * the top-bar "online" status dot is green (below),
+     * VANILLA mode carries a blue secondary accent (below),
+     * the window-control close button turns red on hover.
+   Nothing else here introduces a hue. Corner radius is
    consistently 8px (controls) / 12px (cards) / 20px (pills).
    Spacing follows an 8/12/16/24 scale wherever set inline in code;
    this file only controls color, radius, and type.
@@ -22,6 +27,10 @@
    Light: bg #f6f6f7 | surface #ffffff | surface-2 #f0f0f1 | border #e2e2e4
           text #17181b | muted #6b6c72
    Accent (both themes): orange #ff7a1f | orange-hover #e8690f | orange-soft rgba(255,122,31,0.15)
+   Active top-bar tab: its label/glyph are the lighter orange #ff9a4d (dark theme) so they read
+   against the orange gradient behind them.
+   Online status dot (top-bar account block, and every "online" dot): green #19e546 -- this is the
+   design's online green, and it is deliberately NOT the accent orange (see the header note).
    DEY mode accent: orange (above). VANILLA mode gets its own secondary accent so the mode
    toggle and Play button visibly match whichever mode is active: blue #4aa8ff | blue-hover #2f8ce0.
 */
@@ -37,23 +46,80 @@
 .theme-dark .button:hover { -fx-background-color: #2a2b30; }
 
 .theme-dark .top-bar {
-    -fx-background-color: #17181b;
-    -fx-border-color: transparent transparent #2a2b30 transparent;
+    /* Bar surface #131416, only a hair lighter than the window's own #0d0d0f -- measured off the
+       reference photo, where the bar reads as the same black as the page under it and the active
+       tab's gradient (not a lighter bar) is what separates the two. */
+    -fx-background-color: #131416;
+    -fx-border-color: transparent transparent #1d1e20 transparent;
     -fx-border-width: 0 0 1 0;
 }
 .theme-dark .logo-glyph { -fx-text-fill: #ff7a1f; -fx-font-size: 34px; }
 .theme-dark .title-label { -fx-text-fill: #f5f5f6; -fx-font-size: 22px; -fx-font-weight: bold; }
+/* The wordmark is two-tone: "DEY" in the accent orange, "LAUNCHER" in the foreground color. This
+   rule must stay AFTER .title-label, whose -fx-text-fill it overrides at equal specificity. */
+.theme-dark .brand-accent { -fx-text-fill: #ff7a1f; }
 .theme-dark .subtitle-label { -fx-text-fill: #9a9ba3; -fx-font-size: 13px; }
 
-/* ---- Top nav tabs (Home / Library / Servers) ---- */
-.theme-dark .nav-group { -fx-padding: 0 0 0 4; }
+/* ---- Top nav tabs (Home / Friends / Servers) ----
+   Reference design: bare glyph + label, tabs as tall as the bar's inner height (the code sets that
+   height) so the active tab runs edge to edge along the bar's top and bottom. The active tab has
+   NO left/right border -- only a 2px orange hairline along those two edges, over a vertical orange
+   wash that ramps ~10% -> ~38%. Its icon follows its label: inactive glyphs sit at the muted grey,
+   the active one at the active tab's lighter orange. */
+.theme-dark .nav-group { -fx-padding: 0; }
 .theme-dark .nav-tab-button {
-    -fx-background-color: transparent; -fx-text-fill: #9a9ba3; -fx-font-weight: bold;
-    -fx-padding: 9 16; -fx-background-radius: 8; -fx-cursor: hand; -fx-border-color: transparent;
+    -fx-background-color: transparent; -fx-text-fill: #ced9e2; -fx-font-weight: bold;
+    -fx-font-size: 19px; -fx-padding: 0 27; -fx-background-radius: 8; -fx-cursor: hand;
+    /* Transparent border, 1px wide: keeps the active tab's border from shifting the label by a
+       pixel when it appears, and it is the reason every tab is the same size either way. */
+    -fx-border-color: transparent; -fx-border-width: 1; -fx-border-radius: 8;
 }
-.theme-dark .nav-tab-button:hover { -fx-text-fill: #f5f5f6; -fx-background-color: #17181b; }
-.theme-dark .nav-tab-active { -fx-text-fill: #ff7a1f; -fx-background-color: rgba(255,122,31,0.14); }
-.theme-dark .nav-tab-active:hover { -fx-text-fill: #ff7a1f; -fx-background-color: rgba(255,122,31,0.14); }
+.theme-dark .nav-tab-button:hover { -fx-text-fill: #ffffff; -fx-background-color: #202126; }
+.theme-dark .nav-tab-button .icon-svg { -fx-fill: #8b9099; }
+.theme-dark .nav-tab-active {
+    /* Photo-measured, pixel by pixel: NO left/right border at all -- only a 2px orange hairline
+       along the bar's top edge and along its bottom edge. The wash behind them is the photo's own
+       BOTTOM-WEIGHTED ramp -- it samples ~8% at the tab's top, still only ~11% at mid-height and
+       then climbs to ~38% at the bottom, so the tab stays dark behind the glyphs and turns bright
+       where it meets the bar's lower edge rather than darkening evenly. */
+    -fx-text-fill: #ffa148;
+    -fx-border-color: #ff9a4d transparent;
+    -fx-border-width: 2 0 2 0;
+    -fx-border-radius: 6;
+    -fx-background-color: linear-gradient(to bottom,
+        rgba(253,104,48,0.08) 0%, rgba(253,104,48,0.11) 60%, rgba(253,104,48,0.40) 100%);
+    -fx-background-radius: 6;
+}
+.theme-dark .nav-tab-active:hover {
+    -fx-text-fill: #ffa148;
+    -fx-border-color: #ff9a4d transparent;
+    -fx-border-width: 2 0 2 0;
+    -fx-background-color: linear-gradient(to bottom,
+        rgba(253,104,48,0.08) 0%, rgba(253,104,48,0.11) 60%, rgba(253,104,48,0.40) 100%);
+    -fx-background-radius: 6;
+}
+/* The active glyph and label BLOOM in the reference: sampled just outside the house icon the tab's
+   fill warms from #2d2017 to #3c1e10, so both carry a warm, deliberately modest drop-shadow (the
+   icon in the photo's own yellower #f6a547, not the hairline's orange). */
+.theme-dark .nav-tab-active .icon-svg {
+    -fx-fill: #f6a547;
+    -fx-effect: dropshadow(gaussian, rgba(253,104,48,0.70), 8, 0.50, 0, 0);
+}
+.theme-dark .nav-tab-active .text {
+    -fx-effect: dropshadow(gaussian, rgba(253,104,48,0.60), 7, 0.45, 0, 0);
+}
+/* The hairline that separates the bar's groups (nav | download | account+gear | window controls). */
+.theme-dark .bar-divider { -fx-background-color: #2a2b30; }
+
+/* Bare top-bar glyph buttons (the gear and the update download): no circle, no border -- just the
+   glyph, with the click box kept at a comfortable size in code. Hover only recolors/plates faintly. */
+.theme-dark .top-icon-button {
+    -fx-background-color: transparent; -fx-background-radius: 8; -fx-cursor: hand;
+    -fx-padding: 0; -fx-border-color: transparent; -fx-border-radius: 8;
+}
+.theme-dark .top-icon-button:hover { -fx-background-color: #202126; }
+.theme-dark .top-icon-button .icon-svg { -fx-fill: #9a9ba3; }
+.theme-dark .top-icon-button:hover .icon-svg { -fx-fill: #ff7a1f; }
 
 .theme-dark .icon-button {
     -fx-background-color: #202126; -fx-text-fill: #f5f5f6; -fx-background-radius: 50%;
@@ -73,16 +139,39 @@
     -fx-background-color: #202126; -fx-background-radius: 20; -fx-padding: 4;
     -fx-border-color: #2a2b30; -fx-border-radius: 20;
 }
-.theme-dark .mode-toggle-btn { -fx-background-radius: 16; -fx-padding: 9 0; -fx-font-weight: bold; }
+.theme-dark .mode-toggle-btn { -fx-background-radius: 16; -fx-padding: 9 0; -fx-font-weight: bold; -fx-background-color: transparent; }
+/* Flat rows by default (a thin bottom divider only, no card box) -- only the ACTIVE tile gets
+   the bordered, glowing card treatment, matching the reference sidebar exactly. */
 .theme-dark .version-tile {
-    -fx-background-color: #202126; -fx-text-fill: #f5f5f6; -fx-background-radius: 10;
-    -fx-padding: 14 16; -fx-font-weight: bold; -fx-cursor: hand;
-    -fx-border-color: #2a2b30; -fx-border-radius: 10; -fx-alignment: CENTER_LEFT;
+    -fx-background-color: transparent; -fx-text-fill: #d3d4d8; -fx-background-radius: 10;
+    -fx-padding: 11 14; -fx-font-weight: bold; -fx-cursor: hand;
+    -fx-border-color: transparent transparent #232429 transparent; -fx-border-width: 0 0 1 0;
+    -fx-alignment: CENTER_LEFT;
 }
-.theme-dark .version-tile:hover { -fx-border-color: #4a4b52; }
+.theme-dark .version-tile:hover { -fx-background-color: #1c1d21; -fx-text-fill: #f5f5f6; }
 .theme-dark .version-tile-active {
-    -fx-border-color: #ff7a1f; -fx-background-color: rgba(255,122,31,0.14); -fx-text-fill: #ff7a1f;
+    -fx-border-color: #ff7a1f; -fx-border-width: 1.5; -fx-border-radius: 10;
+    -fx-background-color: linear-gradient(to bottom right, rgba(255,122,31,0.30), rgba(255,122,31,0.10));
+    -fx-text-fill: #ffffff;
+    -fx-effect: dropshadow(gaussian, rgba(255,122,31,0.55), 16, 0.35, 0, 0);
 }
+.theme-dark .version-tile-active:hover { -fx-background-color: linear-gradient(to bottom right, rgba(255,122,31,0.34), rgba(255,122,31,0.13)); }
+.theme-dark .version-tile-icon-badge {
+    -fx-background-color: #26272c; -fx-background-radius: 50%;
+    -fx-min-width: 26; -fx-min-height: 26; -fx-max-width: 26; -fx-max-height: 26;
+    -fx-border-color: #33343a; -fx-border-radius: 50%;
+}
+.theme-dark .version-tile-icon-badge .icon-svg { -fx-fill: #c7c8ce; }
+.theme-dark .version-tile-active .version-tile-icon-badge {
+    -fx-background-color: linear-gradient(to bottom right, #ff9a4d, #ff7a1f);
+    -fx-border-color: transparent;
+    -fx-effect: dropshadow(gaussian, rgba(255,122,31,0.75), 10, 0.5, 0, 0);
+}
+.theme-dark .version-tile-active .version-tile-icon-badge .icon-svg { -fx-fill: #ffffff; }
+/* Two-line modpack profile tiles (name + "version • loader" subtitle). */
+.theme-dark .tile-name-label { -fx-text-fill: #f5f5f6; -fx-font-size: 13px; -fx-font-weight: bold; }
+.theme-dark .tile-subtitle-label { -fx-text-fill: #75767d; -fx-font-size: 11.5px; -fx-font-weight: normal; }
+.theme-dark .version-tile-active .tile-name-label { -fx-text-fill: #ff7a1f; }
 
 .theme-dark .placeholder-page {
     -fx-background-color: #17181b; -fx-background-radius: 12; -fx-border-color: #2a2b30; -fx-border-radius: 12;
@@ -114,14 +203,28 @@
 .theme-dark .combo-box-popup .list-cell:selected { -fx-background-color: rgba(255,122,31,0.18); -fx-text-fill: #ff7a1f; }
 
 .theme-dark .play-button {
-    -fx-background-color: #ff7a1f; -fx-text-fill: #0d0d0f; -fx-font-weight: bold;
+    -fx-text-fill: #ffffff; -fx-font-weight: bold;
     -fx-font-size: 19px; -fx-padding: 18; -fx-background-radius: 10; -fx-cursor: hand;
 }
-.theme-dark .play-button:hover { -fx-background-color: #e8690f; }
-.theme-dark .play-button-dey { -fx-background-color: #ff7a1f; -fx-text-fill: #0d0d0f; }
-.theme-dark .play-button-dey:hover { -fx-background-color: #e8690f; }
-.theme-dark .play-button-vanilla { -fx-background-color: #4aa8ff; -fx-text-fill: #0d0d0f; }
-.theme-dark .play-button-vanilla:hover { -fx-background-color: #2f8ce0; }
+.theme-dark .play-button .icon-svg { -fx-fill: #ffffff; }
+/* NOTE: the glow itself is applied in code (LauncherApp.playButtonGlow), not here, so it can
+   breathe via a Timeline -- an -fx-effect here would fight that animation on every CSS pass. */
+.theme-dark .play-button-dey {
+    -fx-background-color: linear-gradient(from 0% 0% to 90% 100%,
+        #ffa456 0%, #ff7a1f 45%, #f2500c 100%);
+}
+.theme-dark .play-button-dey:hover {
+    -fx-background-color: linear-gradient(from 0% 0% to 90% 100%,
+        #ffb06a 0%, #ff8a35 45%, #ff6018 100%);
+}
+.theme-dark .play-button-vanilla {
+    -fx-background-color: linear-gradient(from 0% 0% to 90% 100%,
+        #7cc9ff 0%, #4aa8ff 45%, #2178c9 100%);
+}
+.theme-dark .play-button-vanilla:hover {
+    -fx-background-color: linear-gradient(from 0% 0% to 90% 100%,
+        #96d4ff 0%, #62b6ff 45%, #348edb 100%);
+}
 .theme-dark .play-progress .bar { -fx-background-color: #ff7a1f; -fx-background-radius: 6; }
 .theme-dark .play-progress .track { -fx-background-color: #2a2b30; -fx-background-radius: 6; }
 
@@ -132,8 +235,18 @@
 .theme-dark .pill-button:hover { -fx-background-color: #2a2b30; -fx-border-color: #ff7a1f; }
 .theme-dark .toggle-button { -fx-background-color: #202126; -fx-text-fill: #f5f5f6; -fx-background-radius: 20; }
 .theme-dark .toggle-button:selected { -fx-background-color: rgba(255,122,31,0.18); -fx-text-fill: #ff7a1f; -fx-border-color: #ff7a1f; -fx-border-radius: 20; }
-.theme-dark .mode-toggle-btn.mode-dey:selected { -fx-background-color: rgba(255,122,31,0.18); -fx-text-fill: #ff7a1f; -fx-border-color: #ff7a1f; -fx-border-radius: 20; }
-.theme-dark .mode-toggle-btn.mode-vanilla:selected { -fx-background-color: rgba(74,168,255,0.18); -fx-text-fill: #4aa8ff; -fx-border-color: #4aa8ff; -fx-border-radius: 20; }
+.theme-dark .mode-toggle-btn.mode-dey { -fx-text-fill: #ff7a1f; }
+.theme-dark .mode-toggle-btn.mode-vanilla { -fx-text-fill: #4aa8ff; }
+.theme-dark .mode-toggle-btn.mode-dey:selected {
+    -fx-background-color: linear-gradient(from 0% 0% to 100% 100%, #ffa456 0%, #ff7a1f 55%, #f2500c 100%);
+    -fx-text-fill: #ffffff; -fx-border-color: transparent; -fx-border-radius: 16;
+    -fx-effect: dropshadow(gaussian, rgba(255,122,31,0.65), 16, 0.45, 0, 2);
+}
+.theme-dark .mode-toggle-btn.mode-vanilla:selected {
+    -fx-background-color: linear-gradient(from 0% 0% to 100% 100%, #7cc9ff 0%, #4aa8ff 55%, #2178c9 100%);
+    -fx-text-fill: #ffffff; -fx-border-color: transparent; -fx-border-radius: 16;
+    -fx-effect: dropshadow(gaussian, rgba(74,168,255,0.65), 16, 0.45, 0, 2);
+}
 .theme-dark .logout-button { -fx-background-color: transparent; -fx-text-fill: #ff7a1f; -fx-border-color: #ff7a1f; -fx-border-radius: 20; -fx-background-radius: 20; -fx-padding: 10 22; -fx-cursor: hand; }
 .theme-dark .logout-button:hover { -fx-background-color: rgba(255,122,31,0.12); }
 
@@ -150,18 +263,29 @@
 }
 .theme-dark .settings-apply-button-ready:hover { -fx-background-color: #e8690f; }
 
+/* ---- Top-bar account block: round face + name, with the status dot on the face's corner. No pill,
+   no border, no background -- the reference design keeps this block completely bare, and only the
+   name/ring answer hover. Which face it shows is always the active account's own skin (code). */
 .theme-dark .account-button {
-    -fx-background-color: #17181b; -fx-background-radius: 20; -fx-border-color: #2a2b30;
-    -fx-border-radius: 20; -fx-padding: 6 16 6 6; -fx-cursor: hand;
+    -fx-background-color: transparent; -fx-background-radius: 8; -fx-border-color: transparent;
+    -fx-border-width: 0; -fx-padding: 0; -fx-cursor: hand;
 }
-.theme-dark .account-button:hover { -fx-border-color: #ff7a1f; }
+.theme-dark .account-button:hover .account-btn-name { -fx-text-fill: #ffffff; }
+.theme-dark .account-button:hover .account-btn-face-host { -fx-border-color: #ff7a1f; }
 .theme-dark .account-btn-face-host {
-    -fx-background-color: #202126; -fx-background-radius: 8; -fx-border-color: #2a2b30; -fx-border-radius: 8;
+    -fx-background-color: #202126; -fx-background-radius: 50%;
+    -fx-border-color: #2a2b30; -fx-border-radius: 50%; -fx-border-width: 1;
     -fx-padding: 2;
 }
-.theme-dark .account-btn-name { -fx-text-fill: #f5f5f6; -fx-font-weight: bold; -fx-font-size: 14px; }
-.theme-dark .account-status-dot { -fx-min-width: 9px; -fx-min-height: 9px; -fx-max-width: 9px; -fx-max-height: 9px; -fx-background-radius: 50%; }
-.theme-dark .dot-online { -fx-background-color: #ff7a1f; }
+.theme-dark .account-btn-name { -fx-text-fill: #f5f5f6; -fx-font-weight: bold; -fx-font-size: 20px; }
+/* Dot on the face's bottom-right corner: 12px with a 2px ring in the bar's own color, so it stays
+   legible over the skin pixels it overlaps. The online green is the design's online green. */
+.theme-dark .account-status-dot {
+    -fx-min-width: 12px; -fx-min-height: 12px; -fx-max-width: 12px; -fx-max-height: 12px;
+    -fx-background-radius: 50%; -fx-border-radius: 50%; -fx-border-width: 2;
+    -fx-border-color: #131416;
+}
+.theme-dark .dot-online { -fx-background-color: #19e546; }
 .theme-dark .dot-offline { -fx-background-color: #f5f5f6; }
 .theme-dark .dot-none { -fx-background-color: transparent; -fx-border-color: #4a4b52; -fx-border-radius: 50%; }
 
@@ -269,14 +393,36 @@
 .theme-dark .slider .track { -fx-background-color: #2a2b30; -fx-background-radius: 4; }
 .theme-dark .slider .thumb { -fx-background-color: #ff7a1f; }
 
-.theme-dark .log-section { -fx-background-color: #0d0d0f; }
-.theme-dark .log-area {
-    -fx-control-inner-background: #101012; -fx-text-fill: #d6d7db;
-    -fx-font-family: "JetBrains Mono", "Consolas", monospace; -fx-font-size: 14.5px;
-    -fx-background-radius: 12; -fx-border-color: #2a2b30; -fx-border-radius: 12;
+/* ---- Game output console. The reference draws it as ONE bordered panel parked in the right
+   column under the Play block: a 1px #1b2025 frame on a #080c0f body, with the "GAME OUTPUT"
+   bar as a slightly lighter #10151a strip INSIDE the frame (no divider line -- the two greys
+   simply change over), and no border of its own around the text area. */
+.theme-dark .log-section {
+    -fx-background-color: #080c0f;
+    -fx-background-radius: 12; -fx-border-color: #1b2025; -fx-border-radius: 12;
 }
-.theme-dark .main-split { -fx-background-color: #0d0d0f; }
-.theme-dark .main-split > .split-pane-divider { -fx-background-color: #2a2b30; }
+.theme-dark .log-header {
+    -fx-background-color: #10151a;
+    -fx-background-radius: 12 12 0 0;
+    -fx-padding: 6 10 6 20;
+}
+.theme-dark .log-title { -fx-text-fill: #c9cbd0; -fx-font-size: 11px; -fx-font-weight: bold; }
+.theme-dark .log-area {
+    -fx-control-inner-background: #080c0f; -fx-text-fill: #8a8f96;
+    -fx-font-family: "JetBrains Mono", "Consolas", monospace; -fx-font-size: 14.5px;
+    /* The frame around the text comes from .log-section, so the control itself paints nothing:
+       transparent background at inset 0 kills the TextArea's own sunken 3px frame. */
+    -fx-background-color: transparent; -fx-background-insets: 0; -fx-border-color: transparent;
+    -fx-padding: 4 8 4 12;
+}
+.theme-dark .log-tool-button {
+    -fx-background-color: transparent; -fx-text-fill: #9a9ba3; -fx-background-radius: 8;
+    -fx-min-width: 30; -fx-min-height: 30; -fx-max-width: 30; -fx-max-height: 30;
+    -fx-padding: 0; -fx-cursor: hand; -fx-border-color: transparent;
+}
+.theme-dark .log-tool-button .icon-svg { -fx-fill: #9a9ba3; }
+.theme-dark .log-tool-button:hover { -fx-background-color: #202126; -fx-text-fill: #ff7a1f; }
+.theme-dark .log-tool-button:hover .icon-svg { -fx-fill: #ff7a1f; }
 
 /* Console-tab toolbar: Start/Stop + version + Play cluster on one wrapping line. */
 .theme-dark .server-toolbar {
@@ -317,6 +463,38 @@
     -fx-text-fill: #ff7a1f; -fx-background-color: rgba(255,122,31,0.15); -fx-background-radius: 20;
     -fx-padding: 4 12; -fx-font-weight: bold; -fx-font-size: 11px;
 }
+
+/* ---- Shared (semi self-hosted) servers: role pill, GIVEN badge, inline cloud sync ----
+   All three are plain Labels, so without a rule here they render as bare text and get squeezed
+   down to "OWN..." / "STOPP..." by a 260px server card. The min-width pinning happens in code
+   (LauncherApp.rolePill()/givenBadge()/badgeLabel() use Region.USE_PREF_SIZE) so it works even if
+   a stylesheet fails to load; these rules only do the looks. */
+.theme-dark .role-pill {
+    -fx-text-fill: #ff7a1f; -fx-background-color: rgba(255,122,31,0.15);
+    -fx-background-radius: 20; -fx-padding: 3 11; -fx-font-weight: bold; -fx-font-size: 11px;
+}
+.theme-dark .role-pill-none {
+    -fx-text-fill: #9a9ba3; -fx-background-color: #2a2b30;
+    -fx-background-radius: 20; -fx-padding: 3 11; -fx-font-weight: bold; -fx-font-size: 11px;
+}
+.theme-dark .given-badge {
+    -fx-text-fill: #0d0d0f; -fx-background-color: #ff7a1f;
+    -fx-background-radius: 20; -fx-padding: 3 11; -fx-font-weight: bold; -fx-font-size: 11px;
+}
+/* The same badge shrunk down to sit on the corner of a 44px server icon. */
+.theme-dark .given-badge-sm { -fx-font-size: 9.5px; -fx-padding: 2 7; -fx-background-radius: 8; }
+
+/* Inline progress for a world push/pull. It lives inside the page that started the work (the
+   Settings tab of a shared server, or the server's card) instead of a modal window: a multi-GB
+   push takes minutes, and a modal progress dialog that refuses to close locks the launcher up. */
+.theme-dark .sync-inline {
+    -fx-background-color: #1c1d21; -fx-background-radius: 10; -fx-padding: 12 14;
+    -fx-border-color: #2a2b30; -fx-border-radius: 10;
+}
+.theme-dark .sync-inline .sync-label { -fx-text-fill: #f5f5f6; -fx-font-size: 13px; }
+.theme-dark .sync-progress { -fx-pref-height: 8; }
+.theme-dark .sync-progress > .track { -fx-background-color: #2a2b30; -fx-background-radius: 6; }
+.theme-dark .sync-progress > .bar { -fx-background-color: #ff7a1f; -fx-background-radius: 6; -fx-padding: 3; }
 
 /* "Share over the Internet" card on the server Console tab. */
 .theme-dark .server-share-card {
@@ -379,6 +557,29 @@
 .theme-dark .dialog-pane .button-bar .button { -fx-background-color: #202126; -fx-text-fill: #f5f5f6; }
 .theme-dark .dialog-pane .button-bar .button:hover { -fx-background-color: #2a2b30; }
 
+/* ---- Launcher dialogs that carry the theme class on the DialogPane itself ----
+   openDialog()/pickManagerRole()/... do dialogPane.getStyleClass().addAll("root-pane",
+   darkMode ? "theme-dark" : "theme-light"). A descendant selector such as ".theme-dark
+   .dialog-pane" can never match a node that has BOTH classes, which is why every launcher dialog
+   kept JavaFX's light grey pane background inside a dark window (the grey rim around the header,
+   the content and the button bar). Same-node selectors are the only form that matches here. */
+.theme-dark.dialog-pane { -fx-background-color: #17181b; }
+.theme-dark.dialog-pane > .header-panel { -fx-background-color: #17181b; }
+.theme-dark.dialog-pane > .header-panel > .label { -fx-text-fill: #f5f5f6; -fx-font-size: 14px; }
+.theme-dark.dialog-pane > .content { -fx-background-color: #0d0d0f; }
+.theme-dark.dialog-pane > .content > .label { -fx-text-fill: #f5f5f6; }
+.theme-dark.dialog-pane > .content .radio-button { -fx-text-fill: #f5f5f6; -fx-font-size: 14px; }
+.theme-dark.dialog-pane > .content .radio-button .radio { -fx-background-color: #0d0d0f; -fx-border-color: #2a2b30; }
+.theme-dark.dialog-pane > .content .radio-button:selected .radio { -fx-border-color: #ff7a1f; }
+.theme-dark.dialog-pane > .content .radio-button:selected .radio .dot { -fx-background-color: #ff7a1f; }
+.theme-dark.dialog-pane > .content .check-box { -fx-text-fill: #f5f5f6; }
+.theme-dark.dialog-pane > .content .check-box .box { -fx-background-color: #0d0d0f; -fx-border-color: #2a2b30; }
+.theme-dark.dialog-pane > .content .check-box:selected .box { -fx-background-color: #ff7a1f; -fx-border-color: #ff7a1f; }
+.theme-dark.dialog-pane > .content .check-box:selected .mark { -fx-background-color: #0d0d0f; }
+.theme-dark.dialog-pane > .button-bar { -fx-background-color: #1c1d21; -fx-border-color: #2a2b30 transparent transparent transparent; -fx-border-width: 1 0 0 0; }
+.theme-dark.dialog-pane > .button-bar > .container > .button { -fx-background-color: #202126; -fx-text-fill: #f5f5f6; -fx-background-radius: 8; -fx-cursor: hand; }
+.theme-dark.dialog-pane > .button-bar > .container > .button:hover { -fx-background-color: #2a2b30; }
+
 /* ================= LIGHT THEME (mirrors every rule above) ================= */
 .theme-light { -fx-background-color: #f6f6f7; }
 .theme-light .label { -fx-text-fill: #17181b; }
@@ -394,17 +595,55 @@
 }
 .theme-light .logo-glyph { -fx-text-fill: #ff7a1f; -fx-font-size: 34px; }
 .theme-light .title-label { -fx-text-fill: #17181b; -fx-font-size: 22px; -fx-font-weight: bold; }
+/* Two-tone wordmark -- see the dark-theme twin for why this must follow .title-label. */
+.theme-light .brand-accent { -fx-text-fill: #ff7a1f; }
 .theme-light .subtitle-label { -fx-text-fill: #6b6c72; -fx-font-size: 13px; }
 
-/* ---- Top nav tabs (Home / Library / Servers) ---- */
-.theme-light .nav-group { -fx-padding: 0 0 0 4; }
+/* ---- Top nav tabs (Home / Friends / Servers) -- twin of the dark-theme block above ---- */
+.theme-light .nav-group { -fx-padding: 0; }
 .theme-light .nav-tab-button {
-    -fx-background-color: transparent; -fx-text-fill: #6b6c72; -fx-font-weight: bold;
-    -fx-padding: 9 16; -fx-background-radius: 8; -fx-cursor: hand; -fx-border-color: transparent;
+    -fx-background-color: transparent; -fx-text-fill: #545a62; -fx-font-weight: bold;
+    -fx-font-size: 19px; -fx-padding: 0 27; -fx-background-radius: 8; -fx-cursor: hand;
+    -fx-border-color: transparent; -fx-border-width: 1; -fx-border-radius: 8;
 }
 .theme-light .nav-tab-button:hover { -fx-text-fill: #17181b; -fx-background-color: #f0f0f1; }
-.theme-light .nav-tab-active { -fx-text-fill: #e8690f; -fx-background-color: rgba(255,122,31,0.12); }
-.theme-light .nav-tab-active:hover { -fx-text-fill: #e8690f; -fx-background-color: rgba(255,122,31,0.12); }
+.theme-light .nav-tab-button .icon-svg { -fx-fill: #5f646b; }
+.theme-light .nav-tab-active {
+    -fx-text-fill: #e8690f;
+    -fx-border-color: #ff7a1f transparent;
+    -fx-border-width: 2 0 2 0;
+    -fx-border-radius: 6;
+    -fx-background-color: linear-gradient(to bottom,
+        rgba(253,104,48,0.07) 0%, rgba(253,104,48,0.10) 60%, rgba(253,104,48,0.30) 100%);
+    -fx-background-radius: 6;
+}
+.theme-light .nav-tab-active:hover {
+    -fx-text-fill: #e8690f;
+    -fx-border-color: #ff7a1f transparent;
+    -fx-border-width: 2 0 2 0;
+    -fx-background-color: linear-gradient(to bottom,
+        rgba(253,104,48,0.07) 0%, rgba(253,104,48,0.10) 60%, rgba(253,104,48,0.30) 100%);
+    -fx-background-radius: 6;
+}
+/* Warm bloom on the active glyph/label -- twin of the dark-theme block above (see it for the
+   sampling that produced it). Tuned down here so it never smears on the white bar. */
+.theme-light .nav-tab-active .icon-svg {
+    -fx-fill: #e8690f;
+    -fx-effect: dropshadow(gaussian, rgba(255,122,31,0.60), 8, 0.45, 0, 0);
+}
+.theme-light .nav-tab-active .text {
+    -fx-effect: dropshadow(gaussian, rgba(255,122,31,0.50), 7, 0.40, 0, 0);
+}
+.theme-light .bar-divider { -fx-background-color: #e2e2e4; }
+
+/* Bare top-bar glyph buttons (gear + update download) -- twin of the dark-theme block above. */
+.theme-light .top-icon-button {
+    -fx-background-color: transparent; -fx-background-radius: 8; -fx-cursor: hand;
+    -fx-padding: 0; -fx-border-color: transparent; -fx-border-radius: 8;
+}
+.theme-light .top-icon-button:hover { -fx-background-color: #f0f0f1; }
+.theme-light .top-icon-button .icon-svg { -fx-fill: #6b6c72; }
+.theme-light .top-icon-button:hover .icon-svg { -fx-fill: #e8690f; }
 
 .theme-light .icon-button {
     -fx-background-color: #f0f0f1; -fx-text-fill: #17181b; -fx-background-radius: 50%;
@@ -423,16 +662,37 @@
     -fx-background-color: #f0f0f1; -fx-background-radius: 20; -fx-padding: 4;
     -fx-border-color: #e2e2e4; -fx-border-radius: 20;
 }
-.theme-light .mode-toggle-btn { -fx-background-radius: 16; -fx-padding: 9 0; -fx-font-weight: bold; }
+.theme-light .mode-toggle-btn { -fx-background-radius: 16; -fx-padding: 9 0; -fx-font-weight: bold; -fx-background-color: transparent; }
 .theme-light .version-tile {
-    -fx-background-color: #f0f0f1; -fx-text-fill: #17181b; -fx-background-radius: 10;
-    -fx-padding: 14 16; -fx-font-weight: bold; -fx-cursor: hand;
-    -fx-border-color: #e2e2e4; -fx-border-radius: 10; -fx-alignment: CENTER_LEFT;
+    -fx-background-color: transparent; -fx-text-fill: #3a3b40; -fx-background-radius: 10;
+    -fx-padding: 11 14; -fx-font-weight: bold; -fx-cursor: hand;
+    -fx-border-color: transparent transparent #e9e9eb transparent; -fx-border-width: 0 0 1 0;
+    -fx-alignment: CENTER_LEFT;
 }
-.theme-light .version-tile:hover { -fx-border-color: #c7c7ca; }
+.theme-light .version-tile:hover { -fx-background-color: #f0f0f1; -fx-text-fill: #17181b; }
+.theme-light .version-tile-icon-badge {
+    -fx-background-color: #ffffff; -fx-background-radius: 50%;
+    -fx-min-width: 26; -fx-min-height: 26; -fx-max-width: 26; -fx-max-height: 26;
+    -fx-border-color: #e2e2e4; -fx-border-radius: 50%;
+}
+.theme-light .version-tile-icon-badge .icon-svg { -fx-fill: #6b6c72; }
+.theme-light .version-tile-active .version-tile-icon-badge {
+    -fx-background-color: linear-gradient(to bottom right, #ff9a4d, #ff7a1f);
+    -fx-border-color: transparent;
+    -fx-effect: dropshadow(gaussian, rgba(255,122,31,0.55), 10, 0.5, 0, 0);
+}
+.theme-light .version-tile-active .version-tile-icon-badge .icon-svg { -fx-fill: #ffffff; }
 .theme-light .version-tile-active {
-    -fx-border-color: #ff7a1f; -fx-background-color: rgba(255,122,31,0.10); -fx-text-fill: #e8690f;
+    -fx-border-color: #ff7a1f; -fx-border-width: 1.5; -fx-border-radius: 10;
+    -fx-background-color: linear-gradient(to bottom right, rgba(255,122,31,0.16), rgba(255,122,31,0.05));
+    -fx-text-fill: #e8690f;
+    -fx-effect: dropshadow(gaussian, rgba(255,122,31,0.35), 14, 0.25, 0, 0);
 }
+.theme-light .version-tile-active:hover { -fx-background-color: linear-gradient(to bottom right, rgba(255,122,31,0.20), rgba(255,122,31,0.07)); }
+/* Two-line modpack profile tiles (name + "version • loader" subtitle). */
+.theme-light .tile-name-label { -fx-text-fill: #17181b; -fx-font-size: 13px; -fx-font-weight: bold; }
+.theme-light .tile-subtitle-label { -fx-text-fill: #8a8b90; -fx-font-size: 11.5px; -fx-font-weight: normal; }
+.theme-light .version-tile-active .tile-name-label { -fx-text-fill: #e8690f; }
 
 
 .theme-light .placeholder-page {
@@ -465,14 +725,24 @@
 .theme-light .combo-box-popup .list-cell:selected { -fx-background-color: rgba(255,122,31,0.15); -fx-text-fill: #e8690f; }
 
 .theme-light .play-button {
-    -fx-background-color: #ff7a1f; -fx-text-fill: #ffffff; -fx-font-weight: bold;
+    -fx-text-fill: #ffffff; -fx-font-weight: bold;
     -fx-font-size: 19px; -fx-padding: 18; -fx-background-radius: 10; -fx-cursor: hand;
 }
-.theme-light .play-button:hover { -fx-background-color: #e8690f; }
-.theme-light .play-button-dey { -fx-background-color: #ff7a1f; -fx-text-fill: #ffffff; }
-.theme-light .play-button-dey:hover { -fx-background-color: #e8690f; }
-.theme-light .play-button-vanilla { -fx-background-color: #4aa8ff; -fx-text-fill: #ffffff; }
-.theme-light .play-button-vanilla:hover { -fx-background-color: #2f8ce0; }
+.theme-light .play-button .icon-svg { -fx-fill: #ffffff; }
+/* NOTE: the glow itself is applied in code (LauncherApp.playButtonGlow), not here -- see the
+   theme-dark play-button-dey comment above. */
+.theme-light .play-button-dey {
+    -fx-background-color: linear-gradient(from 0% 0% to 90% 100%, #ffa456 0%, #ff7a1f 45%, #f2500c 100%);
+}
+.theme-light .play-button-dey:hover {
+    -fx-background-color: linear-gradient(from 0% 0% to 90% 100%, #ffb06a 0%, #ff8a35 45%, #ff6018 100%);
+}
+.theme-light .play-button-vanilla {
+    -fx-background-color: linear-gradient(from 0% 0% to 90% 100%, #7cc9ff 0%, #4aa8ff 45%, #2178c9 100%);
+}
+.theme-light .play-button-vanilla:hover {
+    -fx-background-color: linear-gradient(from 0% 0% to 90% 100%, #96d4ff 0%, #62b6ff 45%, #348edb 100%);
+}
 .theme-light .play-progress .bar { -fx-background-color: #ff7a1f; -fx-background-radius: 6; }
 .theme-light .play-progress .track { -fx-background-color: #e2e2e4; -fx-background-radius: 6; }
 
@@ -483,8 +753,18 @@
 .theme-light .pill-button:hover { -fx-background-color: #e2e2e4; -fx-border-color: #ff7a1f; }
 .theme-light .toggle-button { -fx-background-color: #f0f0f1; -fx-text-fill: #17181b; -fx-background-radius: 20; }
 .theme-light .toggle-button:selected { -fx-background-color: rgba(255,122,31,0.15); -fx-text-fill: #e8690f; -fx-border-color: #ff7a1f; -fx-border-radius: 20; }
-.theme-light .mode-toggle-btn.mode-dey:selected { -fx-background-color: rgba(255,122,31,0.15); -fx-text-fill: #e8690f; -fx-border-color: #ff7a1f; -fx-border-radius: 20; }
-.theme-light .mode-toggle-btn.mode-vanilla:selected { -fx-background-color: rgba(74,168,255,0.15); -fx-text-fill: #2f8ce0; -fx-border-color: #4aa8ff; -fx-border-radius: 20; }
+.theme-light .mode-toggle-btn.mode-dey { -fx-text-fill: #e8690f; }
+.theme-light .mode-toggle-btn.mode-vanilla { -fx-text-fill: #2f8ce0; }
+.theme-light .mode-toggle-btn.mode-dey:selected {
+    -fx-background-color: linear-gradient(from 0% 0% to 100% 100%, #ffa456 0%, #ff7a1f 55%, #f2500c 100%);
+    -fx-text-fill: #ffffff; -fx-border-color: transparent; -fx-border-radius: 16;
+    -fx-effect: dropshadow(gaussian, rgba(255,122,31,0.5), 14, 0.4, 0, 2);
+}
+.theme-light .mode-toggle-btn.mode-vanilla:selected {
+    -fx-background-color: linear-gradient(from 0% 0% to 100% 100%, #7cc9ff 0%, #4aa8ff 55%, #2178c9 100%);
+    -fx-text-fill: #ffffff; -fx-border-color: transparent; -fx-border-radius: 16;
+    -fx-effect: dropshadow(gaussian, rgba(74,168,255,0.5), 14, 0.4, 0, 2);
+}
 .theme-light .logout-button { -fx-background-color: transparent; -fx-text-fill: #e8690f; -fx-border-color: #ff7a1f; -fx-border-radius: 20; -fx-background-radius: 20; -fx-padding: 10 22; -fx-cursor: hand; }
 .theme-light .logout-button:hover { -fx-background-color: rgba(255,122,31,0.10); }
 
@@ -497,18 +777,25 @@
 }
 .theme-light .settings-apply-button-ready:hover { -fx-background-color: #e8690f; }
 
+/* ---- Top-bar account block -- twin of the dark-theme block above ---- */
 .theme-light .account-button {
-    -fx-background-color: #ffffff; -fx-background-radius: 20; -fx-border-color: #e2e2e4;
-    -fx-border-radius: 20; -fx-padding: 6 16 6 6; -fx-cursor: hand;
+    -fx-background-color: transparent; -fx-background-radius: 8; -fx-border-color: transparent;
+    -fx-border-width: 0; -fx-padding: 0; -fx-cursor: hand;
 }
-.theme-light .account-button:hover { -fx-border-color: #ff7a1f; }
+.theme-light .account-button:hover .account-btn-name { -fx-text-fill: #000000; }
+.theme-light .account-button:hover .account-btn-face-host { -fx-border-color: #ff7a1f; }
 .theme-light .account-btn-face-host {
-    -fx-background-color: #f0f0f1; -fx-background-radius: 8; -fx-border-color: #e2e2e4; -fx-border-radius: 8;
+    -fx-background-color: #f0f0f1; -fx-background-radius: 50%;
+    -fx-border-color: #e2e2e4; -fx-border-radius: 50%; -fx-border-width: 1;
     -fx-padding: 2;
 }
-.theme-light .account-btn-name { -fx-text-fill: #17181b; -fx-font-weight: bold; -fx-font-size: 14px; }
-.theme-light .account-status-dot { -fx-min-width: 9px; -fx-min-height: 9px; -fx-max-width: 9px; -fx-max-height: 9px; -fx-background-radius: 50%; }
-.theme-light .dot-online { -fx-background-color: #ff7a1f; }
+.theme-light .account-btn-name { -fx-text-fill: #17181b; -fx-font-weight: bold; -fx-font-size: 20px; }
+.theme-light .account-status-dot {
+    -fx-min-width: 12px; -fx-min-height: 12px; -fx-max-width: 12px; -fx-max-height: 12px;
+    -fx-background-radius: 50%; -fx-border-radius: 50%; -fx-border-width: 2;
+    -fx-border-color: #ffffff;
+}
+.theme-light .dot-online { -fx-background-color: #19e546; }
 .theme-light .dot-offline { -fx-background-color: #17181b; }
 .theme-light .dot-none { -fx-background-color: transparent; -fx-border-color: #c7c7ca; -fx-border-radius: 50%; }
 
@@ -607,14 +894,31 @@
 .theme-light .slider .track { -fx-background-color: #e2e2e4; -fx-background-radius: 4; }
 .theme-light .slider .thumb { -fx-background-color: #ff7a1f; }
 
-.theme-light .log-section { -fx-background-color: #f6f6f7; }
+.theme-light .log-section {
+    -fx-background-color: #f7f8f9;
+    -fx-background-radius: 12; -fx-border-color: #e2e2e4; -fx-border-radius: 12;
+}
+.theme-light .log-header {
+    -fx-background-color: #eceef0;
+    -fx-background-radius: 12 12 0 0;
+    -fx-padding: 6 10 6 20;
+}
+.theme-light .log-title { -fx-text-fill: #4a4b52; -fx-font-size: 11px; -fx-font-weight: bold; }
 .theme-light .log-area {
     -fx-control-inner-background: #ffffff; -fx-text-fill: #3a3b40;
     -fx-font-family: "JetBrains Mono", "Consolas", monospace; -fx-font-size: 14.5px;
-    -fx-background-radius: 12; -fx-border-color: #e2e2e4; -fx-border-radius: 12;
+    -fx-background-color: transparent; -fx-background-insets: 0; -fx-border-color: transparent;
+    -fx-padding: 4 8 4 12;
 }
-.theme-light .main-split { -fx-background-color: #f6f6f7; }
-.theme-light .main-split > .split-pane-divider { -fx-background-color: #e2e2e4; }
+
+.theme-light .log-tool-button {
+    -fx-background-color: transparent; -fx-text-fill: #6b6c72; -fx-background-radius: 8;
+    -fx-min-width: 30; -fx-min-height: 30; -fx-max-width: 30; -fx-max-height: 30;
+    -fx-padding: 0; -fx-cursor: hand; -fx-border-color: transparent;
+}
+.theme-light .log-tool-button .icon-svg { -fx-fill: #6b6c72; }
+.theme-light .log-tool-button:hover { -fx-background-color: #f0f0f1; -fx-text-fill: #e8690f; }
+.theme-light .log-tool-button:hover .icon-svg { -fx-fill: #e8690f; }
 
 /* Console-tab toolbar: Developer/Start + version + Play cluster on one wrapping line. */
 .theme-light .server-toolbar {
@@ -655,6 +959,31 @@
     -fx-text-fill: #e8690f; -fx-background-color: rgba(255,122,31,0.12); -fx-background-radius: 20;
     -fx-padding: 4 12; -fx-font-weight: bold; -fx-font-size: 11px;
 }
+
+/* Shared (semi self-hosted) servers: role pill, GIVEN badge, inline cloud sync -- mirrors the
+   dark-theme block above. */
+.theme-light .role-pill {
+    -fx-text-fill: #e8690f; -fx-background-color: rgba(255,122,31,0.12);
+    -fx-background-radius: 20; -fx-padding: 3 11; -fx-font-weight: bold; -fx-font-size: 11px;
+}
+.theme-light .role-pill-none {
+    -fx-text-fill: #6b6c72; -fx-background-color: #e2e2e4;
+    -fx-background-radius: 20; -fx-padding: 3 11; -fx-font-weight: bold; -fx-font-size: 11px;
+}
+.theme-light .given-badge {
+    -fx-text-fill: #ffffff; -fx-background-color: #e8690f;
+    -fx-background-radius: 20; -fx-padding: 3 11; -fx-font-weight: bold; -fx-font-size: 11px;
+}
+.theme-light .given-badge-sm { -fx-font-size: 9.5px; -fx-padding: 2 7; -fx-background-radius: 8; }
+
+.theme-light .sync-inline {
+    -fx-background-color: #f0f0f1; -fx-background-radius: 10; -fx-padding: 12 14;
+    -fx-border-color: #e2e2e4; -fx-border-radius: 10;
+}
+.theme-light .sync-inline .sync-label { -fx-text-fill: #17181b; -fx-font-size: 13px; }
+.theme-light .sync-progress { -fx-pref-height: 8; }
+.theme-light .sync-progress > .track { -fx-background-color: #e2e2e4; -fx-background-radius: 6; }
+.theme-light .sync-progress > .bar { -fx-background-color: #ff7a1f; -fx-background-radius: 6; -fx-padding: 3; }
 
 /* "Share over the Internet" card on the server Console tab. */
 .theme-light .server-share-card {
@@ -716,6 +1045,25 @@
 }
 .theme-light .dialog-pane .button-bar .button { -fx-background-color: #ffffff; -fx-text-fill: #17181b; -fx-border-color: #e2e2e4; -fx-border-radius: 8; }
 .theme-light .dialog-pane .button-bar .button:hover { -fx-background-color: #f0f0f1; }
+
+/* Launcher dialogs that carry the theme class on the DialogPane itself -- mirrors the dark block
+   above. Without these, a dark launcher shows its own dialogs with a light grey pane background. */
+.theme-light.dialog-pane { -fx-background-color: #ffffff; }
+.theme-light.dialog-pane > .header-panel { -fx-background-color: #ffffff; }
+.theme-light.dialog-pane > .header-panel > .label { -fx-text-fill: #17181b; -fx-font-size: 14px; }
+.theme-light.dialog-pane > .content { -fx-background-color: #f6f6f7; }
+.theme-light.dialog-pane > .content > .label { -fx-text-fill: #17181b; }
+.theme-light.dialog-pane > .content .radio-button { -fx-text-fill: #17181b; -fx-font-size: 14px; }
+.theme-light.dialog-pane > .content .radio-button .radio { -fx-background-color: #ffffff; -fx-border-color: #e2e2e4; }
+.theme-light.dialog-pane > .content .radio-button:selected .radio { -fx-border-color: #ff7a1f; }
+.theme-light.dialog-pane > .content .radio-button:selected .radio .dot { -fx-background-color: #ff7a1f; }
+.theme-light.dialog-pane > .content .check-box { -fx-text-fill: #17181b; }
+.theme-light.dialog-pane > .content .check-box .box { -fx-background-color: #ffffff; -fx-border-color: #e2e2e4; }
+.theme-light.dialog-pane > .content .check-box:selected .box { -fx-background-color: #ff7a1f; -fx-border-color: #ff7a1f; }
+.theme-light.dialog-pane > .content .check-box:selected .mark { -fx-background-color: #ffffff; }
+.theme-light.dialog-pane > .button-bar { -fx-background-color: #eceef0; -fx-border-color: #e2e2e4 transparent transparent transparent; -fx-border-width: 1 0 0 0; }
+.theme-light.dialog-pane > .button-bar > .container > .button { -fx-background-color: #ffffff; -fx-text-fill: #17181b; -fx-border-color: #e2e2e4; -fx-background-radius: 8; -fx-border-radius: 8; -fx-cursor: hand; }
+.theme-light.dialog-pane > .button-bar > .container > .button:hover { -fx-background-color: #f0f0f1; }
 
 /* ============================================================
    Cross-platform JavaFX SVG icon system
@@ -899,6 +1247,76 @@
     -fx-border-color: #dfe1e5;
 }
 
+/* ============================================================
+   Welcome / "Get Started" screen -- shown once, on first launch,
+   full-bleed background art with a dark scrim so the brand block,
+   the three feature rows and the two action buttons stay readable
+   over any part of the artwork. Same three-color system as the
+   rest of the app: orange is still the only accent.
+   ============================================================ */
+.welcome-root { -fx-background-color: #0d0d0f; }
+.welcome-bg {
+    -fx-background-image: url("images/ui/welcome-bg.png");
+    -fx-background-size: cover;
+    -fx-background-position: center center;
+    -fx-background-repeat: no-repeat;
+}
+.welcome-scrim {
+    -fx-background-color: linear-gradient(to top right,
+        rgba(9,9,11,0.94) 0%, rgba(9,9,11,0.72) 30%, rgba(9,9,11,0.28) 58%, rgba(9,9,11,0.02) 78%);
+}
+.welcome-logo-glyph { -fx-text-fill: #ff7a1f; -fx-font-size: 30px; }
+.welcome-title { -fx-text-fill: #f5f5f6; -fx-font-size: 30px; -fx-font-weight: bold; }
+.welcome-tagline { -fx-text-fill: #9a9ba3; -fx-font-size: 15px; }
+.welcome-feature-icon {
+    -fx-background-color: rgba(255,122,31,0.14); -fx-background-radius: 12;
+    -fx-border-color: #ff7a1f; -fx-border-radius: 12;
+    -fx-min-width: 44; -fx-min-height: 44; -fx-max-width: 44; -fx-max-height: 44;
+    -fx-alignment: CENTER;
+}
+.welcome-feature-icon .icon-svg { -fx-fill: #ff7a1f; }
+.welcome-feature-title { -fx-text-fill: #f5f5f6; -fx-font-size: 15px; -fx-font-weight: bold; }
+.welcome-feature-desc { -fx-text-fill: #9a9ba3; -fx-font-size: 13px; -fx-wrap-text: true; }
+.welcome-primary-btn {
+    -fx-background-color: #ff7a1f; -fx-text-fill: #0d0d0f; -fx-font-weight: bold;
+    -fx-font-size: 15px; -fx-padding: 14 26; -fx-background-radius: 10; -fx-cursor: hand;
+}
+.welcome-primary-btn:hover { -fx-background-color: #e8690f; }
+.welcome-secondary-btn {
+    -fx-background-color: rgba(32,33,38,0.85); -fx-text-fill: #f5f5f6; -fx-font-weight: bold;
+    -fx-font-size: 15px; -fx-padding: 14 22; -fx-background-radius: 10; -fx-cursor: hand;
+    -fx-border-color: #2a2b30; -fx-border-radius: 10;
+}
+.welcome-secondary-btn:hover { -fx-border-color: #ff7a1f; }
+.welcome-dot {
+    -fx-background-color: rgba(154,155,163,0.4); -fx-background-radius: 50%;
+    -fx-min-width: 7; -fx-min-height: 7; -fx-max-width: 7; -fx-max-height: 7;
+}
+.welcome-dot-active { -fx-background-color: #ff7a1f; -fx-min-width: 18; }
+
+/* ---- Home/Play card: full-bleed pack artwork behind the title/description,
+   fading into the card's normal solid color by the time the loader/version
+   inputs and Play button begin, so they always stay on a fully opaque
+   surface regardless of the art underneath. ---- */
+.theme-dark .play-card-art {
+    -fx-background-image: url("images/ui/home-bg.png");
+    -fx-background-size: cover;
+    -fx-background-position: top center;
+    -fx-background-repeat: no-repeat;
+    -fx-background-radius: 12;
+}
+.theme-dark .play-card-scrim {
+    -fx-background-color: linear-gradient(to bottom,
+        rgba(23,24,27,0.10) 0%, rgba(23,24,27,0.38) 50%, #17181b 66%, #17181b 100%);
+    -fx-background-radius: 12;
+}
+.theme-light .play-card-art { -fx-background-image: url("images/ui/home-bg.png"); -fx-background-size: cover; -fx-background-position: top center; -fx-background-repeat: no-repeat; -fx-background-radius: 12; }
+.theme-light .play-card-scrim {
+    -fx-background-color: linear-gradient(to bottom,
+        rgba(255,255,255,0.10) 0%, rgba(255,255,255,0.38) 50%, #ffffff 66%, #ffffff 100%);
+    -fx-background-radius: 12;
+}
+
 /* ---- Main-window window controls (- [] x) on the borderless top bar ---- */
 .win-ctl-group { -fx-spacing: 2; }
 .win-ctl-button {
@@ -908,24 +1326,39 @@
 }
 .theme-dark .win-ctl-button:hover { -fx-background-color: #202126; }
 .theme-light .win-ctl-button:hover { -fx-background-color: #f0f0f1; }
+/* ...and the resting state has to restate "transparent" at the same specificity as the themed
+   `.button` plate rule, which would otherwise paint a grey box behind every - [] x glyph. */
+.theme-dark .win-ctl-button, .theme-light .win-ctl-button { -fx-background-color: transparent; }
 .theme-dark .win-glyph-bar { -fx-fill: #9a9ba3; }
 .theme-light .win-glyph-bar { -fx-fill: #6b6c72; }
 .theme-dark .win-glyph-rect { -fx-stroke: #9a9ba3; -fx-fill: transparent; }
 .theme-light .win-glyph-rect { -fx-stroke: #6b6c72; -fx-fill: transparent; }
-.theme-dark .win-glyph-x { -fx-text-fill: #f5f5f6; -fx-font-size: 17px; -fx-font-weight: bold; }
-.theme-light .win-glyph-x { -fx-text-fill: #17181b; -fx-font-size: 17px; -fx-font-weight: bold; }
+.theme-dark .win-glyph-x { -fx-text-fill: #9a9ba3; -fx-font-size: 22px; -fx-font-weight: normal; }
+.theme-light .win-glyph-x { -fx-text-fill: #6b6c72; -fx-font-size: 22px; -fx-font-weight: normal; }
 .theme-dark .win-ctl-close:hover { -fx-background-color: #e5484d; }
 .theme-dark .win-ctl-close:hover .win-glyph-x { -fx-text-fill: #ffffff; }
 .theme-light .win-ctl-close:hover { -fx-background-color: #e5484d; }
 .theme-light .win-ctl-close:hover .win-glyph-x { -fx-text-fill: #ffffff; }
 
-/* ---- Orange update (download) button shown on the top bar when a newer release exists ---- */
+/* ---- Orange update (download) glyph shown on the top bar when a newer release exists ----
+   The reference draws this one as a bare orange glyph with a soft orange glow, not as a filled
+   button, so it stays transparent and only its own glow brightens on hover. */
 .update-button {
-    -fx-background-color: #ff7a1f; -fx-text-fill: #0d0d0f;
-    -fx-effect: dropshadow(gaussian, rgba(255,122,31,0.45), 14, 0, 0, 2);
+    -fx-background-color: transparent; -fx-text-fill: #0d0d0f;
+    -fx-effect: dropshadow(gaussian, rgba(255,122,31,0.55), 16, 0, 0, 0);
 }
-.update-button:hover { -fx-background-color: #ff8f40; }
-.update-button .icon-svg { -fx-fill: #0d0d0f; }
+.update-button:hover {
+    -fx-background-color: transparent;
+    -fx-effect: dropshadow(gaussian, rgba(255,143,64,0.90), 20, 0, 0, 0);
+}
+.update-button .icon-svg { -fx-fill: #ff7a1f; }
+/* ...and it must never pick up the shared hover plate the other bare glyph buttons get: this pair
+   is more specific than .theme-dark/.theme-light .top-icon-button:hover, which would otherwise
+   paint a grey box behind an orange glyph that is meant to stay on the bar's own background. */
+.theme-dark .top-icon-button.update-button,
+.theme-light .top-icon-button.update-button { -fx-background-color: transparent; }
+.theme-dark .top-icon-button.update-button:hover,
+.theme-light .top-icon-button.update-button:hover { -fx-background-color: transparent; }
 
 /* ---- Update-in-progress loading card (overlay) ---- */
 .theme-dark .update-card, .theme-light .update-card {
@@ -946,6 +1379,15 @@
 .theme-light .text-area .content .text { -fx-fill: #17181b; }
 .theme-light .text-area .scroll-pane, .theme-light .text-area .scroll-pane .viewport { -fx-background-color: transparent; }
 .theme-light .text-area .content:hover, .theme-light .text-area:focused .content { -fx-background-color: #f0f0f1; }
+/* ...but the game-output console is the exception: it paints its own panel (see .log-section), so
+   its content area keeps that panel's body colour instead of the generic text-area fill above --
+   these three rules come last on purpose, since they tie with the generic ones on specificity. */
+.theme-dark .log-area .content { -fx-background-color: #080c0f; }
+.theme-dark .log-area .content .text { -fx-fill: #8a8f96; }
+.theme-dark .log-area .content:hover, .theme-dark .log-area:focused .content { -fx-background-color: #080c0f; }
+.theme-light .log-area .content { -fx-background-color: #ffffff; }
+.theme-light .log-area .content .text { -fx-fill: #3a3b40; }
+.theme-light .log-area .content:hover, .theme-light .log-area:focused .content { -fx-background-color: #ffffff; }
 
 /* ---- Server Settings: danger zone + red trashcan delete button ---- */
 .server-danger-zone {

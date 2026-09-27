@@ -106,6 +106,10 @@ public class LauncherApp extends Application {
     private String packBackdropKey = "";
     private static final String MODPACK_BUTTON_TIP = "Modpacks -- add one, or drag & drop a .mrpack / .zip";
     private Button playButton;
+    /** Soft glow behind the Play button (matches the reference design's halo); its radius/spread
+     * breathe via {@link #playButtonGlowPulse} and its color switches with {@link #setMode}. */
+    private DropShadow playButtonGlow;
+    private Timeline playButtonGlowPulse;
     private WaveLaunchBar launchProgress;
     private Scene scene;
     private Stage stage;
@@ -121,6 +125,14 @@ public class LauncherApp extends Application {
     private FriendNotesStore friendNotes; // per-friend personal notes, saved only on this PC
     private ServerStore serverStore;
     private AddedServersStore addedServersStore;
+    /** Semi self-hosted servers over the shared servers repos; null when the backend isn't configured. */
+    private com.deylauncher.servers.SemiHostedService semiHostedService;
+    /** This PC's link records: which local folder is which shared server, and which role I hold there. */
+    private com.deylauncher.servers.SemiHostedLinkStore semiHostedLinks;
+    /** Server ids whose lease this launcher currently holds, with the thread renewing it. */
+    private final java.util.Map<String, Thread> hostingHeartbeats = new java.util.HashMap<>();
+    /** When the shared-with-you list was last refreshed from the cloud, to throttle that lookup. */
+    private volatile long lastSharedRefreshAt;
     /** address -> the Minecraft version string the last successful status ping reported for it. Used
      *  as the default version when joining that server (added server or a friend's), so joining
      *  launches with the SERVER's own version rather than whatever happens to be selected in the
@@ -179,6 +191,29 @@ public class LauncherApp extends Application {
     private Button navHomeBtn, navFriendsBtn, navServersBtn;
     private StackPane pageHost;
     private Node mainPageRoot;
+
+    // ---- Top-bar geometry, straight off the reference design (its numbers scaled to this bar's
+    // height). Everything here is measured in px at 100% UI scale; the type sizes live in theme.css
+    // (and DynamicStyle, which keeps them following the Settings sliders) so the CSS and the code
+    // cannot drift apart on anything a user can resize.
+    /** Inner height of the bar: the nav tabs span it edge to edge, so only the bar's own 1px
+     *  hairline stays visible above/below the active tab, exactly as in the reference. */
+    private static final double TOP_BAR_TAB_HEIGHT = 70;
+    /** Nav tab glyphs -- the reference draws them noticeably larger than the 14px body text. */
+    private static final double TOP_BAR_TAB_ICON = 30;
+    /** Space between the wordmark and the first tab; the reference leaves a wide, deliberate gap. */
+    private static final double TOP_BAR_BRAND_GAP = 44;
+    /** Brand glyph height. Uses app-icon-nav.png (transparent plate), not the window icon: on a dark
+     *  bar the white plate behind app-icon.png reads as a stray white square. */
+    private static final double TOP_BAR_BRAND_GLYPH = 42;
+    /** The bar's bare icon glyphs (download + gear): no circle, no border -- just the glyph. */
+    private static final double TOP_BAR_ICON = 30;
+    /** Click box around those bare glyphs (bigger than the glyph so they stay easy to hit). */
+    private static final double TOP_BAR_ICON_BOX = 44;
+    /** Account face diameter (the reference's avatar is ~75% of the bar's height). */
+    private static final double TOP_BAR_FACE = 48;
+    /** Height of the two hairlines fencing the account block off from the nav and the window controls. */
+    private static final double TOP_BAR_DIVIDER_HEIGHT = 40;
 
     // ---- Main-window custom chrome (borderless stage) + self-updater ----
     private javafx.scene.layout.BorderPane root;      // the themed content root of the main window
@@ -255,6 +290,7 @@ public class LauncherApp extends Application {
         this.friendNotes = new FriendNotesStore(gameFiles.root);
         this.serverStore = new ServerStore(gameFiles.root);
         this.addedServersStore = new AddedServersStore(gameFiles.root);
+        this.semiHostedLinks = new com.deylauncher.servers.SemiHostedLinkStore(gameFiles.root);
         // Before anything lists packs or resolves an instance folder: a pack an older build put into the
         // plain <mc>-<loader> folder gets its own folder, so plain Vanilla/DEY never shows its mods.
         this.packSeparationNotes = ModpackMeta.separateLegacyPacks(gameFiles.root);
@@ -263,6 +299,8 @@ public class LauncherApp extends Application {
         this.deyCapesService = githubConfig.isConfigured() ? new DeyCapesService(githubConfig) : null;
         this.optionsKitsRepository = githubConfig.isConfigured()
                 ? new com.deylauncher.optionskits.OptionsKitsRepository(githubConfig) : null;
+        this.semiHostedService = githubConfig.isConfigured()
+                ? new com.deylauncher.servers.SemiHostedService(githubConfig) : null;
 
         // Best-effort: seed the github repo's capes catalog + texture folder the first time
         // the app opens with github configured, so Dey capes exist even on a fresh repo.
@@ -317,6 +355,15 @@ public class LauncherApp extends Application {
         // A modpack file/folder can be dropped anywhere in the launcher window: that opens the
         // "Install Modpack" window already pointed at it (the drag & drop half of the feature).
         installModpackDropTarget(windowStack);
+
+        // First-ever launch: show the "Get Started" welcome screen on top of the (already built,
+        // already loading) launcher home. Either button just dismisses it -- account sign-in
+        // itself stays behind the top bar's Account button, same as on every later launch.
+        if (firstLaunch) {
+            Node[] welcomeHolder = new Node[1];
+            welcomeHolder[0] = buildWelcomeScreen(() -> windowStack.getChildren().remove(welcomeHolder[0]));
+            windowStack.getChildren().add(welcomeHolder[0]);
+        }
 
         if (firstLaunch) {
             javafx.geometry.Rectangle2D bounds =
@@ -607,8 +654,10 @@ public class LauncherApp extends Application {
         scene.getStylesheets().add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
     }
 
-    // ---- Center area: a page host (Home / Library / Servers) over a full-bleed background,
-    // the game-output log fills the rest and stays visible across every page. ----
+    // ---- Center area: a page host (Home / Friends / Servers) filling the middle of the window.
+    // The game-output console is NOT here: the reference draws it inside the Home page's right
+    // column (under the Play block), so buildMainPage() places it there. Other pages keep their
+    // own layout, and the console's pop-out button is what keeps the log watchable from them. ----
     private BorderPane buildCenterArea() {
         BorderPane center = new BorderPane();
         center.getStyleClass().add("center-area");
@@ -618,79 +667,116 @@ public class LauncherApp extends Application {
         pageHost.getStyleClass().add("card-host");
         VBox.setVgrow(pageHost, Priority.ALWAYS);
 
-        VBox logSection = buildLogPane();
-
-        // SplitPane lets the user themselves resize how much of the window is
-        // the page content vs. the log, instead of us guessing a fixed split --
-        // this is what "auto scale to anything" really means in practice.
-        SplitPane split = new SplitPane(pageHost, logSection);
-        split.setOrientation(javafx.geometry.Orientation.VERTICAL);
-        split.setDividerPositions(0.62);
-        split.getStyleClass().add("main-split");
-        VBox.setVgrow(split, Priority.ALWAYS);
-
-        center.setCenter(split);
+        center.setCenter(pageHost);
         return center;
     }
 
-    // ---- Top bar: brand + Home/Library/Servers nav + settings + account ----
+    // ---- Top bar: brand + Home/Friends/Servers nav + update/settings + account ----
+    // Structure and numbers follow the launcher's reference design exactly: brand glyph on a
+    // transparent plate, the two-tone DEY/LAUNCHER wordmark, three full-bar-height tabs
+    // (glyph + label; the active one wears a 1px orange border over an orange gradient), then a
+    // bare orange download glyph, a hairline, the account block (round face + name + status dot),
+    // the bare gear, another hairline, and the - [] x controls.
     private HBox buildTopBar() {
         ImageView logo = new ImageView(
-        new Image(getClass().getResourceAsStream("/app-icon.png"))
+        new Image(getClass().getResourceAsStream("/app-icon-nav.png"))
         );
-        logo.setFitWidth(34);
-        logo.setFitHeight(34);
+        logo.setFitWidth(TOP_BAR_BRAND_GLYPH);
+        logo.setFitHeight(TOP_BAR_BRAND_GLYPH);
         logo.setPreserveRatio(true);
         logo.setSmooth(true);
         logo.getStyleClass().add("logo-icon");
 
-        Label title = new Label("DEYLAUNCHER");
-        title.setFont(Font.font("System", FontWeight.BOLD, 22));
-        title.getStyleClass().add("title-label");
+        // Two-tone wordmark: "DEY" in the accent orange, "LAUNCHER" in the foreground color. Both
+        // halves carry title-label so the Settings text-scale slider sizes them together.
+        Label brandAccent = new Label("DEY");
+        brandAccent.setFont(Font.font("System", FontWeight.BOLD, 22));
+        brandAccent.getStyleClass().addAll("title-label", "brand-accent");
+        Label brandRest = new Label("LAUNCHER");
+        brandRest.setFont(Font.font("System", FontWeight.BOLD, 22));
+        brandRest.getStyleClass().add("title-label");
 
-        HBox brand = new HBox(10, logo, title);
+        HBox brand = new HBox(5, logo, brandAccent, brandRest);
         brand.setAlignment(Pos.CENTER_LEFT);
 
-        navHomeBtn = new Button("Home");
-        navFriendsBtn = new Button("Friends");
-        navServersBtn = new Button("Servers");
-        navHomeBtn.getStyleClass().addAll("nav-tab-button", "nav-tab-active");
-        navFriendsBtn.getStyleClass().add("nav-tab-button");
-        navServersBtn.getStyleClass().add("nav-tab-button");
-        navHomeBtn.setOnAction(e -> selectNavTab(navHomeBtn));
-        navFriendsBtn.setOnAction(e -> selectNavTab(navFriendsBtn));
-        navServersBtn.setOnAction(e -> selectNavTab(navServersBtn));
+        navHomeBtn = navTab("Home", IconFactory.Icon.HOUSE, true);
+        navFriendsBtn = navTab("Friends", IconFactory.Icon.PEOPLE, false);
+        navServersBtn = navTab("Servers", IconFactory.Icon.SERVER_RACK, false);
 
-        HBox navGroup = new HBox(4, navHomeBtn, navFriendsBtn, navServersBtn);
+        HBox navGroup = new HBox(2, navHomeBtn, navFriendsBtn, navServersBtn);
         navGroup.setAlignment(Pos.CENTER_LEFT);
         navGroup.getStyleClass().add("nav-group");
+        HBox.setMargin(navGroup, new Insets(0, 0, 0, TOP_BAR_BRAND_GAP));
 
         Region spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
 
         accountBtn = buildAccountButton();
 
-        Button settingsBtn = new Button();
-        settingsBtn.setGraphic(icon(IconFactory.Icon.SETTINGS, 18));
-        settingsBtn.setGraphicTextGap(0);
-        settingsBtn.getStyleClass().add("icon-button");
+        Button settingsBtn = bareTopIconButton(IconFactory.Icon.SETTINGS);
         settingsBtn.setOnAction(e -> openSettingsDialog());
 
         // Orange download button -- appears only when a newer release is available on GitHub.
-        updateBtn = new Button();
-        updateBtn.setGraphic(icon(IconFactory.Icon.DOWNLOAD, 18));
-        updateBtn.setGraphicTextGap(0);
-        updateBtn.getStyleClass().addAll("icon-button", "update-button");
+        updateBtn = bareTopIconButton(IconFactory.Icon.DOWNLOAD, "update-button");
         updateBtn.setVisible(false);
         updateBtn.setManaged(false);
         updateBtn.setOnAction(e -> startUpdate());
 
-        HBox bar = new HBox(20, brand, navGroup, spacer, updateBtn, accountBtn, settingsBtn, buildWindowControls());
-        bar.setPadding(new Insets(16, 18, 16, 28));
+        // Two hairlines fence the account block off from the nav and from the window controls.
+        // This is the reference's HBox spacing (16) plus the gaps its own separators sit in, so the
+        // bars between the download glyph / face / gear / - x match the design.
+        HBox bar = new HBox(16, brand, navGroup, spacer, updateBtn, barDivider(), accountBtn,
+                settingsBtn, barDivider(), buildWindowControls());
+        // 1px top/bottom: with TOP_BAR_TAB_HEIGHT tabs inside, the bar lands on the 72px it has
+        // always been, so nothing else on screen shifts.
+        bar.setPadding(new Insets(1, 16, 1, 28));
         bar.setAlignment(Pos.CENTER_LEFT);
         bar.getStyleClass().add("top-bar");
         this.topBar = bar;
         return bar;
+    }
+
+    /** One Home/Friends/Servers tab: label + vector glyph, forced to the bar's inner height so the
+     *  active tab's border runs from the bar's top edge to its bottom edge, as in the reference. */
+    private Button navTab(String text, IconFactory.Icon tabIcon, boolean active) {
+        Button btn = new Button(text);
+        btn.setGraphic(icon(tabIcon, TOP_BAR_TAB_ICON));
+        btn.setGraphicTextGap(9);
+        btn.getStyleClass().add("nav-tab-button");
+        if (active) btn.getStyleClass().add("nav-tab-active");
+        btn.setMinHeight(TOP_BAR_TAB_HEIGHT);
+        btn.setPrefHeight(TOP_BAR_TAB_HEIGHT);
+        btn.setMaxHeight(TOP_BAR_TAB_HEIGHT);
+        btn.setOnAction(e -> selectNavTab(btn));
+        return btn;
+    }
+
+    /** 1px hairline between top-bar groups, inset from the bar's top and bottom edges so it reads as
+     *  a soft separator rather than a full-height divider (the reference insets it the same way). */
+    private Region barDivider() {
+        Region line = new Region();
+        line.getStyleClass().add("bar-divider");
+        line.setMinWidth(1);
+        line.setPrefWidth(1);
+        line.setMaxWidth(1);
+        line.setMinHeight(TOP_BAR_DIVIDER_HEIGHT);
+        line.setPrefHeight(TOP_BAR_DIVIDER_HEIGHT);
+        line.setMaxHeight(TOP_BAR_DIVIDER_HEIGHT);
+        return line;
+    }
+
+    /** A bare top-bar glyph button (the gear, the update download): the glyph and nothing else, in
+     *  a fixed 44px click box so removing the old circular chrome does not shrink the hit area. */
+    private Button bareTopIconButton(IconFactory.Icon glyph, String... extraStyleClasses) {
+        Button btn = new Button();
+        btn.setGraphic(icon(glyph, TOP_BAR_ICON));
+        btn.setGraphicTextGap(0);
+        btn.getStyleClass().add("top-icon-button");
+        btn.getStyleClass().addAll(extraStyleClasses);
+        btn.setMinSize(TOP_BAR_ICON_BOX, TOP_BAR_ICON_BOX);
+        btn.setPrefSize(TOP_BAR_ICON_BOX, TOP_BAR_ICON_BOX);
+        btn.setMaxSize(TOP_BAR_ICON_BOX, TOP_BAR_ICON_BOX);
+        return btn;
     }
 
     /** The smallest width the top bar can be laid out at without clipping any control. Measured with
@@ -734,9 +820,11 @@ public class LauncherApp extends Application {
     }
 
     // ---- Window controls (- [] x) for the borderless main window ----
+    // Glyph sizes follow the reference design: a wide thin bar for minimize, a thicker square for
+    // maximize, and a grey glyph for ALL THREE (the close x is only white while it is hovered).
     private HBox buildWindowControls() {
         Button min = new Button();
-        Rectangle minGlyph = new Rectangle(12, 1.6);
+        Rectangle minGlyph = new Rectangle(18, 2.4);
         minGlyph.setStrokeType(StrokeType.INSIDE);
         minGlyph.getStyleClass().add("win-glyph-bar");
         min.setGraphic(minGlyph);
@@ -744,9 +832,9 @@ public class LauncherApp extends Application {
         min.setOnAction(e -> stage.setIconified(true));
 
         Button max = new Button();
-        Rectangle maxGlyph = new Rectangle(11, 11);
+        Rectangle maxGlyph = new Rectangle(21, 21);
         maxGlyph.setStrokeType(StrokeType.INSIDE);
-        maxGlyph.setStrokeWidth(1.5);
+        maxGlyph.setStrokeWidth(2);
         maxGlyph.setFill(Color.TRANSPARENT);
         maxGlyph.getStyleClass().add("win-glyph-rect");
         max.setGraphic(maxGlyph);
@@ -804,11 +892,12 @@ public class LauncherApp extends Application {
      */
     private void stopAllRunningServersBlocking() {
         if (runningServers.isEmpty()) return;
-        List<ServerProcessManager> toStop = new ArrayList<>(runningServers.values());
+        List<java.util.Map.Entry<String, ServerProcessManager>> toStop =
+                new ArrayList<>(runningServers.entrySet());
         runningServers.clear();
         List<Thread> stoppers = new ArrayList<>();
-        for (ServerProcessManager pm : toStop) {
-            Thread t = new Thread(pm::stop, "server-stop-on-exit");
+        for (var entry : toStop) {
+            Thread t = new Thread(entry.getValue()::stop, "server-stop-on-exit");
             t.start();
             stoppers.add(t);
         }
@@ -817,6 +906,16 @@ public class LauncherApp extends Application {
                 t.join(35_000); // a little past ServerProcessManager's own 30s graceful-stop timeout
             } catch (InterruptedException ignored) {
                 Thread.currentThread().interrupt();
+            }
+        }
+        // Hand every shared server back to the cloud with its latest world, so closing the launcher does
+        // not leave the next moderator hosting a stale copy. The upload runs on a daemon thread (see
+        // releaseHosting) and the claim is only released AFTER it finishes, so a very slow upload degrades
+        // to "the lease expires in a few minutes" rather than to "somebody else started a stale world".
+        for (var entry : toStop) {
+            ServerInstance server = serverStore.load(entry.getKey());
+            if (server != null && isSharedServer(server)) {
+                releaseHosting(server, com.deylauncher.servers.ServerRuntimeDoc.STOP_CLEAN, true);
             }
         }
     }
@@ -1352,6 +1451,28 @@ public class LauncherApp extends Application {
     }
 
     /**
+     * A friend's last heartbeat, as a sentence for their profile.
+     *
+     * <p>{@code lastSeen} is published by their own launcher and stops moving the moment they close
+     * it, so it doubles as "when were they last around" -- including for somebody still marked
+     * ONLINE whose heartbeat has just gone stale. Only rendered while they are offline (Settings >
+     * Launcher > FRIENDS): while they are online, the profile already says what they're doing now.
+     */
+    private static String describeLastOnline(FriendsData.UserEntry entry) {
+        if (entry == null || entry.lastSeen <= 0) return "Never seen online yet.";
+        long elapsed = System.currentTimeMillis() - entry.lastSeen;
+        if (elapsed < 0) elapsed = 0; // their clock can be ahead of ours; never print a negative age
+        long minutes = elapsed / 60_000L;
+        if (minutes < 2) return "Last online just now.";
+        if (minutes < 60) return "Last online " + minutes + " minutes ago.";
+        long hours = minutes / 60;
+        if (hours < 24) return "Last online " + hours + (hours == 1 ? " hour ago." : " hours ago.");
+        long days = hours / 24;
+        if (days < 30) return "Last online " + days + (days == 1 ? " day ago." : " days ago.");
+        return "Last online over a month ago.";
+    }
+
+    /**
      * What to SHOW for a friend: null when they're offline (nothing to describe), else their published
      * play state. Entries written by an older build carry no {@code playState} -- those are rendered the
      * legacy way, where a published address still means "on a server", so nothing regresses for friends
@@ -1594,6 +1715,16 @@ public class LauncherApp extends Application {
         HBox header = new HBox(14, avatarWrap, nameRow);
         header.setAlignment(Pos.CENTER_LEFT);
         root.getChildren().add(header);
+
+        // Last online. Only while they're offline: an online friend's profile already states what
+        // they're doing right now (see describePlayState), and "last online" would then be noise.
+        // Can be switched off with Settings > Launcher > FRIENDS.
+        if (prefs.showLastOnline && !online) {
+            Label lastOnline = new Label(describeLastOnline(entry));
+            lastOnline.getStyleClass().add("notice-label");
+            lastOnline.setWrapText(true);
+            root.getChildren().add(lastOnline);
+        }
 
         // Now playing / Join card.
         root.getChildren().add(buildNowPlayingSection(entry, online));
@@ -2464,6 +2595,25 @@ public class LauncherApp extends Application {
         headerRow.setAlignment(Pos.CENTER_LEFT);
         serversPageContent.getChildren().addAll(headerRow, sortBar);
 
+        // ---- SHARED WITH YOU (semi self-hosted servers somebody else gave you) ----
+        // Rendered from the LOCAL link records first, so the list appears instantly and still appears offline;
+        // the cloud is then asked in the background whether anything changed.
+        if (semiHostedService != null && semiHostedService.configured() && semiHostedLinks != null) {
+            serversPageContent.getChildren().add(sectionLabel("SHARED WITH YOU"));
+            PlayerIdentity activeForShare = identityStore.getActive();
+            java.util.List<com.deylauncher.servers.SemiHostedLinkStore.Link> shared = semiHostedLinks.list();
+            if (activeForShare != null) refreshSharedLinksAsync(activeForShare.uuid);
+            if (shared.isEmpty()) {
+                serversPageContent.getChildren().add(wrappedNotice("No servers have been shared with you yet. "
+                        + "When somebody adds you as a moderator, their server shows up here with their name "
+                        + "on it."));
+            } else {
+                FlowPane sharedGrid = new FlowPane(16, 16);
+                for (var link : shared) sharedGrid.getChildren().add(buildSharedServerCard(link));
+                serversPageContent.getChildren().add(sharedGrid);
+            }
+        }
+
         // ---- YOUR SERVERS ----
         serversPageContent.getChildren().add(sectionLabel("YOUR SERVERS"));
         var yourServers = sortInstances(serverStore.listAll());
@@ -2658,6 +2808,196 @@ public class LauncherApp extends Application {
      * anything except Forge, a DEY/Vanilla toggle (defaulting to DEY, matching what was asked --
      * Forge has no DEY client build, so that toggle is skipped entirely for Forge servers).
      */
+    /**
+     * The card for a server somebody else shared with this account.
+     *
+     * <p>It is deliberately recognisable at a glance as NOT yours: a GIVEN badge and a role pill sit on the
+     * card, the caption names the real owner, and the icon carries the same badge so a grid of cards never
+     * leaves it ambiguous whose server you are about to touch.
+     */
+    private VBox buildSharedServerCard(com.deylauncher.servers.SemiHostedLinkStore.Link link) {
+        ServerInstance local = link.localServerId == null ? null : serverStore.load(link.localServerId);
+        boolean installed = local != null;
+
+        Path localIcon = installed ? serverStore.serverDir(local.id).resolve("server-icon.png") : null;
+        StackPane iconTile = serverIconTile(link.name,
+                localIcon != null && Files.exists(localIcon) ? localIcon : null, 44);
+        // Shrunk form of the badge: the full-size pill is wider than the 44px icon it sits on.
+        Label cornerBadge = givenBadge();
+        cornerBadge.getStyleClass().add("given-badge-sm");
+        StackPane.setAlignment(cornerBadge, Pos.TOP_RIGHT);
+        StackPane.setMargin(cornerBadge, new Insets(-6, -8, 0, 0));
+        iconTile.getChildren().add(cornerBadge);
+
+        Label nameLabel = new Label(link.name == null ? "Shared server" : link.name);
+        nameLabel.getStyleClass().add("mod-name");
+        nameLabel.setWrapText(true);
+        String owner = link.ownerUsername == null ? "another player" : link.ownerUsername;
+        Label ownerLabel = new Label("Owned by " + owner
+                + (link.deyAddress() != null ? "  \u00b7  " + link.deyAddress() : ""));
+        ownerLabel.getStyleClass().add("notice-label");
+        // Wrap rather than ellipsise. "Owned by <name> · dey|alias" is long, and a card reading
+        // "Owned by AlexGame…" answers neither "whose server is this" nor "what do I type to join".
+        ownerLabel.setWrapText(true);
+        ownerLabel.setMaxWidth(Double.MAX_VALUE);
+
+        Label statusBadge = badgeLabel(installed && runningServers.containsKey(local.id)
+                && runningServers.get(local.id).isRunning());
+        HBox pills = new HBox(6, rolePill(link.parsedRole()), statusBadge);
+        pills.setAlignment(Pos.CENTER_LEFT);
+        // Keep both pills at their full text even in a narrow column: "ADM…" on a badge that exists
+        // purely to say which powers you hold would defeat the point of the badge.
+        pills.setMinWidth(Region.USE_PREF_SIZE);
+
+        Label hostInfo = wrappedNotice(installed ? "" : "Not installed on this PC yet.");
+        VBox text = new VBox(6, nameLabel, ownerLabel, pills, hostInfo);
+        HBox.setHgrow(text, Priority.ALWAYS);
+
+        HBox header = new HBox(12, iconTile, text);
+        header.setAlignment(Pos.CENTER_LEFT);
+        header.setOnMouseClicked(e -> openSharedServerOrSetup(link, local));
+
+        Button mainBtn = new Button();
+        mainBtn.getStyleClass().add("play-button");
+        if (installed) {
+            setButtonIcon(mainBtn, IconFactory.Icon.PLAY, "Join");
+            mainBtn.setOnAction(e -> joinSharedServer(local));
+        } else {
+            setButtonIcon(mainBtn, IconFactory.Icon.DOWNLOAD, "Install server");
+            mainBtn.setOnAction(e -> openSharedServerSetupDialog(link, null));
+        }
+        Region btnSpacer = new Region();
+        HBox.setHgrow(btnSpacer, Priority.ALWAYS);
+        Button settingsBtn = new Button();
+        settingsBtn.getStyleClass().add("pill-button");
+        setButtonIconOnly(settingsBtn, IconFactory.Icon.SETTINGS);
+        settingsBtn.setTooltip(new Tooltip(installed ? "Manage this server" : "Install, or cancel moderation"));
+        settingsBtn.setOnAction(e -> openSharedServerOrSetup(link, local));
+        HBox actions = new HBox(8, mainBtn, btnSpacer, settingsBtn);
+        actions.setAlignment(Pos.CENTER_LEFT);
+
+        VBox card = new VBox(10, header, actions, mountInlineSync(link.serverId).node);
+        card.setPadding(new Insets(16));
+        // Wider than an owned-server card: this one carries a role pill, a status pill and an
+        // "Owned by ... · dey|alias" line, and none of them may be cut short.
+        card.setPrefWidth(300);
+        card.getStyleClass().addAll("skin-library-tile", "shared-server-tile");
+        refreshSharedCardStatus(link, hostInfo);
+        return card;
+    }
+
+    /** Opens the management window for an installed shared server, or the install/cancel screen if not. */
+    private void openSharedServerOrSetup(com.deylauncher.servers.SemiHostedLinkStore.Link link,
+                                         ServerInstance localOrNull) {
+        if (localOrNull != null) {
+            openServerManagementDialog(localOrNull);
+        } else {
+            openSharedServerSetupDialog(link, null);
+        }
+    }
+
+    /**
+     * Joins a shared server: straight in while this PC hosts it, otherwise at whatever address the current
+     * host published -- resolved from the DEY address, so one card keeps working as hosting moves around.
+     */
+    private void joinSharedServer(ServerInstance local) {
+        boolean runningHere = runningServers.containsKey(local.id)
+                && runningServers.get(local.id).isRunning();
+        if (runningHere || local.deyAddress() == null) {
+            launchIntoOwnServer(local, local.type != ServerType.FORGE);
+            return;
+        }
+        var resolved = resolveDeyJoin(local.deyAddress());
+        if (resolved.address() == null) {
+            Alert offline = new Alert(Alert.AlertType.INFORMATION, resolved.message());
+            offline.setHeaderText(local.name + " isn't available right now");
+            offline.show();
+            return;
+        }
+        log(local.deyAddress() + " -> " + resolved.address());
+        onPlay(resolved.address());
+    }
+
+    /** Asks the shared repo who is hosting this server and says so on the card. */
+    private void refreshSharedCardStatus(com.deylauncher.servers.SemiHostedLinkStore.Link link,
+                                         Label hostInfo) {
+        if (semiHostedService == null || !semiHostedService.configured()) return;
+        new Thread(() -> {
+            String message;
+            try {
+                var runtime = semiHostedService.readRuntime(link.repo, link.serverId);
+                if (semiHostedService.isHeldLive(runtime)) {
+                    boolean mine = activeUuidOrNull() != null && activeUuidOrNull().equals(runtime.hostUuid);
+                    message = mine ? "Running on this PC."
+                            : "Running on " + (runtime.hostUsername == null ? "another PC"
+                                    : runtime.hostUsername + "'s PC")
+                              + (runtime.publicAddress == null ? "" : "  \u00b7  " + runtime.publicAddress);
+                } else {
+                    message = "Offline -- nobody is hosting it right now.";
+                }
+            } catch (Exception ex) {
+                message = "Couldn't reach the shared repo: " + ex.getMessage();
+            }
+            final String text = message;
+            Platform.runLater(() -> {
+                hostInfo.setText(text);
+                hostInfo.setVisible(true);
+            });
+        }, "semi-card-status-" + link.serverId).start();
+    }
+
+    /**
+     * Asks the shared repos which servers are shared with this account, and updates the local link records.
+     *
+     * <p>This is what makes a brand-new grant (or a revoked one, or a role change) appear without anybody
+     * having to know to press Refresh. Throttled, because the Servers page re-renders for many reasons and
+     * every call costs API budget on a token the whole user base shares.
+     */
+    private void refreshSharedLinksAsync(String myUuid) {
+        if (semiHostedService == null || !semiHostedService.configured() || semiHostedLinks == null) return;
+        long now = System.currentTimeMillis();
+        if (now - lastSharedRefreshAt < 30_000L) return;
+        lastSharedRefreshAt = now;
+        new Thread(() -> {
+            try {
+                boolean changed = false;
+                for (var cs : semiHostedService.listManagedBy(myUuid)) {
+                    var link = semiHostedLinks.find(cs.serverId());
+                    if (link == null) {
+                        link = new com.deylauncher.servers.SemiHostedLinkStore.Link();
+                        link.serverId = cs.serverId();
+                        link.repo = cs.repoName();
+                        link.alias = cs.alias();
+                        link.name = cs.name();
+                        link.ownerUuid = cs.ownerUuid();
+                        link.ownerUsername = cs.ownerUsername();
+                        link.ownerAccountType = cs.ownerAccountType();
+                        changed = true;
+                    }
+                    // Keep the role current: the owner re-roling somebody has to take effect here, and the
+                    // local server.json mirrors it so the role-gated tabs agree with the repo.
+                    var grant = semiHostedService.readManagers(cs.repoName(), cs.serverId()).find(myUuid);
+                    if (grant != null && !grant.role.equals(link.role)) {
+                        link.role = grant.role;
+                        changed = true;
+                    }
+                    semiHostedLinks.upsert(link);
+                    if (link.localServerId != null && !link.localServerId.isBlank()) {
+                        ServerInstance local = serverStore.load(link.localServerId);
+                        if (local != null && grant != null && !grant.role.equals(local.linkedRole)) {
+                            local.linkedRole = grant.role;
+                            serverStore.save(local);
+                        }
+                    }
+                }
+                if (changed) Platform.runLater(this::renderServersPageContent);
+            } catch (Exception ignored) {
+                // Offline or rate-limited: the locally cached links still render, which is the whole point of
+                // storing them on this PC.
+            }
+        }, "semi-shared-refresh").start();
+    }
+
     private HBox buildJoinSplitRow(ServerInstance server) {
         boolean[] joinUseDey = { server.type != ServerType.FORGE }; // default DEY unless Forge
 
@@ -3005,28 +3345,803 @@ public class LauncherApp extends Application {
         dialog.showAndWait();
     }
 
+    // =============================================================================================
+    // Semi self-hosted servers (one shared server, hosted from any moderator's PC)
+    // =============================================================================================
+    //
+    // In one paragraph: a server can be marked semi self-hosted, which publishes a small record for it
+    // into a shared servers repo (the record remembers WHICH repo, so several servers repos can coexist
+    // on the same token). The owner then hands out moderation with a mandatory role, and any moderator
+    // can host the server from their own PC -- exactly one at a time, decided by a lease in runtime.json,
+    // with the world synced through GitHub in chunks. Players reach whichever PC is hosting through the
+    // server's DEY address (dey|alias), which resolves to whatever public address the current host
+    // published.
+
+    /** How often a hosting PC refreshes its claim. Shorter than the lease so one hiccup is harmless. */
+    private static final long HOST_HEARTBEAT_MS = 45_000L;
+
+    /** The role the active account holds here: OWNER for a server we host ourselves. */
+    private com.deylauncher.servers.ManagerRole roleOnServer(ServerInstance server) {
+        if (server == null) return null;
+        PlayerIdentity me = identityStore.getActive();
+        String myUuid = me == null ? null : me.uuid;
+        if (!server.isGrantedToMe(myUuid)) return com.deylauncher.servers.ManagerRole.OWNER;
+        com.deylauncher.servers.ManagerRole onServer = server.myRoleOnGrantedServer(myUuid);
+        if (onServer != null) return onServer;
+        var link = linkFor(server);
+        return link == null ? null : link.parsedRole();
+    }
+
+    /** The local link record for a server, or null when this server was never shared. */
+    private com.deylauncher.servers.SemiHostedLinkStore.Link linkFor(ServerInstance server) {
+        if (server == null || semiHostedLinks == null) return null;
+        if (server.cloudServerId != null && !server.cloudServerId.isBlank()) {
+            var byCloudId = semiHostedLinks.find(server.cloudServerId);
+            if (byCloudId != null) return byCloudId;
+        }
+        return semiHostedLinks.findForLocal(server.id);
+    }
+
+    /** True when this server takes part in shared hosting (owner-side flag or a grant from somebody). */
+    private boolean isSharedServer(ServerInstance server) {
+        return server != null && (server.semiSelfHosted || linkFor(server) != null);
+    }
+
+    /** The servers repo this server lives in: the record's own answer first, then the local link. */
+    private String repoFor(ServerInstance server) {
+        if (server.cloudRepo != null && !server.cloudRepo.isBlank()) return server.cloudRepo;
+        var link = linkFor(server);
+        if (link != null && link.repo != null && !link.repo.isBlank()) return link.repo;
+        return semiHostedService == null ? null : semiHostedService.primaryRepo();
+    }
+
+    /** The shared id for a local server: the published id when there is one, else this PC's own id. */
+    private String cloudIdFor(ServerInstance server) {
+        if (server.cloudServerId != null && !server.cloudServerId.isBlank()) return server.cloudServerId;
+        var link = linkFor(server);
+        return link != null ? link.serverId : server.id;
+    }
+
+    /** The cloud record for a local server, or null when it was never published. */
+    private com.deylauncher.servers.SemiHostedService.CloudServer cloudFor(ServerInstance server) {
+        if (semiHostedService == null || server == null || !semiHostedService.configured()) return null;
+        String id = cloudIdFor(server);
+        if (id == null) return null;
+        try {
+            return semiHostedService.findById(id).orElse(null);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** A short "OWNER"/"ADMIN"/"STARTER" label for the role pill on a card. */
+    private static String roleLabel(com.deylauncher.servers.ManagerRole role) {
+        if (role == null) return "NO ACCESS";
+        return role == com.deylauncher.servers.ManagerRole.ADMINISTRATOR ? "ADMIN" : role.name();
+    }
+
+    /** The public address this PC currently offers for a server (its playit tunnel), or null. */
+    private String publishedAddressFor(ServerInstance server) {
+        var tunnel = serverTunnels.get(server.id);
+        if (tunnel == null) return null;
+        String address = tunnel.publicAddress();
+        return address == null || address.isBlank() ? null : address;
+    }
+
+    /**
+     * Claims the right to host a shared server, just before its process starts.
+     *
+     * @return null when this PC may host, or a message explaining who is already running it
+     */
+    private String claimHosting(ServerInstance server) {
+        if (!isSharedServer(server) || semiHostedService == null || !semiHostedService.configured()) {
+            return null;
+        }
+        PlayerIdentity me = identityStore.getActive();
+        if (me == null) return "Set up an account before hosting a shared server.";
+        var cs = cloudFor(server);
+        if (cs == null) return null; // not in the cloud yet -- nothing to arbitrate
+        try {
+            var result = semiHostedService.acquireLease(cs, me.uuid, me.username, me.accountType.name(),
+                    publishedAddressFor(server), localIpAddress() + ":" + server.port, server.port);
+            if (!result.granted()) return result.message();
+            startHostHeartbeat(server, cs);
+            return null;
+        } catch (Exception ex) {
+            return "Couldn't check who is hosting this server: " + ex.getMessage();
+        }
+    }
+
+    /** Keeps this PC's lease alive while it hosts, and reacts when the owner recalls the session. */
+    private void startHostHeartbeat(ServerInstance server,
+                                    com.deylauncher.servers.SemiHostedService.CloudServer cs) {
+        stopHostHeartbeat(server.id);
+        Thread thread = new Thread(() -> {
+            while (appRunning && hostingHeartbeats.get(server.id) == Thread.currentThread()) {
+                var pm = runningServers.get(server.id);
+                if (pm == null || !pm.isRunning()) break;
+                PlayerIdentity me = identityStore.getActive();
+                String myUuid = me == null ? null : me.uuid;
+                try {
+                    // The owner may recall the session at any moment -- this is the "force stop a
+                    // moderator's server" power, and it necessarily arrives on this heartbeat.
+                    if (semiHostedService.forceStopRequestedFor(cs, myUuid)) {
+                        semiHostedService.clearForceStop(cs);
+                        Platform.runLater(() -> {
+                            log("The owner stopped " + server.name + " remotely.");
+                            var live = runningServers.get(server.id);
+                            if (live != null) live.stop();
+                        });
+                        break;
+                    }
+                    boolean stillMine = semiHostedService.heartbeat(cs, myUuid,
+                            publishedAddressFor(server), pm.getOnlinePlayers());
+                    if (!stillMine) {
+                        // The lease ran out and somebody else took over: stop rather than run a second copy.
+                        Platform.runLater(() -> {
+                            log("Another PC took over hosting " + server.name + "; stopping this copy.");
+                            var live = runningServers.get(server.id);
+                            if (live != null) live.stop();
+                        });
+                        break;
+                    }
+                } catch (Exception ignored) {
+                    // One failed heartbeat must not end the session: if the problem is persistent the lease
+                    // expires on its own, which is the safe direction.
+                }
+                try {
+                    Thread.sleep(HOST_HEARTBEAT_MS);
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
+        }, "semi-hosted-heartbeat-" + server.id);
+        thread.setDaemon(true);
+        hostingHeartbeats.put(server.id, thread);
+        thread.start();
+    }
+
+    /** Stops this PC's heartbeat for a server (it does not touch the cloud claim itself). */
+    private void stopHostHeartbeat(String serverId) {
+        Thread thread = hostingHeartbeats.remove(serverId);
+        if (thread != null) thread.interrupt();
+    }
+
+    /**
+     * Gives up hosting: optionally publishes the world first, then releases the cloud claim so another
+     * moderator can pick the server up. Runs off the FX thread because a push can take a while.
+     */
+    private void releaseHosting(ServerInstance server, String cause, boolean pushWorld) {
+        stopHostHeartbeat(server.id);
+        if (semiHostedService == null || !semiHostedService.configured()) return;
+        var cs = cloudFor(server);
+        if (cs == null) return;
+        PlayerIdentity me = identityStore.getActive();
+        String myUuid = me == null ? null : me.uuid;
+        String myName = me == null ? null : me.username;
+        Thread thread = new Thread(() -> {
+            // Push BEFORE releasing the claim: if this push is interrupted (the launcher is closing), the
+            // lease is still held, so no other PC can start hosting a half-saved world -- the claim simply
+            // expires a few minutes later instead.
+            if (pushWorld) {
+                try {
+                    var outcome = semiHostedService.pushWorld(cs, serverStore.serverDir(server.id),
+                            myName, null);
+                    if (semiHostedLinks != null) semiHostedLinks.recordSync(cs.serverId(), null);
+                    Platform.runLater(() -> log(outcome.describe()));
+                } catch (Exception ex) {
+                    if (semiHostedLinks != null) semiHostedLinks.recordSync(cs.serverId(), ex.getMessage());
+                    Platform.runLater(() -> log("Couldn't save " + server.name
+                            + " to the cloud: " + ex.getMessage()));
+                }
+            }
+            try {
+                semiHostedService.releaseLease(cs, myUuid, cause);
+                semiHostedService.clearForceStop(cs);
+            } catch (Exception ignored) {
+                // Best effort: an uncleared claim simply expires.
+            }
+        }, "semi-hosted-release-" + server.id);
+        // Daemon so closing the launcher is never blocked by an in-flight upload; the push-then-release
+        // order above is what keeps that safe.
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    // ---- Publishing and syncing a shared server ------------------------------------------------
+
+    /** Shown whenever a shared-server action is attempted without the backend wired up. */
+    private static final String NOT_SET_UP_MESSAGE =
+            "Semi self-hosted servers need the DeyLauncher backend, which isn't set up in this build.";
+
+    /** The server icon as base64 PNG, or null when there is none / it is too big to publish. */
+    private String readServerIconBase64(ServerInstance server) {
+        Path icon = serverStore.serverDir(server.id).resolve("server-icon.png");
+        if (!Files.exists(icon)) return null;
+        try {
+            long size = Files.size(icon);
+            if (size <= 0 || size > com.deylauncher.servers.HostedServer.MAX_ICON_BYTES) return null;
+            return java.util.Base64.getEncoder().encodeToString(Files.readAllBytes(icon));
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** Keeps this PC's link record in step with a server's published record. */
+    private void rememberLink(ServerInstance server, com.deylauncher.servers.HostedServer meta,
+                              com.deylauncher.servers.ManagerRole role) {
+        if (semiHostedLinks == null || meta == null) return;
+        var link = semiHostedLinks.find(meta.serverId);
+        if (link == null) link = new com.deylauncher.servers.SemiHostedLinkStore.Link();
+        link.serverId = meta.serverId;
+        link.repo = meta.repo;
+        if (server != null) link.localServerId = server.id;
+        link.alias = meta.alias;
+        link.name = meta.name;
+        link.ownerUuid = meta.ownerUuid;
+        link.ownerUsername = meta.ownerUsername;
+        link.ownerAccountType = meta.ownerAccountType;
+        if (role != null) link.role = role.wire();
+        link.installed = link.localServerId != null && !link.localServerId.isBlank();
+        semiHostedLinks.upsert(link);
+    }
+
+    /**
+     * The state of one server's cloud push/pull, kept per server id so the inline block below can be
+     * rebuilt (a tab switch, a servers-page refresh) and still show what is happening.
+     */
+    private record SyncState(String message, double fraction, boolean running) {
+    }
+
+    /**
+     * The inline progress block for a cloud push/pull/install.
+     *
+     * <p>This replaces the modal dialog this flow used to open. A world push can take minutes, and
+     * that dialog deliberately refused to close (so a half-finished upload couldn't be abandoned) --
+     * which left the whole launcher frozen behind it until the transfer ended. An inline block can
+     * never do that: whatever window it lives in stays fully usable and closable, and the transfer
+     * just carries on in the background.
+     */
+    private final class InlineSyncProgress {
+        final VBox node = new VBox(6);
+        private final Label message = new Label();
+        private final javafx.scene.control.ProgressBar bar = new javafx.scene.control.ProgressBar(0);
+        private final Button hideBtn = new Button("Hide");
+        private boolean dismissed;
+
+        InlineSyncProgress() {
+            message.setWrapText(true);
+            message.getStyleClass().add("sync-label");
+            bar.setPrefWidth(320);
+            bar.setMaxWidth(Double.MAX_VALUE);
+            bar.getStyleClass().add("sync-progress");
+            hideBtn.getStyleClass().add("pill-button");
+            hideBtn.setOnAction(e -> {
+                dismissed = true;
+                hide();
+            });
+            HBox barRow = new HBox(10, bar, hideBtn);
+            barRow.setAlignment(Pos.CENTER_LEFT);
+            HBox.setHgrow(bar, Priority.ALWAYS);
+            node.getStyleClass().add("sync-inline");
+            node.getChildren().addAll(message, barRow);
+            hide();
+        }
+
+        void apply(SyncState state) {
+            if (state.running()) {
+                dismissed = false; // a new transfer is not "dismissed", however the last one ended
+            } else if (dismissed) {
+                hide();
+                return;
+            }
+            message.setText(state.message() == null ? "" : state.message());
+            bar.setProgress(state.running()
+                    ? javafx.scene.control.ProgressBar.INDETERMINATE_PROGRESS
+                    : Math.max(0, Math.min(1.0, state.fraction())));
+            // Hiding is only offered once the transfer has stopped: while it runs there is nothing
+            // useful the button could do, and a "Hide" that leaves work running would be a lie.
+            hideBtn.setVisible(!state.running());
+            hideBtn.setManaged(!state.running());
+            show();
+        }
+
+        private void show() {
+            node.setVisible(true);
+            node.setManaged(true);
+        }
+
+        private void hide() {
+            node.setVisible(false);
+            node.setManaged(false);
+        }
+    }
+
+    /** Inline sync blocks currently mounted in a page, keyed by server id. */
+    private final java.util.Map<String, InlineSyncProgress> inlineSyncBlocks =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** The last known state of each server's cloud sync, so a rebuilt page can show it again. */
+    private final java.util.Map<String, SyncState> syncStates =
+            new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * Creates the inline sync block for a server and immediately replays whatever that server's cloud
+     * transfer last did. The caller adds {@code block.node} to its own layout; everything else is
+     * driven by begin/update/endInlineSync below.
+     */
+    private InlineSyncProgress mountInlineSync(String serverId) {
+        InlineSyncProgress block = new InlineSyncProgress();
+        if (serverId != null) {
+            inlineSyncBlocks.put(serverId, block);
+            SyncState state = syncStates.get(serverId);
+            if (state != null) block.apply(state);
+        }
+        return block;
+    }
+
+    private void beginInlineSync(String serverId, Label status, String message) {
+        if (status != null) status.setText(message);
+        if (serverId != null) setSyncState(serverId, new SyncState(message, -1, true));
+    }
+
+    private void updateInlineSync(String serverId, Label status, String message, double fraction) {
+        if (status != null) status.setText(message);
+        if (serverId != null) setSyncState(serverId, new SyncState(message, fraction, true));
+    }
+
+    private void endInlineSync(String serverId, Label status, String message, boolean failed) {
+        if (status != null) status.setText(message);
+        if (serverId != null) setSyncState(serverId, new SyncState(message, failed ? 0 : 1, false));
+    }
+
+    private void setSyncState(String serverId, SyncState state) {
+        syncStates.put(serverId, state);
+        InlineSyncProgress block = inlineSyncBlocks.get(serverId);
+        if (block != null) block.apply(state);
+    }
+
+    /**
+     * Publishes (or re-publishes) a local server so other PCs can see it. The alias is claimed at the same
+     * time, which is what makes {@code dey|alias} resolve to this server and nothing else.
+     */
+    private void publishServer(ServerInstance server, String repoName, String alias, Label status,
+                               Runnable onDone) {
+        if (semiHostedService == null || !semiHostedService.configured()) {
+            if (status != null) status.setText(NOT_SET_UP_MESSAGE);
+            return;
+        }
+        final PlayerIdentity me = identityStore.getActive();
+        if (me == null) {
+            if (status != null) status.setText("Set up an account first -- a shared server needs an owner.");
+            return;
+        }
+        server.cloudAlias = com.deylauncher.servers.DeyAddress.normalizeAlias(alias);
+        if (status != null) status.setText("Publishing " + server.name + "...");
+        Task<com.deylauncher.servers.HostedServer> task = new Task<>() {
+            @Override
+            protected com.deylauncher.servers.HostedServer call() throws Exception {
+                String repo = repoName != null && !repoName.isBlank() ? repoName : repoFor(server);
+                return semiHostedService.publish(server, me.uuid, me.username, me.accountType, repo,
+                        readServerIconBase64(server));
+            }
+        };
+        task.setOnSucceeded(e -> {
+            var meta = task.getValue();
+            server.semiSelfHosted = true;
+            server.cloudServerId = meta.serverId;
+            server.cloudRepo = meta.repo;
+            server.cloudAlias = meta.alias;
+            serverStore.save(server);
+            rememberLink(server, meta, com.deylauncher.servers.ManagerRole.OWNER);
+            if (status != null) {
+                status.setText("Published to " + meta.repo + " ("
+                        + (meta.deyAddress() == null ? "no DEY address" : meta.deyAddress()) + ").");
+            }
+            renderServersPageContent();
+            if (onDone != null) onDone.run();
+        });
+        task.setOnFailed(e -> {
+            Throwable cause = task.getException();
+            String message = cause == null ? "unknown error" : cause.getMessage();
+            if (status != null) status.setText("Couldn't publish: " + message);
+        });
+        new Thread(task, "semi-publish-" + server.id).start();
+    }
+
+    /** Uploads the current local world to the server's repo, with a progress dialog. */
+    private void pushSharedWorld(ServerInstance server, Label status, Runnable onDone) {
+        if (semiHostedService == null || !semiHostedService.configured()) {
+            if (status != null) status.setText(NOT_SET_UP_MESSAGE);
+            return;
+        }
+        var cs = cloudFor(server);
+        if (cs == null) {
+            if (status != null) status.setText("Publish this server first.");
+            return;
+        }
+        final PlayerIdentity me = identityStore.getActive();
+        // The cloud id is the key the inline progress block is registered under, so it is captured
+        // once: push/pull callbacks run on background threads and must not re-read anything mutable.
+        final String cloudId = cs.serverId();
+        beginInlineSync(cloudId, status, "Packing " + server.name + "...");
+        Task<com.deylauncher.servers.WorldSync.Outcome> task = new Task<>() {
+            @Override
+            protected com.deylauncher.servers.WorldSync.Outcome call() throws Exception {
+                return semiHostedService.pushWorld(cs, serverStore.serverDir(server.id),
+                        me == null ? null : me.username,
+                        (message, fraction) -> Platform.runLater(
+                                () -> updateInlineSync(cloudId, status, message, fraction)));
+            }
+        };
+        task.setOnSucceeded(e -> {
+            var outcome = task.getValue();
+            if (semiHostedLinks != null) semiHostedLinks.recordSync(cloudId, null);
+            endInlineSync(cloudId, status, outcome.describe(), false);
+            log(outcome.describe());
+            if (onDone != null) onDone.run();
+        });
+        task.setOnFailed(e -> {
+            Throwable cause = task.getException();
+            String message = cause == null ? "unknown error" : cause.getMessage();
+            if (semiHostedLinks != null) semiHostedLinks.recordSync(cloudId, message);
+            endInlineSync(cloudId, status, "Couldn't save to the cloud: " + message, true);
+            log("Couldn't save " + server.name + " to the cloud: " + message);
+        });
+        new Thread(task, "semi-push-" + server.id).start();
+    }
+
+    /** Downloads the latest pushed world for a server and unpacks it over the local copy. */
+    private void pullSharedWorld(ServerInstance server, Label status, Runnable onDone) {
+        if (semiHostedService == null || !semiHostedService.configured()) {
+            if (status != null) status.setText(NOT_SET_UP_MESSAGE);
+            return;
+        }
+        var cs = cloudFor(server);
+        if (cs == null) {
+            if (status != null) status.setText("This server isn't published yet.");
+            return;
+        }
+        final String cloudId = cs.serverId();
+        beginInlineSync(cloudId, status, "Checking the cloud...");
+        Task<com.deylauncher.servers.WorldManifest> task = new Task<>() {
+            @Override
+            protected com.deylauncher.servers.WorldManifest call() throws Exception {
+                return semiHostedService.pullWorld(cs, serverStore.serverDir(server.id),
+                        (message, fraction) -> Platform.runLater(
+                                () -> updateInlineSync(cloudId, status, message, fraction)));
+            }
+        };
+        task.setOnSucceeded(e -> {
+            var manifest = task.getValue();
+            String message = manifest == null
+                    ? "Nothing has been saved to the cloud for this server yet."
+                    : "Got " + manifest.describe() + " from the cloud.";
+            if (semiHostedLinks != null) semiHostedLinks.recordSync(cloudId, null);
+            endInlineSync(cloudId, status, message, false);
+            log(message);
+            if (onDone != null) onDone.run();
+        });
+        task.setOnFailed(e -> {
+            Throwable cause = task.getException();
+            String message = cause == null ? "unknown error" : cause.getMessage();
+            endInlineSync(cloudId, status, "Couldn't get the latest version: " + message, true);
+            log("Couldn't get the latest version of " + server.name + ": " + message);
+        });
+        new Thread(task, "semi-pull-" + server.id).start();
+    }
+
+    /** A server type read from a cloud record, defaulting to Vanilla when it is unknown/unreadable. */
+    private static ServerType parseServerType(String wire) {
+        if (wire == null || wire.isBlank()) return ServerType.VANILLA;
+        try {
+            return ServerType.valueOf(wire.trim().toUpperCase());
+        } catch (IllegalArgumentException e) {
+            return ServerType.VANILLA;
+        }
+    }
+
+    /**
+     * Installs a server that was shared with this account: creates the local folder from the cloud record,
+     * pulls the latest world into it, and links the two ids together.
+     *
+     * <p>Adopting the SHARED id as the local id is deliberate: the owner and every moderator then agree on
+     * one identifier for one server, so the repo paths, the runtime claim and the world parts can never
+     * drift apart.
+     */
+    private void installSharedServer(com.deylauncher.servers.SemiHostedLinkStore.Link link, Label status,
+                                     Runnable onDone) {
+        if (semiHostedService == null || !semiHostedService.configured()) {
+            if (status != null) status.setText(NOT_SET_UP_MESSAGE);
+            return;
+        }
+        if (link == null) return;
+        final String cloudId = link.serverId;
+        beginInlineSync(cloudId, status, "Fetching the server's details...");
+        Task<ServerInstance> task = new Task<>() {
+            @Override
+            protected ServerInstance call() throws Exception {
+                var cs = semiHostedService.findById(link.serverId).orElse(null);
+                var meta = cs == null ? null : semiHostedService.fetchMeta(cs);
+                if (meta == null) {
+                    throw new IllegalStateException("This server is no longer shared with you.");
+                }
+                ServerInstance local = new ServerInstance(meta.name, parseServerType(meta.type),
+                        meta.minecraftVersion);
+                local.id = meta.serverId;
+                local.port = meta.port > 0 ? meta.port : local.port;
+                local.cloudServerId = meta.serverId;
+                local.cloudRepo = meta.repo;
+                local.cloudAlias = meta.alias;
+                local.semiSelfHosted = true;
+                local.linkedOwnerUuid = meta.ownerUuid;
+                local.linkedRole = link.role;
+                local.allowModeratorHostOnlyWhenPublic = meta.allowModeratorHostOnlyWhenPublic;
+                local.openToModerators = meta.openToModerators;
+                serverStore.save(local);
+                if (cs != null) {
+                    semiHostedService.pullWorld(cs, serverStore.serverDir(local.id),
+                            (message, fraction) -> Platform.runLater(
+                                    () -> updateInlineSync(cloudId, status, message, fraction)));
+                }
+                return local;
+            }
+        };
+        task.setOnSucceeded(e -> {
+            ServerInstance local = task.getValue();
+            semiHostedLinks.markInstalled(link.serverId, local.id);
+            // The block stays up with this final line (and a Hide button) instead of vanishing:
+            // "did it finish?" should be answerable without opening the log.
+            endInlineSync(cloudId, status, "Installed " + local.name
+                    + ". Its files are ready -- press Join or Start when you want to play.", false);
+            log("Installed " + local.name + " from the shared servers repo.");
+            renderServersPageContent();
+            if (onDone != null) onDone.run();
+        });
+        task.setOnFailed(e -> {
+            Throwable cause = task.getException();
+            String message = cause == null ? "unknown error" : cause.getMessage();
+            endInlineSync(cloudId, status, "Couldn't install: " + message, true);
+            log("Couldn't install " + link.name + ": " + message);
+        });
+        new Thread(task, "semi-install-" + link.serverId).start();
+    }
+
+    /** A DEY address resolved for joining, or a message explaining why it cannot be joined right now. */
+    private record DeyJoin(String address, String message) {
+    }
+
+    /**
+     * Resolves a DEY address to the address the current host published. A plain address is returned
+     * unchanged, so every existing join path can be routed through here without behaving differently.
+     */
+    private DeyJoin resolveDeyJoin(String raw) {
+        if (raw == null || !com.deylauncher.servers.DeyAddress.isDeyAddress(raw)) {
+            return new DeyJoin(raw, null);
+        }
+        if (semiHostedService == null || !semiHostedService.configured()) {
+            return new DeyJoin(null, NOT_SET_UP_MESSAGE);
+        }
+        try {
+            var resolution = semiHostedService.resolveDeyAddress(raw);
+            if (resolution.note() == null) return new DeyJoin(resolution.address(), null);
+            return new DeyJoin(resolution.online() ? resolution.address() : null, resolution.note());
+        } catch (Exception ex) {
+            return new DeyJoin(null, "Couldn't look up " + raw + ": " + ex.getMessage());
+        }
+    }
+
+    /**
+     * The owner's "moderators may only host while publicly reachable" policy, checked at Start.
+     *
+     * <p>Returns a warning to confirm when this PC would host without publishing an address, or null when
+     * there is nothing to warn about. A warning rather than a block, deliberately: starting the server and
+     * opening the tunnel are two separate actions, so refusing to start would make the order the policy
+     * implies impossible to follow.
+     */
+    private String moderatorHostPolicyWarning(ServerInstance server) {
+        if (!isSharedServer(server) || semiHostedService == null || !semiHostedService.configured()) {
+            return null;
+        }
+        var cs = cloudFor(server);
+        if (cs == null || !cs.allowModeratorHostOnlyWhenPublic()) return null;
+        if (!server.isGrantedToMe(activeUuidOrNull())) return null; // the owner may always host
+        if (publishedAddressFor(server) != null) return null;
+        return server.name + "'s owner asks moderators to share it over the Internet while they host, and no "
+                + "public address is open yet. Open the tunnel under \"Share over the Internet\" first if you "
+                + "can -- other players won't be able to join until an address is published.";
+    }
+
     // ---- Server management dialog: Console/Version, Properties, Permissions, Players tabs ----
     private TextArea serverConsoleArea;
 
+    /** The active account's uuid, or null when nothing is signed in. */
+    private String activeUuidOrNull() {
+        PlayerIdentity me = identityStore.getActive();
+        return me == null ? null : me.uuid;
+    }
+
     private void openServerManagementDialog(ServerInstance server) {
+        var link = linkFor(server);
+        boolean grantedToMe = server.isGrantedToMe(activeUuidOrNull());
+
+        // A server shared with this account that is NOT installed here has nothing local to configure, so
+        // the window offers exactly two things: install it, or stop moderating it. That is the whole point
+        // of the screen -- there is no console to show and no files to edit on this PC yet.
+        if (grantedToMe && (link == null || !link.isInstalledLocally())) {
+            openSharedServerSetupDialog(link, server);
+            return;
+        }
+
+        com.deylauncher.servers.ManagerRole role = roleOnServer(server);
+        if (role == null) {
+            // A grant that was revoked (or an account switch) leaves no role to honour; opening a window
+            // full of buttons the backend would reject is worse than saying so.
+            Alert alert = new Alert(Alert.AlertType.WARNING,
+                    "This server is no longer shared with the account you're using.");
+            alert.setHeaderText("No access");
+            alert.showAndWait();
+            return;
+        }
+
         TabPane tabs = new TabPane();
         tabs.getStyleClass().add("account-skin-tabs");
         tabs.setTabClosingPolicy(TabPane.TabClosingPolicy.UNAVAILABLE);
-        tabs.getTabs().addAll(
-                new Tab("Console", buildServerConsoleTab(server)),
-                new Tab("Properties", buildServerPropertiesTab(server)),
-                new Tab("Players", buildServerPlayersTab(server)),
-                new Tab("Addons", buildServerAddonsTab(server)),
-                new Tab("Files", buildServerFilesTab(server)),
-                new Tab("Settings", buildServerSettingsTab(server)),
-                new Tab("Permissions", buildServerPermissionsTab(server))
-        );
-        // Borderless (Mods-style) window, sized larger so all the console/properties/players/etc.
-        // tabs have room to breathe (proportional to the display, like the Mods window).
+        // Only the tabs this role may actually use are added -- a locked tab would only advertise what the
+        // person does not have. Which ones those are is decided by ManagerRole, never here.
+        for (com.deylauncher.servers.ServerTab tab : com.deylauncher.servers.ServerTab.values()) {
+            if (!role.canOpen(tab)) continue;
+            tabs.getTabs().add(new Tab(tab.title(), buildServerTab(server, tab)));
+        }
+        // Borderless (Mods-style) window, sized larger so all the tabs have room to breathe (proportional
+        // to the display, like the Mods window).
         javafx.geometry.Rectangle2D vb = javafx.stage.Screen.getPrimary().getVisualBounds();
         double w = Math.max(960, Math.min(1560, vb.getWidth() * 0.85));
         double h = Math.max(700, Math.min(1040, vb.getHeight() * 0.88));
-        openShellWindow("server-" + server.id, server.name, tabs, 700, 540, w, h);
+        openShellWindow("server-" + server.id, server.name + roleSuffix(role), tabs, 700, 540, w, h);
+    }
+
+    /** The window title suffix that tells a moderator at a glance that this is not their own server. */
+    private static String roleSuffix(com.deylauncher.servers.ManagerRole role) {
+        return role == com.deylauncher.servers.ManagerRole.OWNER ? "" : "  ·  " + roleLabel(role);
+    }
+
+    /** Builds one management tab by name, so the role filter above can decide which ones exist. */
+    private Node buildServerTab(ServerInstance server, com.deylauncher.servers.ServerTab tab) {
+        return switch (tab) {
+            case CONSOLE -> buildServerConsoleTab(server);
+            case PROPERTIES -> buildServerPropertiesTab(server);
+            case PLAYERS -> buildServerPlayersTab(server);
+            case ADDONS -> buildServerAddonsTab(server);
+            case FILES -> buildServerFilesTab(server);
+            case SETTINGS -> buildServerSettingsTab(server);
+            case PERMISSIONS -> buildServerPermissionsTab(server);
+        };
+    }
+
+    /** The small pill that says which role you hold on a shared server. */
+    private Label rolePill(com.deylauncher.servers.ManagerRole role) {
+        Label pill = new Label(roleLabel(role));
+        pill.getStyleClass().add(role == null ? "role-pill-none" : "role-pill");
+        // A badge must never be abbreviated -- its whole job is to be read at a glance, so pin its
+        // width to the text instead of letting a narrow column turn "OWNER" into "OWN...".
+        pill.setMinWidth(Region.USE_PREF_SIZE);
+        pill.setTooltip(new Tooltip(role == null ? "No access" : role.summary()));
+        return pill;
+    }
+
+    /** The badge that marks a server as "given to you" rather than owned by you. */
+    private Label givenBadge() {
+        Label badge = new Label("GIVEN");
+        badge.getStyleClass().add("given-badge");
+        badge.setMinWidth(Region.USE_PREF_SIZE);
+        badge.setTooltip(new Tooltip("This server was shared with you by its owner."));
+        return badge;
+    }
+
+    /** The active account's username, or null when nothing is signed in. */
+    private String activeAccountName() {
+        PlayerIdentity me = identityStore.getActive();
+        return me == null ? null : me.username;
+    }
+
+    /**
+     * The deliberately tiny window for a server that was shared with this account but is not installed here
+     * yet: install it, or cancel your moderation. Nothing else is offered, because there is nothing on this
+     * PC to configure -- that is exactly what being a whitelisted moderator means before the first install.
+     */
+    private void openSharedServerSetupDialog(com.deylauncher.servers.SemiHostedLinkStore.Link link,
+                                             ServerInstance localOrNull) {
+        String name = link != null && link.name != null && !link.name.isBlank() ? link.name
+                : (localOrNull != null ? localOrNull.name : "Shared server");
+        String owner = link != null && link.ownerUsername != null && !link.ownerUsername.isBlank()
+                ? link.ownerUsername : "its owner";
+        com.deylauncher.servers.ManagerRole role = link == null ? null : link.parsedRole();
+
+        Label title = new Label(name);
+        title.getStyleClass().add("card-heading");
+        Label ownerLabel = new Label("Owned by " + owner
+                + (link != null && link.deyAddress() != null ? "  ·  " + link.deyAddress() : ""));
+        ownerLabel.getStyleClass().add("notice-label");
+        HBox badges = new HBox(8, rolePill(role), givenBadge());
+        badges.setAlignment(Pos.CENTER_LEFT);
+
+        Label note = new Label("You've been added as "
+                + (role == null ? "a moderator" : role.displayName().toLowerCase(java.util.Locale.ROOT))
+                + " on this server, so you can install it here and host it while " + owner + " isn't. "
+                + "The world is stored in the shared servers repo, so installing downloads the latest "
+                + "version of it.");
+        note.getStyleClass().add("notice-label");
+        note.setWrapText(true);
+
+        Label status = new Label();
+        status.getStyleClass().add("notice-label");
+        status.setWrapText(true);
+
+        Button installBtn = new Button();
+        installBtn.getStyleClass().add("play-button");
+        setButtonIcon(installBtn, IconFactory.Icon.DOWNLOAD, "Install server");
+        installBtn.setDisable(link == null);
+        installBtn.setOnAction(e -> {
+            installBtn.setDisable(true);
+            installSharedServer(link, status, () -> installBtn.setDisable(false));
+        });
+
+        Button cancelBtn = new Button("Cancel server moderation");
+        cancelBtn.getStyleClass().add("danger-delete-button");
+        cancelBtn.setDisable(link == null);
+        cancelBtn.setOnAction(e -> cancelOwnModeration(link, name, owner, status));
+
+        VBox content = new VBox(14, title, ownerLabel, badges, note, new HBox(10, installBtn, cancelBtn),
+                status);
+        content.setPadding(new Insets(24));
+        openShellWindow(sharedSetupKey(link), name + "  ·  shared with you", content, 420, 300, 560, 440);
+    }
+
+    private static String sharedSetupKey(com.deylauncher.servers.SemiHostedLinkStore.Link link) {
+        return "shared-setup-" + (link == null ? "unknown" : link.serverId);
+    }
+
+    /** Removes this account from a server's manager list, after a confirmation. */
+    private void cancelOwnModeration(com.deylauncher.servers.SemiHostedLinkStore.Link link, String name,
+                                     String owner, Label status) {
+        Alert confirm = new Alert(Alert.AlertType.CONFIRMATION,
+                "Stop moderating \"" + name + "\"?\nIt will disappear from your servers, and " + owner
+                        + " will have to add you again.", ButtonType.CANCEL, ButtonType.OK);
+        confirm.setHeaderText("Cancel moderation");
+        if (confirm.showAndWait().orElse(ButtonType.CANCEL) != ButtonType.OK) return;
+        if (semiHostedService == null || !semiHostedService.configured()) {
+            status.setText(NOT_SET_UP_MESSAGE);
+            return;
+        }
+        status.setText("Removing you as a moderator...");
+        new Thread(() -> {
+            try {
+                semiHostedService.revokeManager(link.repo, link.serverId, activeUuidOrNull(),
+                        activeAccountName());
+                semiHostedLinks.remove(link.serverId);
+                // The downloaded files stay on this PC (the world may still be wanted), but the server
+                // stops being advertised as one of ours.
+                if (link.localServerId != null && !link.localServerId.isBlank()) {
+                    ServerInstance local = serverStore.load(link.localServerId);
+                    if (local != null) {
+                        local.linkedOwnerUuid = null;
+                        local.linkedRole = null;
+                        local.semiSelfHosted = false;
+                        local.cloudServerId = null;
+                        local.cloudRepo = null;
+                        serverStore.save(local);
+                    }
+                }
+                Platform.runLater(() -> {
+                    javafx.stage.Stage win = shellWindows.get(sharedSetupKey(link));
+                    if (win != null) win.close();
+                    renderServersPageContent();
+                });
+            } catch (Exception ex) {
+                Platform.runLater(() -> status.setText("Couldn't cancel moderation: " + ex.getMessage()));
+            }
+        }, "semi-revoke-self").start();
     }
 
 /**
@@ -3409,6 +4524,10 @@ public class LauncherApp extends Application {
         VBox box = new VBox(14);
         box.setPadding(new Insets(20));
 
+        // What this account may do in the console: start/stop and play for every role, version changes for
+        // the owner only. The role rules themselves live in ManagerRole.
+        com.deylauncher.servers.ManagerRole consoleRole = roleOnServer(server);
+
         boolean running = runningServers.containsKey(server.id) && runningServers.get(server.id).isRunning();
         Label statusBadge = badgeLabel(running);
 
@@ -3444,6 +4563,12 @@ public class LauncherApp extends Application {
         versionChangeNote.getStyleClass().add("notice-label");
         versionChangeNote.setWrapText(true);
         changeVersionBtn.setOnAction(ev -> {
+            // Defensive: the button is not built for a role without the right, but a permission check that
+            // only exists in the UI is not a permission check.
+            if (consoleRole == null || !consoleRole.canChangeVersion()) {
+                versionChangeNote.setText("Only the owner can change this server's version.");
+                return;
+            }
             String chosen = serverVersionBox.getValue();
             if (chosen == null || chosen.equals(server.minecraftVersion)) return;
             if (runningServers.containsKey(server.id) && runningServers.get(server.id).isRunning()) {
@@ -3568,7 +4693,19 @@ public class LauncherApp extends Application {
         runCtrls.setAlignment(Pos.CENTER_LEFT);
         runCtrls.getStyleClass().add("server-control-group");
         Label verCap = captionLabel("VERSION", captionFont);
-        HBox verCtrls = new HBox(8, serverVersionBox, changeVersionBtn);
+        // Changing the version or the software is owner-only: a downgrade can make the one shared world
+        // unreadable for everyone, so a moderator gets the information instead of the control.
+        boolean mayChangeVersion = consoleRole != null && consoleRole.canChangeVersion();
+        HBox verCtrls;
+        if (mayChangeVersion) {
+            verCtrls = new HBox(8, serverVersionBox, changeVersionBtn);
+        } else {
+            Label versionLocked = new Label("Only the owner can change this server's version or software.");
+            versionLocked.getStyleClass().add("notice-label");
+            versionLocked.setWrapText(true);
+            versionLocked.setMaxWidth(320);
+            verCtrls = new HBox(8, versionLocked);
+        }
         verCtrls.setAlignment(Pos.CENTER_LEFT);
         verCtrls.getStyleClass().add("server-control-group");
         Label playCap = captionLabel("PLAY", captionFont);
@@ -3617,6 +4754,29 @@ public class LauncherApp extends Application {
         commandField.setOnAction(e -> sendCommand.run());
 
         startBtn.setOnAction(e -> {
+            // Shared hosting: exactly one PC may run this server, so claim it FIRST. A refusal here is not a
+            // failure -- it is the feature working ("the first one to open it wins").
+            String refusal = claimHosting(server);
+            if (refusal != null) {
+                serverConsoleArea.appendText("[DeyLauncher] " + refusal + "\n");
+                Alert already = new Alert(Alert.AlertType.INFORMATION, refusal);
+                already.setHeaderText("Already running");
+                already.show();
+                return;
+            }
+            // The owner can require that a moderator only host while they can also make the server
+            // reachable from outside their network, so "moderator hosting" never produces a server nobody
+            // can join. Starting without that is allowed, but only after saying so out loud.
+            String policyWarning = moderatorHostPolicyWarning(server);
+            if (policyWarning != null) {
+                Alert warn = new Alert(Alert.AlertType.CONFIRMATION, policyWarning,
+                        ButtonType.CANCEL, ButtonType.OK);
+                warn.setHeaderText("Share it over the Internet first?");
+                if (warn.showAndWait().orElse(ButtonType.CANCEL) != ButtonType.OK) {
+                    releaseHosting(server, com.deylauncher.servers.ServerRuntimeDoc.STOP_CLEAN, false);
+                    return;
+                }
+            }
             startBtn.setDisable(true);
             server.lastJoinedAt = System.currentTimeMillis();
             serverStore.save(server);
@@ -3733,6 +4893,13 @@ public class LauncherApp extends Application {
                         stopBtn.setDisable(true);
                         setBadge(statusBadge, false);
                         publishPresenceWithServer(server, false);
+                        // Shared server: save its world and hand the claim back, whatever made it exit, so
+                        // the next moderator starts from this session's world rather than an older one.
+                        if (isSharedServer(server)) {
+                            releaseHosting(server, exit == 0
+                                    ? com.deylauncher.servers.ServerRuntimeDoc.STOP_CLEAN
+                                    : com.deylauncher.servers.ServerRuntimeDoc.STOP_CRASH, true);
+                        }
                         renderServersPageContent();
                     });
                     return null;
@@ -3759,6 +4926,11 @@ public class LauncherApp extends Application {
                         startBtn.setDisable(false);
                         setBadge(statusBadge, false);
                         publishPresenceWithServer(server, false); // server no longer joinable
+                        // Shared server: publish the world and give the claim back, so the next moderator
+                        // picks up exactly where this session ended.
+                        if (isSharedServer(server)) {
+                            releaseHosting(server, com.deylauncher.servers.ServerRuntimeDoc.STOP_CLEAN, true);
+                        }
                         renderServersPageContent();
                     });
                 }, "server-stop-" + server.id).start();
@@ -4139,39 +5311,56 @@ public class LauncherApp extends Application {
         });
         renderOnline.run();
 
-        // ---- Server managers (permission record for future remote management) ----
-        VBox managersSection = new VBox(10, sectionLabel("SERVER MANAGERS"));
-        Label managersNote = new Label("DeyLauncher friends recorded as permitted to manage this server. "
-                + "Not enforced remotely yet -- this just records who's permitted for when "
-                + "multihosting/remote management is built.");
-        managersNote.getStyleClass().add("notice-label");
-        managersNote.setWrapText(true);
-        managersSection.getChildren().add(managersNote);
-        Runnable renderManagers = () -> {
-            managersSection.getChildren().setAll(sectionLabel("SERVER MANAGERS"), managersNote);
-            for (String managerName : server.managerUsernames) {
-                Label managerLabel = new Label(managerName);
-                managerLabel.getStyleClass().add("mod-name");
-                Region managerSpacer = new Region();
-                HBox.setHgrow(managerSpacer, Priority.ALWAYS);
-                Button removeManagerBtn = new Button("Remove");
-                removeManagerBtn.getStyleClass().add("pill-button");
-                removeManagerBtn.setOnAction(e -> {
-                    server.managerUsernames.remove(managerName);
-                    serverStore.save(server);
-                });
-                HBox managerRow = new HBox(10, managerLabel, managerSpacer, removeManagerBtn);
-                managerRow.setAlignment(Pos.CENTER_LEFT);
-                managerRow.getStyleClass().add("mod-row");
-                managersSection.getChildren().add(managerRow);
-            }
-        };
+        // ---- Server managers ----
+        // Two deliberately different mechanisms. A shared (semi self-hosted) server's moderators are real
+        // accounts with roles in the shared repo -- that is the list which is actually enforced everywhere. An
+        // unshared server can only keep a local note of who is allowed to help.
+        com.deylauncher.servers.ManagerRole playersRole = roleOnServer(server);
+
+        box.getChildren().add(onlineSection);
+        box.getChildren().add(buildPlayerListSection("OPERATORS (OP)", playerManager.listOps(), playerManager, playerManager.opsFile(), server));
+        box.getChildren().add(buildPlayerListSection("WHITELIST", playerManager.listWhitelist(), playerManager, playerManager.whitelistFile(), server));
+        box.getChildren().add(buildPlayerListSection("BANNED", playerManager.listBanned(), playerManager, playerManager.bannedFile(), server));
+        box.getChildren().add(isSharedServer(server)
+                ? buildSharedManagersSection(server, playersRole)
+                : buildLocalManagersSection(server, playersRole));
+        return scroll;
+    }
+
+    /** The local "who may help" note for a server that is NOT shared -- unchanged local-only behaviour. */
+    private Node buildLocalManagersSection(ServerInstance server,
+                                           com.deylauncher.servers.ManagerRole myRole) {
+        VBox section = new VBox(10);
+        renderLocalManagers(section, server);
+        return section;
+    }
+
+    /** (Re)draws the local manager note and list for an unshared server. */
+    private void renderLocalManagers(VBox section, ServerInstance server) {
+        Label note = wrappedNotice("This server isn't shared, so this is only a local note of who is allowed "
+                + "to help you. Turn on semi self-hosted sharing in Settings to give these people real roles "
+                + "and let them host it from their own PC.");
+        section.getChildren().setAll(sectionLabel("SERVER MANAGERS"), note);
+        for (String managerName : server.managerUsernames) {
+            Label managerLabel = new Label(managerName);
+            managerLabel.getStyleClass().add("mod-name");
+            Region managerSpacer = new Region();
+            HBox.setHgrow(managerSpacer, Priority.ALWAYS);
+            Button removeManagerBtn = new Button("Remove");
+            removeManagerBtn.getStyleClass().add("pill-button");
+            removeManagerBtn.setOnAction(e -> {
+                server.managerUsernames.remove(managerName);
+                serverStore.save(server);
+                renderLocalManagers(section, server);
+            });
+            HBox managerRow = new HBox(10, managerLabel, managerSpacer, removeManagerBtn);
+            managerRow.setAlignment(Pos.CENTER_LEFT);
+            managerRow.getStyleClass().add("mod-row");
+            section.getChildren().add(managerRow);
+        }
         TextField addManagerField = new TextField();
         addManagerField.setPromptText("DeyLauncher username");
         addManagerField.getStyleClass().add("input-field");
-        Button suggestManagerBtn = new Button("Suggest");
-        suggestManagerBtn.getStyleClass().add("pill-button");
-        suggestManagerBtn.setOnAction(e -> showOnlinePlayerSuggestions(addManagerField, server));
         Button addManagerBtn = new Button("Add");
         addManagerBtn.getStyleClass().add("pill-button");
         addManagerBtn.setOnAction(e -> {
@@ -4180,22 +5369,231 @@ public class LauncherApp extends Application {
             server.managerUsernames.add(username);
             serverStore.save(server);
             addManagerField.clear();
-            renderManagers.run();
+            renderLocalManagers(section, server);
         });
-        HBox addManagerRow = new HBox(10, suggestManagerBtn, addManagerField, addManagerBtn);
-        renderManagers.run();
-        managersSection.getChildren().add(addManagerRow);
-
-        box.getChildren().add(onlineSection);
-        box.getChildren().add(buildPlayerListSection("OPERATORS (OP)", playerManager.listOps(), playerManager, playerManager.opsFile(), server));
-        box.getChildren().add(buildPlayerListSection("WHITELIST", playerManager.listWhitelist(), playerManager, playerManager.whitelistFile(), server));
-        box.getChildren().add(buildPlayerListSection("BANNED", playerManager.listBanned(), playerManager, playerManager.bannedFile(), server));
-        box.getChildren().add(managersSection);
-        return scroll;
+        section.getChildren().add(new HBox(10, addManagerField, addManagerBtn));
     }
 
     /**
-     * One online player's row: face avatar + name, click to expand quick op/whitelist/ban
+     * The moderator list for a shared server, including the owner's mandatory role choice.
+     *
+     * <p>Adding somebody opens a picker that cannot be confirmed without choosing a role: "which powers did I
+     * hand out" must never be ambiguous, and any default would quietly make every new moderator a co-host.
+     */
+    private Node buildSharedManagersSection(ServerInstance server,
+                                            com.deylauncher.servers.ManagerRole myRole) {
+        VBox section = new VBox(10, sectionLabel("SERVER MANAGERS"));
+        Label status = new Label();
+        status.getStyleClass().add("notice-label");
+        status.setWrapText(true);
+        var link = linkFor(server);
+        if (link == null) {
+            section.getChildren().add(wrappedNotice("Publish this server first (Settings \u25b8 Semi "
+                    + "self-hosted) and only then add moderators."));
+            return section;
+        }
+        Label note = wrappedNotice("Moderators can host this server from their own PC, one at a time. Each one "
+                + "gets exactly one role, chosen when you add them: Administrator (co-host) or Starter "
+                + "(start/stop and play only). Add people you know -- an offline account's id is derived from "
+                + "its name alone, so a name is not proof of who somebody is.");
+        VBox list = new VBox(8);
+        section.getChildren().addAll(note, list, status);
+        reloadSharedManagers(link, list, myRole, status);
+
+        if (myRole != null && myRole.canManageRoles()) {
+            TextField addManagerField = new TextField();
+            addManagerField.setPromptText("DeyLauncher username");
+            addManagerField.getStyleClass().add("input-field");
+            Button suggestManagerBtn = new Button("Suggest");
+            suggestManagerBtn.getStyleClass().add("pill-button");
+            suggestManagerBtn.setOnAction(e -> showOnlinePlayerSuggestions(addManagerField, server));
+            Button addManagerBtn = new Button("Add as...");
+            addManagerBtn.getStyleClass().add("play-button");
+            addManagerBtn.setOnAction(e -> {
+                String username = addManagerField.getText().trim();
+                if (username.isEmpty()) {
+                    status.setText("Type the DeyLauncher name of the person you want to add.");
+                    return;
+                }
+                java.util.Optional<com.deylauncher.servers.ManagerRole> chosen = pickManagerRole(username);
+                if (chosen.isEmpty()) return; // dismissing the picker grants nothing at all
+                grantManagerByUsername(link, username, chosen.get(), status, list, myRole);
+            });
+            section.getChildren().add(new HBox(10, suggestManagerBtn, addManagerField, addManagerBtn));
+        } else {
+            section.getChildren().add(wrappedNotice("Only the owner can add, re-role or remove moderators."));
+        }
+        return section;
+    }
+
+    /** Fills the moderator list from the shared repo, with role pills and owner-only actions. */
+    private void reloadSharedManagers(com.deylauncher.servers.SemiHostedLinkStore.Link link, VBox list,
+                                      com.deylauncher.servers.ManagerRole myRole, Label status) {
+        new Thread(() -> {
+            final com.deylauncher.servers.ManagersDoc doc;
+            try {
+                doc = semiHostedService.readManagers(link.repo, link.serverId);
+            } catch (Exception ex) {
+                Platform.runLater(() -> status.setText("Couldn't load the moderator list: " + ex.getMessage()));
+                return;
+            }
+            Platform.runLater(() -> {
+                list.getChildren().clear();
+                list.getChildren().add(wrappedNotice(doc.managerCount() == 0
+                        ? "No moderators yet -- you're the only one who can manage this server."
+                        : doc.managerCount() + " moderator" + (doc.managerCount() == 1 ? "" : "s")
+                          + " besides you."));
+                boolean canManage = myRole != null && myRole.canManageRoles();
+                for (var grant : doc.managers) {
+                    Label name = new Label(grant.username == null || grant.username.isBlank()
+                            ? grant.uuid : grant.username);
+                    name.getStyleClass().add("mod-name");
+                    Region spacer = new Region();
+                    HBox.setHgrow(spacer, Priority.ALWAYS);
+                    HBox row = new HBox(10, name, rolePill(grant.parsedRole()), spacer);
+                    row.setAlignment(Pos.CENTER_LEFT);
+                    row.getStyleClass().add("mod-row");
+                    if (canManage) {
+                        Button changeBtn = new Button("Change role");
+                        changeBtn.getStyleClass().add("pill-button");
+                        changeBtn.setOnAction(e -> {
+                            java.util.Optional<com.deylauncher.servers.ManagerRole> chosen =
+                                    pickManagerRole(grant.username);
+                            if (chosen.isEmpty()) return;
+                            applyManagerRole(link, grant, chosen.get(), status, list, myRole);
+                        });
+                        Button removeBtn = new Button("Remove");
+                        removeBtn.getStyleClass().add("danger-delete-button");
+                        removeBtn.setOnAction(e -> {
+                            String who = grant.username == null ? "that moderator" : grant.username;
+                            status.setText("Removing " + who + "...");
+                            new Thread(() -> {
+                                try {
+                                    semiHostedService.revokeManager(link.repo, link.serverId, grant.uuid,
+                                            activeAccountName());
+                                    Platform.runLater(() -> {
+                                        status.setText("Removed " + who + ".");
+                                        reloadSharedManagers(link, list, myRole, status);
+                                        renderServersPageContent();
+                                    });
+                                } catch (Exception ex) {
+                                    Platform.runLater(() -> status.setText("Couldn't remove " + who + ": "
+                                            + ex.getMessage()));
+                                }
+                            }, "semi-revoke-manager").start();
+                        });
+                        row.getChildren().addAll(changeBtn, removeBtn);
+                    }
+                    list.getChildren().add(row);
+                }
+            });
+        }, "semi-managers-" + link.serverId).start();
+    }
+
+    /**
+     * The mandatory role picker. It returns empty when the dialog is dismissed, and the confirm button stays
+     * disabled until a role is actually chosen -- so there is no way to add a moderator without deciding,
+     * which is exactly what the feature requires.
+     */
+    private java.util.Optional<com.deylauncher.servers.ManagerRole> pickManagerRole(String username) {
+        String who = username == null || username.isBlank() ? "this player" : username;
+        Dialog<com.deylauncher.servers.ManagerRole> dialog = new Dialog<>();
+        dialog.setTitle("Role for " + who);
+        dialog.setHeaderText("Choose what " + who + " may do on this server");
+        dialog.getDialogPane().getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
+        dialog.getDialogPane().getStylesheets()
+                .add(DynamicStyle.dataUri(prefs.uiScale, prefs.textScale, prefs.fontFamily));
+        dialog.getDialogPane().getStyleClass().addAll("root-pane", darkMode ? "theme-dark" : "theme-light");
+
+        ToggleGroup group = new ToggleGroup();
+        VBox options = new VBox(12);
+        for (com.deylauncher.servers.ManagerRole role : com.deylauncher.servers.ManagerRole.grantable()) {
+            RadioButton option = new RadioButton(role.displayName());
+            option.setToggleGroup(group);
+            option.setUserData(role);
+            options.getChildren().addAll(option, wrappedNotice(role.summary()));
+        }
+        VBox content = new VBox(14, wrappedNotice("A role is required -- there is no default, so nothing is "
+                + "granted until you pick one."), options);
+        content.setPadding(new Insets(20));
+        content.setPrefWidth(420);
+        dialog.getDialogPane().setContent(content);
+
+        ButtonType addType = new ButtonType("Add", ButtonBar.ButtonData.OK_DONE);
+        dialog.getDialogPane().getButtonTypes().addAll(addType, ButtonType.CANCEL);
+        Node addNode = dialog.getDialogPane().lookupButton(addType);
+        addNode.setDisable(true);
+        group.selectedToggleProperty().addListener((o, a, b) -> addNode.setDisable(b == null));
+        dialog.setResultConverter(button -> {
+            if (button != addType || group.getSelectedToggle() == null) return null;
+            return (com.deylauncher.servers.ManagerRole) group.getSelectedToggle().getUserData();
+        });
+        return dialog.showAndWait();
+    }
+
+    /** Resolves a username to an account uuid and grants that account a role. */
+    private void grantManagerByUsername(com.deylauncher.servers.SemiHostedLinkStore.Link link, String username,
+                                        com.deylauncher.servers.ManagerRole role, Label status, VBox list,
+                                        com.deylauncher.servers.ManagerRole myRole) {
+        status.setText("Looking up " + username + "...");
+        new Thread(() -> {
+            String uuid = null;
+            // Grants are keyed by uuid, so the name has to be resolved through the shared friends graph first.
+            try {
+                String myUuid = activeUuidOrNull();
+                if (myUuid != null && friendsService != null) {
+                    var view = friendsService.load(myUuid);
+                    for (var entry : view.allUsers().entrySet()) {
+                        if (username.equalsIgnoreCase(entry.getValue().username)) {
+                            uuid = entry.getKey();
+                            break;
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+                // Falling through reports "not found", which is the honest answer either way.
+            }
+            if (uuid == null) {
+                Platform.runLater(() -> status.setText("Couldn't find a DeyLauncher account called \""
+                        + username + "\". They need to have used DeyLauncher at least once."));
+                return;
+            }
+            try {
+                semiHostedService.grantManager(link.repo, link.serverId, uuid, username, role,
+                        activeAccountName());
+                Platform.runLater(() -> {
+                    status.setText(username + " can now manage this server as " + role.displayName() + ".");
+                    reloadSharedManagers(link, list, myRole, status);
+                    renderServersPageContent();
+                });
+            } catch (Exception ex) {
+                Platform.runLater(() -> status.setText("Couldn't add " + username + ": " + ex.getMessage()));
+            }
+        }, "semi-grant-manager").start();
+    }
+
+    /** Re-roles an existing moderator (the owner's "change their role" action). */
+    private void applyManagerRole(com.deylauncher.servers.SemiHostedLinkStore.Link link,
+                                  com.deylauncher.servers.ManagerGrant grant,
+                                  com.deylauncher.servers.ManagerRole role, Label status, VBox list,
+                                  com.deylauncher.servers.ManagerRole myRole) {
+        String who = grant.username == null || grant.username.isBlank() ? grant.uuid : grant.username;
+        status.setText("Changing " + who + "'s role...");
+        new Thread(() -> {
+            try {
+                semiHostedService.grantManager(link.repo, link.serverId, grant.uuid, grant.username, role,
+                        activeAccountName());
+                Platform.runLater(() -> {
+                    status.setText(who + " is now " + role.displayName() + ".");
+                    reloadSharedManagers(link, list, myRole, status);
+                });
+            } catch (Exception ex) {
+                Platform.runLater(() -> status.setText("Couldn't change the role: " + ex.getMessage()));
+            }
+        }, "semi-role-change").start();
+    }
+
+    /** One online player's row: face avatar + name, click to expand quick op/whitelist/ban
      * account-info controls. Live inventory viewing is NOT implemented -- that would need a real
      * NBT parser reading playerdata (reflecting last save, not truly live), which is a
      * meaningfully bigger feature than fits honestly in this pass.
@@ -5208,37 +6606,80 @@ public class LauncherApp extends Application {
         memGrid.add(minRamSlider, 0, 1);
         memGrid.add(maxRamSlider, 1, 1);
 
-        // ---- Danger zone: permanently delete this server ----
-        Region dangerSpacer = new Region();
-        HBox.setHgrow(dangerSpacer, Priority.ALWAYS);
+        // ---- Danger zone: what this role is actually allowed to do about the server ----
+        VBox dangerZone = buildServerDangerZone(server);
 
-        Button deleteBtn = new Button();
-        setButtonIconOnly(deleteBtn, IconFactory.Icon.TRASH);
-        deleteBtn.getStyleClass().add("danger-delete-button");
-        deleteBtn.setTooltip(new Tooltip("Delete this server permanently"));
+        box.getChildren().addAll(
+                sectionLabel("MEMORY"), memGrid,
+                sectionLabel("PORT"), portField,
+                sectionLabel("JAVA ENVIRONMENT"), javaEnvBox, javaEnvNote,
+                sectionLabel("SEMI SELF-HOSTED (SHARED)"), buildSemiHostedSection(server),
+                sectionLabel("DANGER ZONE"), dangerZone);
+        return tabShell(scroll, saveBtn, savedNote);
+    }
 
-        Label dangerTitle = new Label("Delete this server");
-        dangerTitle.getStyleClass().add("danger-title");
-        HBox dangerHeader = new HBox(12, deleteBtn, dangerTitle, dangerSpacer);
-        dangerHeader.setAlignment(Pos.CENTER_LEFT);
+    /**
+     * The Settings danger zone, shaped by what this role may do.
+     *
+     * <p>The owner deletes the server everywhere -- and, for a shared server, its cloud record, manager list
+     * and world with it. A moderator gets only the two safe actions: remove the copy from this PC, or cancel
+     * their own moderation. Neither can destroy the owner's server, which is the point.
+     */
+    private VBox buildServerDangerZone(ServerInstance server) {
+        com.deylauncher.servers.ManagerRole role = roleOnServer(server);
+        var link = linkFor(server);
+        VBox zone = new VBox(10);
+        zone.getStyleClass().add("server-danger-zone");
 
-        Label dangerNote = new Label("Permanently removes this server and all of its world, "
-                + "player and addon data from this PC. This can't be undone.");
-        dangerNote.getStyleClass().add("notice-label");
-        dangerNote.setWrapText(true);
+        Region spacer = new Region();
+        HBox.setHgrow(spacer, Priority.ALWAYS);
+        boolean shared = isSharedServer(server);
 
-        VBox dangerZone = new VBox(10, dangerHeader, dangerNote);
-        dangerZone.getStyleClass().add("server-danger-zone");
+        if (role != null && role.canDeleteServerEverywhere()) {
+            Button deleteBtn = new Button();
+            setButtonIconOnly(deleteBtn, IconFactory.Icon.TRASH);
+            deleteBtn.getStyleClass().add("danger-delete-button");
+            deleteBtn.setTooltip(new Tooltip("Delete this server permanently"));
+            Label title = new Label(shared ? "Delete this server everywhere" : "Delete this server");
+            title.getStyleClass().add("danger-title");
+            HBox header = new HBox(12, deleteBtn, title, spacer);
+            header.setAlignment(Pos.CENTER_LEFT);
 
-        deleteBtn.setOnAction(e -> {
-            Alert confirm = new Alert(Alert.AlertType.CONFIRMATION,
-                    "Delete \"" + server.name + "\"?\nIts folder and all server data will be removed permanently.",
-                    ButtonType.CANCEL, ButtonType.OK);
-            confirm.setHeaderText("Delete server");
-            var pick = confirm.showAndWait();
-            if (pick.isPresent() && pick.get() == ButtonType.OK) {
+            Label note = new Label("Permanently removes this server and all of its world, player and addon "
+                    + "data from this PC" + (shared
+                    ? ", and its shared record, manager list and saved world from the servers repo too."
+                    : ".") + " This can't be undone.");
+            note.getStyleClass().add("notice-label");
+            note.setWrapText(true);
+
+            CheckBox alsoCloud = new CheckBox("Also delete the shared copy in the servers repo");
+            alsoCloud.setSelected(true);
+            alsoCloud.setVisible(shared);
+            alsoCloud.setManaged(shared);
+
+            deleteBtn.setOnAction(e -> {
+                boolean wipeCloud = shared && alsoCloud.isSelected();
+                Alert confirm = new Alert(Alert.AlertType.CONFIRMATION,
+                        "Delete \"" + server.name + "\"?\nIts folder and all server data will be removed"
+                                + (wipeCloud ? ", and its shared copy will be deleted from the servers repo"
+                                : "") + ".", ButtonType.CANCEL, ButtonType.OK);
+                confirm.setHeaderText(wipeCloud ? "Delete server everywhere" : "Delete server");
+                if (confirm.showAndWait().orElse(ButtonType.CANCEL) != ButtonType.OK) return;
+                if (runningServers.containsKey(server.id)) {
+                    releaseHosting(server, com.deylauncher.servers.ServerRuntimeDoc.STOP_CLEAN, false);
+                }
                 ServerProcessManager pm = runningServers.remove(server.id);
                 if (pm != null) pm.stop();
+                if (wipeCloud && link != null && semiHostedService != null) {
+                    new Thread(() -> {
+                        try {
+                            semiHostedService.deleteCloudData(link.repo, link.serverId);
+                        } catch (Exception ex) {
+                            Platform.runLater(() -> log("Couldn't delete the shared copy: " + ex.getMessage()));
+                        }
+                    }, "semi-delete-cloud").start();
+                }
+                if (link != null) semiHostedLinks.remove(link.serverId);
                 try {
                     serverStore.delete(server.id);
                 } catch (Exception ex) {
@@ -5251,18 +6692,426 @@ public class LauncherApp extends Application {
                 renderServersPageContent();
                 javafx.stage.Stage mgmt = shellWindows.get("server-" + server.id);
                 if (mgmt != null) mgmt.close();
+            });
+            zone.getChildren().addAll(header, note, alsoCloud);
+            return zone;
+        }
+
+        // A moderator's two safe actions. Deliberately NOT "delete the server": the server is not theirs.
+        String owner = link != null && link.ownerUsername != null ? link.ownerUsername : "the owner";
+        Button removeLocalBtn = new Button();
+        setButtonIconOnly(removeLocalBtn, IconFactory.Icon.TRASH);
+        removeLocalBtn.getStyleClass().add("danger-delete-button");
+        removeLocalBtn.setTooltip(new Tooltip("Remove this server's files from this PC"));
+        Label localTitle = new Label("Delete this server from this PC");
+        localTitle.getStyleClass().add("danger-title");
+        HBox localHeader = new HBox(12, removeLocalBtn, localTitle, spacer);
+        localHeader.setAlignment(Pos.CENTER_LEFT);
+        Label localNote = new Label("Removes only your local copy. The server still belongs to " + owner
+                + ", and you can install it again from the Servers page at any time.");
+        localNote.getStyleClass().add("notice-label");
+        localNote.setWrapText(true);
+        removeLocalBtn.setOnAction(e -> {
+            Alert confirm = new Alert(Alert.AlertType.CONFIRMATION,
+                    "Remove \"" + server.name + "\" from this PC?", ButtonType.CANCEL, ButtonType.OK);
+            confirm.setHeaderText("Delete from this PC");
+            if (confirm.showAndWait().orElse(ButtonType.CANCEL) != ButtonType.OK) return;
+            ServerProcessManager pm = runningServers.remove(server.id);
+            if (pm != null) pm.stop();
+            if (link != null) {
+                // The link survives: the server is still shared with this account, just not installed here
+                // any more, so its card goes back to offering "Install server".
+                link.localServerId = null;
+                link.installed = false;
+                semiHostedLinks.upsert(link);
+            }
+            try {
+                serverStore.delete(server.id);
+            } catch (Exception ex) {
+                log("Failed to delete server: " + ex.getMessage());
+            }
+            renderServersPageContent();
+            javafx.stage.Stage mgmt = shellWindows.get("server-" + server.id);
+            if (mgmt != null) mgmt.close();
+        });
+
+        Button cancelModBtn = new Button("Cancel server moderation");
+        cancelModBtn.getStyleClass().add("pill-button");
+        cancelModBtn.setDisable(link == null);
+        Label cancelStatus = new Label();
+        cancelStatus.getStyleClass().add("notice-label");
+        if (link != null) {
+            cancelModBtn.setOnAction(e -> cancelOwnModeration(link, server.name, owner, cancelStatus));
+        }
+
+        zone.getChildren().addAll(localHeader, localNote, cancelModBtn, cancelStatus);
+        return zone;
+    }
+
+    /** A wrapped "notice" label, used by the shared-hosting panels. */
+    private Label wrappedNotice(String text) {
+        Label label = new Label(text);
+        label.getStyleClass().add("notice-label");
+        label.setWrapText(true);
+        return label;
+    }
+
+    /**
+     * The Settings section for semi self-hosted sharing: where the owner turns sharing on, claims the DEY
+     * address, publishes the cloud copy and decides who may host; a moderator sees the same facts but only
+     * the actions their role allows.
+     */
+    private Node buildSemiHostedSection(ServerInstance server) {
+        VBox box = new VBox(12);
+        box.getStyleClass().add("server-share-card");
+
+        com.deylauncher.servers.ManagerRole role = roleOnServer(server);
+        var link = linkFor(server);
+        Label status = new Label();
+        status.getStyleClass().add("notice-label");
+        status.setWrapText(true);
+
+        if (semiHostedService == null || !semiHostedService.configured()) {
+            box.getChildren().add(wrappedNotice("This build has no shared-servers backend configured, so a "
+                    + "server can't be shared across PCs. DeyLauncher image builds ship with one; seeing this "
+                    + "means this particular build was made without it."));
+            return box;
+        }
+
+        // ---- Facts everybody with access to this server can see ----
+        HBox facts = new HBox(8, rolePill(role));
+        facts.setAlignment(Pos.CENTER_LEFT);
+        if (server.isGrantedToMe(activeUuidOrNull())) {
+            facts.getChildren().add(givenBadge());
+            facts.getChildren().add(wrappedNotice("Owned by "
+                    + (link != null && link.ownerUsername != null ? link.ownerUsername : "another player")));
+        }
+        box.getChildren().add(facts);
+        if (link != null && link.deyAddress() != null) {
+            box.getChildren().add(wrappedNotice("Players can add " + link.deyAddress()
+                    + " -- it always points at whoever is hosting right now."));
+        }
+        if (link != null && link.lastSyncError != null) {
+            box.getChildren().add(wrappedNotice("Last cloud sync failed: " + link.lastSyncError));
+        }
+        box.getChildren().add(status);
+
+        // Where a world push/pull reports what it is doing. Inline on purpose: this used to be a
+        // modal window, and a multi-GB push can run for minutes -- see InlineSyncProgress.
+        box.getChildren().add(mountInlineSync(cloudIdFor(server)).node);
+
+        boolean owner = role != null && role.canEditSharedHostingPolicy();
+        if (owner) {
+            box.getChildren().add(buildOwnerSharingControls(server, link, status));
+        } else {
+            box.getChildren().add(buildModeratorSharingControls(server, role, status));
+        }
+        return box;
+    }
+
+    /** The owner's controls: sharing on/off, the DEY alias, the repo, syncing and hosting policy. */
+    private Node buildOwnerSharingControls(ServerInstance server,
+                                           com.deylauncher.servers.SemiHostedLinkStore.Link link,
+                                           Label status) {
+        VBox box = new VBox(10);
+
+        CheckBox shareBox = new CheckBox("Share this server, so moderators can host it from their own PC");
+        shareBox.setSelected(server.semiSelfHosted);
+        Label shareNote = wrappedNotice("While this is on, the server's record, its DEY address and the saved "
+                + "world live in a shared servers repo. Only the owner (you) can change its version, its "
+                + "roles or its cloud copy. An offline account can share 1 server, a Microsoft account 5.");
+
+        TextField aliasField = new TextField(server.cloudAlias == null ? "" : server.cloudAlias);
+        aliasField.setPromptText("mySMP");
+        aliasField.getStyleClass().add("input-field");
+        HBox.setHgrow(aliasField, Priority.ALWAYS);
+        Button suggestAliasBtn = new Button("Suggest");
+        suggestAliasBtn.getStyleClass().add("pill-button");
+        suggestAliasBtn.setOnAction(e -> {
+            status.setText("Looking for a free name...");
+            new Thread(() -> {
+                String suggestion;
+                try {
+                    suggestion = semiHostedService.suggestAlias(server.name);
+                } catch (Exception ex) {
+                    suggestion = (server.name == null ? "server" : server.name).replaceAll("[^A-Za-z0-9_-]", "");
+                }
+                final String value = suggestion;
+                Platform.runLater(() -> {
+                    aliasField.setText(value);
+                    status.setText("Suggested dey|" + value + " -- press Publish to claim it.");
+                });
+            }, "semi-alias-suggest").start();
+        });
+        HBox aliasRow = new HBox(8, new Label(com.deylauncher.servers.DeyAddress.PREFIX), aliasField,
+                suggestAliasBtn);
+        aliasRow.setAlignment(Pos.CENTER_LEFT);
+
+        ComboBox<String> repoBox = new ComboBox<>();
+        repoBox.getItems().addAll(semiHostedService.repoNames());
+        repoBox.setValue(repoFor(server));
+        repoBox.getStyleClass().add("input-field");
+        repoBox.setMaxWidth(Double.MAX_VALUE);
+
+        Button publishBtn = new Button();
+        publishBtn.getStyleClass().add(link == null ? "play-button" : "pill-button");
+        setButtonIcon(publishBtn, IconFactory.Icon.SERVER, link == null ? "Publish" : "Update shared copy");
+        publishBtn.setOnAction(e -> {
+            String alias = aliasField.getText().trim();
+            if (!alias.isEmpty() && !com.deylauncher.servers.DeyAddress.isValidAlias(alias)) {
+                status.setText("That name can't be used as an address. "
+                        + com.deylauncher.servers.DeyAddress.rulesHint());
+                return;
+            }
+            String repo = repoBox.getValue();
+            server.allowModeratorHostOnlyWhenPublic = server.allowModeratorHostOnlyWhenPublic;
+            status.setText("Checking the address is free...");
+            new Thread(() -> {
+                try {
+                    if (!alias.isEmpty()
+                            && semiHostedService.aliasTaken(alias, cloudIdFor(server))) {
+                        Platform.runLater(() -> status.setText("dey|" + alias
+                                + " already belongs to another shared server. Pick a different name."));
+                        return;
+                    }
+                } catch (Exception ignored) {
+                    // The publish below surfaces any real failure; a failed pre-check must not block it.
+                }
+                Platform.runLater(() -> publishServer(server, repo, alias, status, null));
+            }, "semi-alias-check").start();
+        });
+
+        box.getChildren().addAll(shareBox, shareNote, sectionLabel("DEY ADDRESS"), aliasRow,
+                wrappedNotice(com.deylauncher.servers.DeyAddress.rulesHint()),
+                sectionLabel("SERVERS REPO"), repoBox, publishBtn);
+
+        // Ticking the box publishes straight away -- that is what "share" has to mean. Unticking it leaves the
+        // cloud copy in place so the owner can decide separately whether to delete it below.
+        shareBox.setOnAction(e -> {
+            server.semiSelfHosted = shareBox.isSelected();
+            serverStore.save(server);
+            if (shareBox.isSelected() && linkFor(server) == null) {
+                publishBtn.fire();
+            } else {
+                status.setText(shareBox.isSelected()
+                        ? "Sharing is on. Press Update shared copy to push the current settings."
+                        : "Sharing is off -- this server is no longer offered to its moderators. Its cloud "
+                          + "copy stays until you delete it below.");
+                renderServersPageContent();
             }
         });
 
+        // ---- Syncing the world ----
+        Button pushBtn = new Button();
+        pushBtn.getStyleClass().add("pill-button");
+        setButtonIcon(pushBtn, IconFactory.Icon.DOWNLOAD, "Push world now");
+        pushBtn.setTooltip(new Tooltip("Upload the current world to the servers repo"));
+        pushBtn.setOnAction(e -> pushSharedWorld(server, status, () -> renderServersPageContent()));
+
+        Button pullBtn = new Button();
+        pullBtn.getStyleClass().add("pill-button");
+        setButtonIcon(pullBtn, IconFactory.Icon.REFRESH, "Get latest from cloud");
+        pullBtn.setTooltip(new Tooltip("Replace this PC's copy with the newest saved one"));
+        pullBtn.setOnAction(e -> pullSharedWorld(server, status, () -> renderServersPageContent()));
+
+        Button deleteCloudBtn = new Button();
+        deleteCloudBtn.getStyleClass().add("danger-delete-button");
+        setButtonIcon(deleteCloudBtn, IconFactory.Icon.TRASH, "Delete cloud data");
+        deleteCloudBtn.setDisable(link == null);
+        deleteCloudBtn.setTooltip(new Tooltip("Delete this server's saved world, record and manager list from "
+                + "the servers repo"));
+        deleteCloudBtn.setOnAction(e -> {
+            if (link == null) return;
+            Alert confirm = new Alert(Alert.AlertType.CONFIRMATION,
+                    "Delete the shared copy of \"" + server.name + "\" from " + link.repo + "?\nIts saved "
+                            + "world, manager list and address will be removed. The server itself stays on "
+                            + "this PC.", ButtonType.CANCEL, ButtonType.OK);
+            confirm.setHeaderText("Delete cloud data");
+            if (confirm.showAndWait().orElse(ButtonType.CANCEL) != ButtonType.OK) return;
+            status.setText("Deleting the shared copy...");
+            new Thread(() -> {
+                try {
+                    semiHostedService.deleteCloudData(link.repo, link.serverId);
+                    semiHostedLinks.remove(link.serverId);
+                    server.semiSelfHosted = false;
+                    server.cloudServerId = null;
+                    server.cloudRepo = null;
+                    serverStore.save(server);
+                    Platform.runLater(() -> {
+                        status.setText("Deleted the shared copy. Press Publish to share it again.");
+                        renderServersPageContent();
+                    });
+                } catch (Exception ex) {
+                    Platform.runLater(() -> status.setText("Couldn't delete the shared copy: "
+                            + ex.getMessage()));
+                }
+            }, "semi-delete-cloud").start();
+        });
+
+        HBox syncRow = new HBox(8, pushBtn, pullBtn);
+        syncRow.setAlignment(Pos.CENTER_LEFT);
+        box.getChildren().addAll(sectionLabel("SYNC THE WORLD"), syncRow, deleteCloudBtn);
+
+        // ---- Owner-only hosting policy ----
+        CheckBox publicOnlyBox = new CheckBox("Moderators may only host while they can host it publicly");
+        publicOnlyBox.setSelected(server.allowModeratorHostOnlyWhenPublic);
+        CheckBox openBox = new CheckBox("Offer this server to its moderators");
+        openBox.setSelected(server.openToModerators);
+        SimpleBooleanProperty policyDirty = new SimpleBooleanProperty(false);
+        publicOnlyBox.selectedProperty().addListener((o, a, b) -> policyDirty.set(true));
+        openBox.selectedProperty().addListener((o, a, b) -> policyDirty.set(true));
+        Button savePolicyBtn = buildDirtyButton(policyDirty);
+        savePolicyBtn.setOnAction(e -> {
+            server.allowModeratorHostOnlyWhenPublic = publicOnlyBox.isSelected();
+            server.openToModerators = openBox.isSelected();
+            serverStore.save(server);
+            policyDirty.set(false);
+            status.setText("Saved. Updating the shared copy...");
+            // Every moderator's launcher reads these two flags, so they have to reach the shared record too.
+            new Thread(() -> {
+                try {
+                    var cs = cloudFor(server);
+                    var hosted = cs == null ? null : semiHostedService.fetchMeta(cs);
+                    if (hosted != null) {
+                        hosted.allowModeratorHostOnlyWhenPublic = server.allowModeratorHostOnlyWhenPublic;
+                        hosted.openToModerators = server.openToModerators;
+                        semiHostedService.updatePolicy(hosted, activeAccountName());
+                        Platform.runLater(() -> status.setText("Saved and shared with the moderators."));
+                    }
+                } catch (Exception ex) {
+                    Platform.runLater(() -> status.setText("Saved on this PC, but the shared copy couldn't be "
+                            + "updated: " + ex.getMessage()));
+                }
+            }, "semi-policy-" + server.id).start();
+        });
+
+        // ---- Who is hosting, and the owner's force stop ----
+        Label hostInfo = wrappedNotice("Checking who is hosting...");
+        Button forceStopBtn = new Button();
+        forceStopBtn.getStyleClass().add("pill-button");
+        setButtonIcon(forceStopBtn, IconFactory.Icon.STOP, "Force stop the current host");
+        forceStopBtn.setDisable(true);
+        forceStopBtn.setOnAction(e -> forceStopCurrentHost(server, hostInfo, forceStopBtn));
+        refreshHostInfo(server, hostInfo, forceStopBtn);
+
         box.getChildren().addAll(
-                sectionLabel("MEMORY"), memGrid,
-                sectionLabel("PORT"), portField,
-                sectionLabel("JAVA ENVIRONMENT"), javaEnvBox, javaEnvNote,
-                sectionLabel("DANGER ZONE"), dangerZone);
-        return tabShell(scroll, saveBtn, savedNote);
+                sectionLabel("WHO MAY HOST"), publicOnlyBox, openBox, savePolicyBtn,
+                sectionLabel("HOSTED RIGHT NOW"), hostInfo, forceStopBtn);
+        return box;
+    }
+
+    /** Shows who is hosting (if anyone), and enables the force-stop button when it is somebody else. */
+    private void refreshHostInfo(ServerInstance server, Label hostInfo,
+                                 javafx.scene.control.Button forceStopBtn) {
+        var link = linkFor(server);
+        if (link == null || semiHostedService == null || !semiHostedService.configured()) {
+            hostInfo.setText("This server isn't shared yet.");
+            forceStopBtn.setDisable(true);
+            return;
+        }
+        final String repo = link.repo;
+        final String serverId = link.serverId;
+        new Thread(() -> {
+            String message;
+            boolean somebodyElseHosts = false;
+            try {
+                var runtime = semiHostedService.readRuntime(repo, serverId);
+                if (semiHostedService.isHeldLive(runtime)) {
+                    boolean mine = activeUuidOrNull() != null
+                            && activeUuidOrNull().equals(runtime.hostUuid);
+                    somebodyElseHosts = !mine;
+                    message = mine
+                            ? "You are hosting this server right now."
+                            : runtime.hostedByMessage() + " Force stop asks their launcher to stop; if it is "
+                              + "closed, the claim expires on its own within a few minutes.";
+                } else if (runtime.lastStoppedAt > 0) {
+                    message = "Nobody is hosting. It last stopped on "
+                            + new java.text.SimpleDateFormat("d MMM HH:mm", java.util.Locale.ROOT)
+                                    .format(new java.util.Date(runtime.lastStoppedAt)) + ".";
+                } else {
+                    message = "Nobody is hosting right now.";
+                }
+            } catch (Exception ex) {
+                message = "Couldn't check who is hosting: " + ex.getMessage();
+            }
+            final String text = message;
+            final boolean enable = somebodyElseHosts;
+            Platform.runLater(() -> {
+                hostInfo.setText(text);
+                forceStopBtn.setDisable(!enable);
+            });
+        }, "semi-host-info-" + server.id).start();
+    }
+
+    /** Asks whoever is hosting to stop -- the owner's "stop a moderator's server" power. */
+    private void forceStopCurrentHost(ServerInstance server, Label hostInfo,
+                                      javafx.scene.control.Button forceStopBtn) {
+        var link = linkFor(server);
+        if (link == null || semiHostedService == null) return;
+        final PlayerIdentity me = identityStore.getActive();
+        hostInfo.setText("Asking the current host to stop...");
+        forceStopBtn.setDisable(true);
+        new Thread(() -> {
+            try {
+                var cs = semiHostedService.findById(link.serverId).orElse(null);
+                var runtime = semiHostedService.readRuntime(link.repo, link.serverId);
+                if (cs == null || !semiHostedService.isHeldLive(runtime)) {
+                    Platform.runLater(() -> hostInfo.setText("Nobody is hosting this server right now."));
+                    return;
+                }
+                semiHostedService.requestForceStop(cs, runtime, me == null ? null : me.uuid,
+                        me == null ? null : me.username, "Stopped by the owner from DeyLauncher.");
+                Platform.runLater(() -> hostInfo.setText("Asked "
+                        + (runtime.hostUsername == null ? "the host" : runtime.hostUsername + "'s launcher")
+                        + " to stop. It stops within about a minute, or its claim expires in a few."));
+            } catch (Exception ex) {
+                Platform.runLater(() -> hostInfo.setText("Couldn't force stop: " + ex.getMessage()));
+            }
+        }, "semi-force-stop-" + server.id).start();
+    }
+
+    /**
+     * What a moderator sees: the same facts, and only the actions their role allows. Everything destructive
+     * or structural stays with the owner, which is the whole difference between a co-host and a guest.
+     */
+    private Node buildModeratorSharingControls(ServerInstance server,
+                                               com.deylauncher.servers.ManagerRole role, Label status) {
+        VBox box = new VBox(10);
+        Label hostInfo = wrappedNotice("Checking who is hosting...");
+        refreshHostInfo(server, hostInfo, new Button());
+        box.getChildren().add(hostInfo);
+
+        if (role != null && role.canSyncCloud()) {
+            Button pullBtn = new Button();
+            pullBtn.getStyleClass().add("pill-button");
+            setButtonIcon(pullBtn, IconFactory.Icon.REFRESH, "Get latest from cloud");
+            pullBtn.setOnAction(e -> pullSharedWorld(server, status, () -> renderServersPageContent()));
+            Button pushBtn = new Button();
+            pushBtn.getStyleClass().add("pill-button");
+            setButtonIcon(pushBtn, IconFactory.Icon.DOWNLOAD, "Push world now");
+            pushBtn.setOnAction(e -> pushSharedWorld(server, status, () -> renderServersPageContent()));
+            HBox row = new HBox(8, pushBtn, pullBtn);
+            row.setAlignment(Pos.CENTER_LEFT);
+            box.getChildren().add(row);
+        } else {
+            box.getChildren().add(wrappedNotice("Your role can start and stop this server and play on it, "
+                    + "but not change its shared copy. The owner can grant Administrator if you need that."));
+        }
+
+        box.getChildren().add(wrappedNotice("The owner keeps the server's version, its roles, its hosting "
+                + "policy and the option to delete its shared copy -- and can always stop whoever is hosting, "
+                + "including you."));
+        return box;
     }
 
     private Node buildServerPermissionsTab(ServerInstance server) {
+        com.deylauncher.servers.ManagerRole role = roleOnServer(server);
+        // A Starter's whole Permissions tab is the two world-shape settings, so it is built separately rather
+        // than filtered afterwards -- there is nothing here for a Starter to be shown a locked version of.
+        if (role != null && role.isPermissionsRestricted()) {
+            return buildRestrictedPermissionsTab(server);
+        }
+
         VBox box = new VBox(16);
         box.setPadding(new Insets(20));
         ScrollPane scroll = new ScrollPane(box);
@@ -5311,7 +7160,73 @@ public class LauncherApp extends Application {
                 sectionLabel("FRIENDS"), friendsJoinBox, friendsJoinNote,
                 sectionLabel("PLAYER SAVE"), saveBox, saveNote,
                 sectionLabel("MULTIHOSTING"), multihostBox, multihostNote);
+        if (role != null && role.canManageRoles()) {
+            box.getChildren().addAll(sectionLabel("SERVER MANAGERS"),
+                    wrappedNotice("Moderators are added from the Players tab, where you also pick the role "
+                            + "each of them gets. Only an owner can add, re-role or remove a moderator."));
+        }
         return tabShell(scroll, saveBtn, savedNote);
+    }
+
+    /**
+     * A Starter's Permissions tab: exactly the simulation distance and the view distance.
+     *
+     * <p>Both are world-shape knobs that cannot damage or expose a server, which is precisely why they are
+     * the only two a Starter may touch. Everything else the tab normally contains -- friends sharing, player
+     * saves, managers -- belongs to the owner, so it is not rendered here at all.
+     */
+    private Node buildRestrictedPermissionsTab(ServerInstance server) {
+        VBox box = new VBox(16);
+        box.setPadding(new Insets(20));
+        ScrollPane scroll = new ScrollPane(box);
+        scroll.setFitToWidth(true);
+        scroll.getStyleClass().add("settings-scroll");
+
+        var properties = new ServerPropertiesManager(serverStore.serverDir(server.id)).read();
+
+        TextField viewDistance = new TextField(properties.getOrDefault("view-distance", "10"));
+        viewDistance.getStyleClass().add("input-field");
+        Label viewNote = wrappedNotice("How far players can see, in chunks. Lower is lighter on slow PCs.");
+
+        TextField simulationDistance = new TextField(properties.getOrDefault("simulation-distance", "10"));
+        simulationDistance.getStyleClass().add("input-field");
+        Label simulationNote = wrappedNotice("How far from a player the world keeps running -- mobs, crops and "
+                + "redstone. Lower means less CPU for the host.");
+
+        SimpleBooleanProperty dirty = new SimpleBooleanProperty(false);
+        viewDistance.textProperty().addListener((o, a, b) -> dirty.set(true));
+        simulationDistance.textProperty().addListener((o, a, b) -> dirty.set(true));
+        Button saveBtn = buildDirtyButton(dirty);
+        Label savedNote = new Label();
+        savedNote.getStyleClass().add("notice-label");
+        saveBtn.setOnAction(e -> {
+            int view = clampDistance(parseIntSafe(viewDistance.getText(), 10));
+            int simulation = clampDistance(parseIntSafe(simulationDistance.getText(), 10));
+            viewDistance.setText(String.valueOf(view));
+            simulationDistance.setText(String.valueOf(simulation));
+            try {
+                var all = new ServerPropertiesManager(serverStore.serverDir(server.id)).read();
+                all.put("view-distance", String.valueOf(view));
+                all.put("simulation-distance", String.valueOf(simulation));
+                new ServerPropertiesManager(serverStore.serverDir(server.id)).write(all);
+                savedNote.setText("Saved. It applies the next time the server starts.");
+                dirty.set(false);
+            } catch (Exception ex) {
+                savedNote.setText("Couldn't save server.properties: " + ex.getMessage());
+            }
+        });
+
+        box.getChildren().addAll(
+                wrappedNotice("Your role on this server allows these two settings only. The owner keeps "
+                        + "everything else on this tab."),
+                sectionLabel("VIEW DISTANCE"), viewDistance, viewNote,
+                sectionLabel("SIMULATION DISTANCE"), simulationDistance, simulationNote);
+        return tabShell(scroll, saveBtn, savedNote);
+    }
+
+    /** Keeps a distance inside the range a Minecraft server actually accepts. */
+    private static int clampDistance(int value) {
+        return Math.max(3, Math.min(32, value));
     }
 
     /** Best-effort local LAN address for the copyable server IP box -- falls back to loopback if detection fails. */
@@ -5438,12 +7353,20 @@ public class LauncherApp extends Application {
         new Thread(task, "friends-action").start();
     }
 
-    /** The main-page account button: skin face + player name + an online/offline status dot, instead of a plain "Account" label. */
+    /** The top bar's account block: a round skin face with the online/offline status dot pinned to
+     *  its bottom-right corner, next to the player name -- not a pill and not a card, which is what
+     *  the reference design shows. WHICH face it shows is never chosen here: refreshAccountButton()
+     *  takes whatever the active account's skin is (or the placeholder face for an offline account
+     *  with no skin yet), so the picture stays automatic. */
     private Button buildAccountButton() {
         accountBtnFace = new ImageView();
-        accountBtnFace.setFitWidth(22);
-        accountBtnFace.setFitHeight(22);
-        accountBtnFace.setSmooth(false);
+        accountBtnFace.setFitWidth(TOP_BAR_FACE);
+        accountBtnFace.setFitHeight(TOP_BAR_FACE);
+        accountBtnFace.setSmooth(false);   // keep the pixel face pixelated, don't blur the 8x8 crop
+        // The face is clipped to a circle here rather than by a parent radius: a parent's
+        // -fx-background-radius rounds the parent's BACKGROUND, it does not clip its children, so
+        // without this the square 8x8 crop would poke out of the round ring behind it.
+        accountBtnFace.setClip(new Circle(TOP_BAR_FACE / 2, TOP_BAR_FACE / 2, TOP_BAR_FACE / 2));
         accountBtnFace.getStyleClass().add("account-btn-face");
 
         accountBtnDot = new Region();
@@ -5452,15 +7375,18 @@ public class LauncherApp extends Application {
         accountBtnName = new Label("No Account");
         accountBtnName.getStyleClass().add("account-btn-name");
 
-        StackPane faceHost = new StackPane(accountBtnFace);
+        // Face and dot share one StackPane so the dot overlaps the face's bottom-right corner.
+        StackPane faceHost = new StackPane(accountBtnFace, accountBtnDot);
         faceHost.getStyleClass().add("account-btn-face-host");
+        StackPane.setAlignment(accountBtnDot, Pos.BOTTOM_RIGHT);
+        StackPane.setMargin(accountBtnDot, new Insets(0, 2, 2, 0));
 
-        HBox content = new HBox(8, faceHost, accountBtnName, accountBtnDot);
+        HBox content = new HBox(12, faceHost, accountBtnName);
         content.setAlignment(Pos.CENTER_LEFT);
 
         Button btn = new Button();
         btn.setGraphic(content);
-        btn.getStyleClass().addAll("pill-button", "account-button");
+        btn.getStyleClass().add("account-button");
         btn.setOnAction(e -> openPreferencesDialog("Account"));
         return btn;
     }
@@ -5545,7 +7471,7 @@ public class LauncherApp extends Application {
         vanillaModeBtn.setOnAction(e -> { if (vanillaModeBtn.isSelected()) setMode(false); });
         deyModeBtn.setOnAction(e -> { if (deyModeBtn.isSelected()) setMode(true); });
 
-        HBox modeToggleRow = new HBox(4, vanillaModeBtn, deyModeBtn);
+        HBox modeToggleRow = new HBox(4, deyModeBtn, vanillaModeBtn);
         modeToggleRow.getStyleClass().add("mode-toggle-group");
         modeToggleRow.setAlignment(Pos.CENTER);
         modeToggleRow.setMaxWidth(Double.MAX_VALUE);
@@ -5647,7 +7573,10 @@ public class LauncherApp extends Application {
         modsBtn = new Button();
         setButtonIcon(modsBtn, IconFactory.Icon.PUZZLE, "Mods");
         modsBtn.getStyleClass().add("pill-button");
-        modsBtn.setMaxWidth(Double.MAX_VALUE);
+        // The loader and version columns beside it are the ones that grow or shrink, so the Mods
+        // button keeps its full "Mods" width no matter how narrow the card gets -- without this a
+        // squeezed row ellipsises it down to "M..." / "Mo...", which reads as a broken control.
+        modsBtn.setMinWidth(Region.USE_PREF_SIZE);
         modsBtn.setOnAction(e -> openModsDialog());
         modsBtn.setVisible(false);
         modsBtn.setManaged(false);
@@ -5658,17 +7587,46 @@ public class LauncherApp extends Application {
         playButton.setMaxWidth(Double.MAX_VALUE);
         playButton.setOnAction(e -> onPlay());
 
+        // Breathing glow behind the button (reference design's halo) -- applied in code rather than
+        // CSS so its radius/spread can animate; setMode() below recolors it to match DEY/VANILLA.
+        playButtonGlow = new DropShadow(BlurType.GAUSSIAN, Color.web("#fd6830", 0.60), 24, 0.38, 0, 6);
+        playButton.setEffect(playButtonGlow);
+        playButtonGlowPulse = new Timeline(
+                new KeyFrame(Duration.ZERO,
+                        new KeyValue(playButtonGlow.radiusProperty(), 20, Interpolator.EASE_BOTH),
+                        new KeyValue(playButtonGlow.spreadProperty(), 0.30, Interpolator.EASE_BOTH)),
+                new KeyFrame(Duration.seconds(1.6),
+                        new KeyValue(playButtonGlow.radiusProperty(), 34, Interpolator.EASE_BOTH),
+                        new KeyValue(playButtonGlow.spreadProperty(), 0.50, Interpolator.EASE_BOTH)));
+        playButtonGlowPulse.setAutoReverse(true);
+        playButtonGlowPulse.setCycleCount(Animation.INDEFINITE);
+        playButtonGlowPulse.play();
+
         launchProgress = new WaveLaunchBar();
         launchProgress.setMaxWidth(Double.MAX_VALUE);
         launchProgress.setVisible(false);
         launchProgress.setManaged(false);
         launchProgress.getStyleClass().add("play-progress");
 
+        // Loader + Version sit side by side (as in the reference design), with the Mods button
+        // pinned to the row's end and aligned to the combo boxes rather than their labels above.
+        VBox loaderColumn = new VBox(8, modLoaderLabel, modLoaderBox);
+        VBox versionColumn = new VBox(8, versionLabel, versionBox);
+        HBox.setHgrow(loaderColumn, Priority.ALWAYS);
+        HBox.setHgrow(versionColumn, Priority.ALWAYS);
+
+        Label modsBtnSpacer = new Label(" ");
+        modsBtnSpacer.getStyleClass().add("field-label");
+        VBox modsColumn = new VBox(8, modsBtnSpacer, modsBtn);
+        modsColumn.managedProperty().bind(modsBtn.managedProperty());
+        modsColumn.visibleProperty().bind(modsBtn.visibleProperty());
+
+        HBox fieldsRow = new HBox(14, loaderColumn, versionColumn, modsColumn);
+        fieldsRow.setAlignment(Pos.BOTTOM_LEFT);
+
         VBox right = new VBox(14,
                 mainHeadingLabel, mainDescriptionLabel, offlineNotice,
-                modLoaderLabel, modLoaderBox,
-                versionLabel, versionBox,
-                modsBtn, playButton, launchProgress);
+                fieldsRow, playButton, launchProgress);
         right.setPadding(new Insets(36)); // what .play-card's -fx-padding gave it before the card became a wrapper
         right.setAlignment(Pos.CENTER_LEFT);
         playContent = right;
@@ -5687,14 +7645,35 @@ public class LauncherApp extends Application {
         StackPane.setAlignment(packBackdrop, Pos.CENTER_RIGHT);
         StackPane.setMargin(packBackdrop, new Insets(0, 12, 0, 0));
 
-        playCard = new StackPane(packBackdrop, right);
+        // Always-on card artwork: fills the whole card behind the title/description, fading
+        // into the card's normal solid color by the time the loader/version inputs and Play
+        // button begin (see .play-card-art / .play-card-scrim), so it reads like the reference
+        // Home screen without ever sitting under an opaque control.
+        Region cardArt = new Region();
+        cardArt.getStyleClass().add("play-card-art");
+        cardArt.setMouseTransparent(true);
+        Region cardScrim = new Region();
+        cardScrim.getStyleClass().add("play-card-scrim");
+        cardScrim.setMouseTransparent(true);
+
+        playCard = new StackPane(cardArt, cardScrim, packBackdrop, right);
         playCard.getStyleClass().add("play-card");
         playCard.setStyle("-fx-padding: 0;"); // the padding lives on the content column
         playCard.setMinHeight(Region.USE_PREF_SIZE); // the card never shrinks below its content (no clipped text)
         playCard.widthProperty().addListener((o, a, b) -> applyBackdropReserve());
-        HBox.setHgrow(playCard, Priority.ALWAYS);
+        // The card sits in a VBox column now (with the console under it), so it simply fills the
+        // column's width; its height stays its own content height -- see rightColumn below.
 
-        HBox main = new HBox(20, left, playCard);
+        // Right column: the details card, with the game-output console parked under it exactly as
+        // the reference lays out the Home screen -- both share the column's width, and the console
+        // takes whatever height is left over (it never squeezes the card, which keeps its own
+        // content height, and it stops at its own minimum so the page can still shrink).
+        VBox logPane = buildLogPane();
+        VBox rightColumn = new VBox(14, playCard, logPane);
+        rightColumn.setAlignment(Pos.TOP_LEFT);
+        HBox.setHgrow(rightColumn, Priority.ALWAYS);
+
+        HBox main = new HBox(20, left, rightColumn);
         main.setPadding(new Insets(24, 28, 8, 28));
         main.setAlignment(Pos.TOP_LEFT);
 
@@ -5712,6 +7691,85 @@ public class LauncherApp extends Application {
         return main;
     }
 
+    /** One-time "Get Started" screen shown on first launch, full-bleed over the sunset mountain
+     * background art with a dark scrim so the brand block, the three feature rows and the two
+     * action buttons stay readable over any part of the artwork. Both buttons lead to the same
+     * launcher home underneath -- account sign-in itself already lives behind the top bar's
+     * Account button, so this screen is purely the welcome/orientation step, not an auth gate. */
+    private Node buildWelcomeScreen(Runnable onContinue) {
+        Region bg = new Region();
+        bg.getStyleClass().add("welcome-bg");
+        Region scrim = new Region();
+        scrim.getStyleClass().add("welcome-scrim");
+
+        Label logoGlyph = new Label("\u26CF");
+        logoGlyph.getStyleClass().add("welcome-logo-glyph");
+        Label title = new Label("DEYLAUNCHER");
+        title.getStyleClass().add("welcome-title");
+        HBox brand = new HBox(10, logoGlyph, title);
+        brand.setAlignment(Pos.CENTER_LEFT);
+
+        Label tagline = new Label("Play.  Friends.  Servers.");
+        tagline.getStyleClass().add("welcome-tagline");
+
+        VBox features = new VBox(18,
+                welcomeFeatureRow(IconFactory.Icon.CONTROLLER, "Play Minecraft",
+                        "Vanilla or modded, any version, with modpacks and mods."),
+                welcomeFeatureRow(IconFactory.Icon.PEOPLE, "Connect with Friends",
+                        "See what your friends are playing and join with one click."),
+                welcomeFeatureRow(IconFactory.Icon.SERVER, "Host & Share Servers",
+                        "Create, host and share servers between PCs with a stable dey| address."));
+
+        Button getStarted = new Button("Get Started  \u2192");
+        getStarted.getStyleClass().add("welcome-primary-btn");
+        getStarted.setMaxWidth(Double.MAX_VALUE);
+        getStarted.setOnAction(e -> onContinue.run());
+
+        Button haveAccount = new Button("I already have an account");
+        haveAccount.getStyleClass().add("welcome-secondary-btn");
+        haveAccount.setMaxWidth(Double.MAX_VALUE);
+        haveAccount.setOnAction(e -> onContinue.run());
+
+        VBox buttonRow = new VBox(12, getStarted, haveAccount);
+        buttonRow.setMaxWidth(360);
+
+        HBox dots = new HBox(6);
+        dots.setAlignment(Pos.CENTER_LEFT);
+        for (int i = 0; i < 4; i++) {
+            Region dot = new Region();
+            dot.getStyleClass().add("welcome-dot");
+            if (i == 0) dot.getStyleClass().add("welcome-dot-active");
+            dots.getChildren().add(dot);
+        }
+
+        VBox content = new VBox(22, brand, tagline, features, buttonRow, dots);
+        content.setMaxWidth(460);
+        content.setAlignment(Pos.BOTTOM_LEFT);
+        StackPane.setAlignment(content, Pos.BOTTOM_LEFT);
+        StackPane.setMargin(content, new Insets(0, 0, 64, 64));
+
+        StackPane welcomeRoot = new StackPane(bg, scrim, content);
+        welcomeRoot.getStyleClass().add("welcome-root");
+        return welcomeRoot;
+    }
+
+    private HBox welcomeFeatureRow(IconFactory.Icon icon, String heading, String desc) {
+        StackPane iconBadge = new StackPane(icon(icon, 20));
+        iconBadge.getStyleClass().add("welcome-feature-icon");
+
+        Label headingLabel = new Label(heading);
+        headingLabel.getStyleClass().add("welcome-feature-title");
+        Label descLabel = new Label(desc);
+        descLabel.getStyleClass().add("welcome-feature-desc");
+        descLabel.setWrapText(true);
+        descLabel.setMaxWidth(340);
+        VBox text = new VBox(2, headingLabel, descLabel);
+
+        HBox row = new HBox(14, iconBadge, text);
+        row.setAlignment(Pos.CENTER_LEFT);
+        return row;
+    }
+
     /** Switches between VANILLA (clean Vanilla/Fabric/Forge, any version) and DEY (Fabric only,
      * curated mods with Sodium baked in, release builds only) and rebuilds the loader choices
      * and left-column filter tiles to match. Also recolors the Play button to match whichever
@@ -5726,6 +7784,9 @@ public class LauncherApp extends Application {
 
         playButton.getStyleClass().removeAll("play-button-vanilla", "play-button-dey");
         playButton.getStyleClass().add(dey ? "play-button-dey" : "play-button-vanilla");
+        if (playButtonGlow != null) {
+            playButtonGlow.setColor(Color.web(dey ? "#fd6830" : "#4aa8ff", 0.60));
+        }
 
         modLoaderBox.getItems().clear();
         if (dey) {
@@ -5744,6 +7805,7 @@ public class LauncherApp extends Application {
     /** Rebuilds the left-column filter tiles for the current mode and selects the first one. */
     private void rebuildVersionTiles() {
         versionTileList.getChildren().clear();
+        versionTileList.getChildren().add(sectionLabel("VERSIONS"));
         VersionPreset[] presets = deyMode ? DEY_PRESETS : VANILLA_PRESETS;
         String modePrefix = deyMode ? "DEY " : "VANILLA ";
         Button firstTile = null;
@@ -5753,6 +7815,8 @@ public class LauncherApp extends Application {
             tile.setMaxWidth(Double.MAX_VALUE);
             tile.setAlignment(Pos.CENTER_LEFT);
             tile.setUserData(preset);
+            tile.setGraphic(versionTileDot());
+            tile.setGraphicTextGap(10);
             tile.setOnAction(e -> selectVersionTile(preset, tile));
             versionTileList.getChildren().add(tile);
             if (firstTile == null) firstTile = tile;
@@ -5761,6 +7825,18 @@ public class LauncherApp extends Application {
         versionTileList.getChildren().add(modpackTileBox);
         rebuildModpackTiles();
         if (firstTile != null) selectVersionTile(presets[0], firstTile);
+    }
+
+    /** Round icon badge shown at the start of every version-filter tile (matches the reference
+     * design's sidebar rows -- a circular chip with a small box glyph, not just a bare dot);
+     * recolors to a glowing accent orange when its tile becomes active via the shared
+     * ".version-tile-active" ancestor selector in theme.css. */
+    private StackPane versionTileDot() {
+        Node glyph = icon(IconFactory.Icon.MODPACK, 12);
+        glyph.getStyleClass().add("version-tile-icon-glyph");
+        StackPane badge = new StackPane(glyph);
+        badge.getStyleClass().add("version-tile-icon-badge");
+        return badge;
     }
 
     /** Sizes the tile scroller to its widest tile (+ room for the scroll bar) so labels are never truncated. */
@@ -5787,12 +7863,31 @@ public class LauncherApp extends Application {
      * instance folder, so two packs for the same Minecraft version and loader are two distinct tiles.
      */
     private Button buildModpackTile(ModpackMeta meta) {
-        Button tile = new Button(meta.name);
+        Button tile = new Button();
         tile.getStyleClass().add("version-tile");
         tile.setMaxWidth(Double.MAX_VALUE);
         tile.setAlignment(Pos.CENTER_LEFT);
-        tile.setGraphic(packArtworkNode(meta, 56, 32));
-        tile.setGraphicTextGap(10);
+
+        // Two-line label (matches the reference design's modpack rows: bold pack name on top,
+        // a muted "version • loader" subtitle underneath) instead of the single-line name the
+        // plain filter tiles use -- a Button only supports one text run, so the whole name +
+        // subtitle block is built as a custom graphic instead.
+        Label nameLabel = new Label(meta.name);
+        nameLabel.getStyleClass().add("tile-name-label");
+        StringBuilder sub = new StringBuilder();
+        if (meta.mcVersion != null && !meta.mcVersion.isBlank()) sub.append(meta.mcVersion);
+        if (meta.loader != null && !meta.loader.isBlank()) {
+            if (sub.length() > 0) sub.append("  \u2022  ");
+            sub.append(meta.loader);
+        }
+        Label subtitleLabel = new Label(sub.toString());
+        subtitleLabel.getStyleClass().add("tile-subtitle-label");
+        VBox textCol = new VBox(2, nameLabel, subtitleLabel);
+        textCol.setAlignment(Pos.CENTER_LEFT);
+
+        HBox graphic = new HBox(10, packArtworkNode(meta, 40, 40), textCol);
+        graphic.setAlignment(Pos.CENTER_LEFT);
+        tile.setGraphic(graphic);
         tile.setUserData(meta.instanceId);
         StringBuilder tip = new StringBuilder("Modpack profile -- Minecraft ").append(meta.mcVersion);
         if (meta.loader != null && !meta.loader.isBlank()) tip.append(", ").append(meta.loader);
@@ -6112,6 +8207,19 @@ public class LauncherApp extends Application {
                 ? preferredVersionId : matched.get(0));
     }
 
+    /** The version-filter tile buttons, in preset order. They are NOT the first children of
+     * versionTileList -- a "VERSIONS" section label sits above them and the modpack tiles are
+     * appended below -- so preset index i maps to {@code versionTiles().get(i)} and never to
+     * {@code versionTileList.getChildren().get(i)} (that label is a Label, so the direct cast to
+     * Button blew up on startup). */
+    private List<Button> versionTiles() {
+        List<Button> tiles = new ArrayList<>();
+        for (Node n : versionTileList.getChildren()) {
+            if (n instanceof Button b && b.getUserData() instanceof VersionPreset) tiles.add(b);
+        }
+        return tiles;
+    }
+
     /** Restores the exact version+mode you last hit Play with, if it still matches one of the
      * current mode's tiles. Called once right after the tiles are first built (best-effort, off
      * whatever's loaded so far) and again once the real version list finishes loading. */
@@ -6119,10 +8227,10 @@ public class LauncherApp extends Application {
         String last = prefs.lastVersionId;
         if (last == null || last.isBlank()) return;
         VersionPreset[] presets = deyMode ? DEY_PRESETS : VANILLA_PRESETS;
-        for (int i = 0; i < presets.length && i < versionTileList.getChildren().size(); i++) {
+        List<Button> tiles = versionTiles();
+        for (int i = 0; i < presets.length && i < tiles.size(); i++) {
             if (presetCouldMatch(presets[i], last)) {
-                Button tile = (Button) versionTileList.getChildren().get(i);
-                selectVersionTile(presets[i], tile, last);
+                selectVersionTile(presets[i], tiles.get(i), last);
                 return;
             }
         }
@@ -6167,20 +8275,90 @@ public class LauncherApp extends Application {
         return next == '.' || next == '-' || next == '_';
     }
 
+    /**
+     * The game-output console, styled and placed exactly like the reference design: ONE bordered
+     * rounded panel in the Home page's right column, under the Play block, whose top edge carries
+     * the "GAME OUTPUT" strip (a slightly lighter band inside the frame, with the copy / clear /
+     * pop-out tools on its right) and whose body is the read-only log itself.
+     *
+     * <p>The tracking in the reference's title is wide enough that a plain 11px label would read as
+     * a different word, and JavaFX CSS has no letter-spacing property at all, so the spacing is
+     * written into the text itself with thin spaces (U+2009): "G A M E   O U T P U T".
+     */
     private VBox buildLogPane() {
-        Label logLabel = new Label("GAME OUTPUT");
-        logLabel.getStyleClass().add("field-label");
+        Label logLabel = new Label("G\u2009A\u2009M\u2009E\u2002\u2009O\u2009U\u2009T\u2009P\u2009U\u2009T");
+        logLabel.getStyleClass().add("log-title");
 
         logArea = new TextArea();
         logArea.setEditable(false);
         logArea.getStyleClass().add("log-area");
+        // The console lives in a column, not in a SplitPane, so it needs its own ceiling/floor:
+        // it grows into whatever height the Home page has left over, and never below a few lines.
+        logArea.setMinHeight(60);
         VBox.setVgrow(logArea, Priority.ALWAYS);
 
-        VBox box = new VBox(8, logLabel, logArea);
-        box.setPadding(new Insets(16, 28, 24, 28));
+        Button copyLogBtn = new Button();
+        copyLogBtn.setGraphic(icon(IconFactory.Icon.CLIPBOARD, 15));
+        copyLogBtn.setGraphicTextGap(0);
+        copyLogBtn.getStyleClass().add("log-tool-button");
+        copyLogBtn.setTooltip(new Tooltip("Copy game output"));
+        copyLogBtn.setOnAction(e -> {
+            javafx.scene.input.ClipboardContent content = new javafx.scene.input.ClipboardContent();
+            content.putString(logArea.getText());
+            javafx.scene.input.Clipboard.getSystemClipboard().setContent(content);
+        });
+
+        Button clearLogBtn = new Button();
+        clearLogBtn.setGraphic(icon(IconFactory.Icon.TRASH, 15));
+        clearLogBtn.setGraphicTextGap(0);
+        clearLogBtn.getStyleClass().add("log-tool-button");
+        clearLogBtn.setTooltip(new Tooltip("Clear game output"));
+        clearLogBtn.setOnAction(e -> logArea.clear());
+
+        Button popOutLogBtn = new Button();
+        popOutLogBtn.setGraphic(icon(IconFactory.Icon.FILE, 15));
+        popOutLogBtn.setGraphicTextGap(0);
+        popOutLogBtn.getStyleClass().add("log-tool-button");
+        popOutLogBtn.setTooltip(new Tooltip("Open output in its own window"));
+        popOutLogBtn.setOnAction(e -> openLogInOwnWindow());
+
+        Region logHeaderSpacer = new Region();
+        HBox.setHgrow(logHeaderSpacer, Priority.ALWAYS);
+        HBox logHeader = new HBox(6, logLabel, logHeaderSpacer, copyLogBtn, clearLogBtn, popOutLogBtn);
+        logHeader.setAlignment(Pos.CENTER_LEFT);
+        logHeader.getStyleClass().add("log-header");
+
+        // No spacing between the two: the header band's own background is the divider, so the
+        // strip sits flush on the log body inside the one frame the panel draws around both.
+        VBox box = new VBox(logHeader, logArea);
         box.getStyleClass().add("log-section");
+        box.setMinHeight(120);
         VBox.setVgrow(box, Priority.ALWAYS);
         return box;
+    }
+
+    /** Mirrors the current game output into its own small, always-updating window -- handy for
+     * keeping an eye on the log while the main window is off on another tab. Read-only, like the
+     * in-window log; closing it just stops the mirroring, it never affects the real log. */
+    private void openLogInOwnWindow() {
+        TextArea mirror = new TextArea(logArea.getText());
+        mirror.setEditable(false);
+        mirror.getStyleClass().add("log-area");
+        javafx.beans.value.ChangeListener<String> sync = (o, a, b) -> mirror.setText(b);
+        logArea.textProperty().addListener(sync);
+
+        BorderPane root = new BorderPane(mirror);
+        root.setPadding(new Insets(12));
+        root.getStyleClass().addAll("root-pane", darkMode ? "theme-dark" : "theme-light");
+
+        Stage win = new Stage();
+        win.setTitle("DeyLauncher -- Game Output");
+        Scene sc = new Scene(root, 640, 420);
+        sc.getStylesheets().add(getClass().getResource("/theme.css").toExternalForm());
+        win.setScene(sc);
+        win.initOwner(stage);
+        win.setOnHidden(e -> logArea.textProperty().removeListener(sync));
+        win.show();
     }
 
     // ---- Modpacks: the icon button beside DEY/VANILLA, the installer window, and drag & drop ----
@@ -6750,8 +8928,9 @@ public class LauncherApp extends Application {
     private boolean selectVersionAndLoader(String mcVersion, String loader) {
         if (mcVersion == null || mcVersion.isBlank()) return false;
         VersionPreset[] presets = deyMode ? DEY_PRESETS : VANILLA_PRESETS;
+        List<Button> tiles = versionTiles();
         int chosen = -1, allVersionsTile = -1;
-        for (int i = 0; i < presets.length && i < versionTileList.getChildren().size(); i++) {
+        for (int i = 0; i < presets.length && i < tiles.size(); i++) {
             if (presets[i].kind() == FilterKind.ALL) allVersionsTile = i;
             if (presetCouldMatch(presets[i], mcVersion)) {
                 chosen = i;
@@ -6759,8 +8938,8 @@ public class LauncherApp extends Application {
             }
         }
         if (chosen < 0) chosen = allVersionsTile;
-        if (chosen < 0 || !(versionTileList.getChildren().get(chosen) instanceof Button tile)) return false;
-        selectVersionTile(presets[chosen], tile, mcVersion);
+        if (chosen < 0) return false;
+        selectVersionTile(presets[chosen], tiles.get(chosen), mcVersion);
         if (loader != null && !loader.isBlank() && modLoaderBox.getItems().contains(loader)) {
             modLoaderBox.setValue(loader);
         }
@@ -10391,6 +12570,21 @@ public class LauncherApp extends Application {
         Label verifyPackNote = new Label("Anything missing is fetched automatically before the game starts.");
         verifyPackNote.getStyleClass().add("notice-label");
 
+        // Friends (Settings > Launcher): whether a friend's profile adds a "Last online ..." line
+        // while they're offline. Display-only -- their launcher publishes lastSeen either way, so
+        // this changes nothing about what leaves this machine.
+        CheckBox lastOnlineBox = new CheckBox("Show when friends were last online");
+        lastOnlineBox.setSelected(prefs.showLastOnline);
+        lastOnlineBox.setTooltip(new Tooltip("Adds a \"Last online ...\" line to a friend's profile "
+                + "while they're offline. Friends who are online already say what they're playing."));
+        lastOnlineBox.selectedProperty().addListener((o, a, b) -> {
+            markDirty.run();
+            prefs.showLastOnline = b;
+            prefs.save();
+        });
+        Label lastOnlineNote = new Label("Only ever drawn on a friend's profile while they're offline.");
+        lastOnlineNote.getStyleClass().add("notice-label");
+
         Runnable applyStartupSize = () -> {
             markDirty.run();
             prefs.startWidth = parseIntOr(startWidthField.getText(), (int) prefs.startWidth);
@@ -10452,6 +12646,11 @@ public class LauncherApp extends Application {
         settingsSizeBox.setAlignment(Pos.CENTER_LEFT);
         grid.add(settingsSizeBox, 0, row++, 2, 1);
         grid.add(settingsSizeNote, 0, row++, 2, 1);
+
+        row++;
+        grid.add(sectionLabel("FRIENDS"), 0, row++, 2, 1);
+        grid.add(lastOnlineBox, 0, row++, 2, 1);
+        grid.add(lastOnlineNote, 0, row++, 2, 1);
 
         row++;
         grid.add(sectionLabel("MODPACKS"), 0, row++, 2, 1);
@@ -10753,75 +12952,25 @@ public class LauncherApp extends Application {
                     Platform.runLater(() -> log("Couldn't install the AWT-init helper (continuing): " + msg));
                 }
 
-                // DeyCapes integration only receives public repository coordinates. Never copy a GitHub
-                // credential into a game instance: instance folders, logs and mod jars are user-accessible.
-                // Private cape repositories require a server-side/public proxy rather than a shipped token.
+                // DeyCapes: hand the shared cape data to the in-game mod as LOCAL FILES. The cape
+                // catalog lives in the same PRIVATE repo as the friends graph, and the mod has no
+                // GitHub credential by design (a token copied into a game instance would sit in plain
+                // text on disk and carries write access to that shared backend), so it cannot read the
+                // repo anonymously -- GitHub answers 404, not 403, for a private repo, which is exactly
+                // why Dey capes used to never render in-game no matter what the launcher did. The
+                // launcher CAN read it: it holds the embedded token. So it fetches the catalog and every
+                // texture here (falling back to the PNGs bundled in this jar) and writes them into
+                // config/deycapes/, which is precisely the dashed-uuid -> PNG layout the mod's local
+                // provider already reads. Nothing is published, the repo stays private, no token ever
+                // leaves the launcher, and every install works with zero setup. See DeyCapesLocalHandoff.
                 if (deyAtLaunch && modLoader.equals("Fabric") && deyCapesService != null && !"Vanilla".equals(modLoader)) {
                     try {
-                        var cfgDir = gameDir.resolve("config").resolve("deycapes");
-                        java.nio.file.Files.createDirectories(cfgDir);
-                        var cfg = new java.util.Properties();
-                        cfg.setProperty("owner", deyCapesService.gitConfig().owner());
-                        cfg.setProperty("repo", deyCapesService.gitConfig().repo());
-                        cfg.setProperty("capesPath", deyCapesService.gitConfig().capesPath());
-                        cfg.setProperty("capesOwnedPath", deyCapesService.gitConfig().ownershipPath());
-                        cfg.setProperty("capesDir", deyCapesService.gitConfig().capesDir());
-                        try (var out = java.nio.file.Files.newOutputStream(cfgDir.resolve("github.properties"))) {
-                            cfg.store(out, "DeyCapes public repository settings");
-                        }
-                    } catch (Exception cfgEx) {
-                                                Platform.runLater(() -> log("Couldn't write DeyCapes config (continuing without remote capes): " + cfgEx.getMessage()));
-                    }
-
-                    // Best-effort diagnostic: the in-game DeyCapes mod fetches the cape repo
-                    // ANONYMOUSLY (no GitHub token is ever written into a game instance -- see the
-                    // comment above), so a private or empty repo 401/403/404s inside the mod and Dey
-                    // capes never render in Minecraft, even though the launcher writes ownership
-                    // fine via the embedded token. Probe anonymously so this silent in-game
-                    // failure surfaces in the launcher log instead.
-                    String dcOwner = deyCapesService.gitConfig().owner();
-                    String dcRepo = deyCapesService.gitConfig().repo();
-                    String dcCapesDir = deyCapesService.gitConfig().capesDir();
-                    // The exact file GithubCapeProvider.fetchMapping() (the mod, decompiled) requests
-                    // FIRST is /contents/<capesPath> (capes.json itself), not the capes/ texture folder --
-                    // probe that one specifically too, so "repo is private/unreachable" (both paths fail
-                    // the same way) is distinguishable from "repo is public but capes.json was never
-                    // written yet" (only this probe fails; see the ensureCatalog() seed failure above).
-                    String dcCapesPath = deyCapesService.gitConfig().capesPath();
-                    var dcClient = java.net.http.HttpClient.newHttpClient(); try {
-                        var dcResp = dcClient.send(
-                                java.net.http.HttpRequest.newBuilder(
-                                        java.net.URI.create("https://api.github.com/repos/"
-                                                + dcOwner + "/" + dcRepo + "/contents/" + dcCapesDir))
-                                        .header("Accept", "application/vnd.github+json")
-                                        .GET().build(),
-                                java.net.http.HttpResponse.BodyHandlers.ofString());
-                        if (dcResp.statusCode() == 401 || dcResp.statusCode() == 403 || dcResp.statusCode() == 404) {
-                            Platform.runLater(() -> log("DEY CAPES: the in-game DeyCapes mod cannot read " + dcOwner + "/" + dcRepo
-                                    + " anonymously (HTTP " + dcResp.statusCode() + "). That repo is private or empty -- the mod never "
-                                    + "receives a token, so Dey capes won't render in Minecraft. Make the repo PUBLIC on GitHub, "
-                                    + "or run a server-side proxy. (The launcher still writes cape ownership via its embedded token.)"));
-                        } else {
-                            var dcCapesResp = dcClient.send(
-                                    java.net.http.HttpRequest.newBuilder(
-                                            java.net.URI.create("https://api.github.com/repos/"
-                                                    + dcOwner + "/" + dcRepo + "/contents/" + dcCapesPath))
-                                            .header("Accept", "application/vnd.github+json")
-                                            .GET().build(),
-                                    java.net.http.HttpResponse.BodyHandlers.ofString());
-                            if (dcCapesResp.statusCode() == 404) {
-                                Platform.runLater(() -> log("DEY CAPES: " + dcOwner + "/" + dcRepo + " is reachable anonymously, "
-                                        + "but " + dcCapesPath + " doesn't exist in it yet (HTTP 404) -- the mod has no equip data "
-                                        + "to read at all. This usually means the launcher's one-time capes.json seed never "
-                                        + "succeeded (check the log for a \"couldn't seed capes.json\" line near startup)."));
-                            } else if (dcCapesResp.statusCode() != 200) {
-                                Platform.runLater(() -> log("DEY CAPES: " + dcCapesPath + " request returned HTTP "
-                                        + dcCapesResp.statusCode() + " when read anonymously -- the mod will not be able to "
-                                        + "load equipped capes this way either."));
-                            }
-                        }
-                    } catch (Exception ignored) {
-                        // Best-effort probe; never block launch over it.
+                        var capeHandoff = com.deylauncher.deycapes.DeyCapesLocalHandoff
+                                .writeInto(gameDir, deyCapesService);
+                        Platform.runLater(() -> log("DEY CAPES: " + capeHandoff.summary()));
+                    } catch (Exception capeEx) {
+                        Platform.runLater(() -> log("DEY CAPES: couldn't prepare the in-game cape files "
+                                + "(continuing without Dey capes): " + capeEx.getMessage()));
                     }
                 }
 
@@ -11163,6 +13312,9 @@ public class LauncherApp extends Application {
     private Label badgeLabel(boolean running) {
         Label label = new Label(running ? "RUNNING" : "STOPPED");
         label.getStyleClass().add(running ? "badge-online" : "badge-offline");
+        // Same reason as rolePill(): "RUNN…"/"STOPP…" is useless on a card whose only job is to say
+        // whether the server is up.
+        label.setMinWidth(Region.USE_PREF_SIZE);
         Circle dot = new Circle(3.6);
         dot.getStyleClass().add(running ? "status-dot-online" : "status-dot-offline");
         label.setGraphic(dot);

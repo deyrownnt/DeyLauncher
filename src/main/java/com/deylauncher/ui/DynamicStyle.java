@@ -25,6 +25,11 @@ public class DynamicStyle {
     private static final double BASE_INPUT_FONT = 16;
     private static final double BASE_PLAY_FONT = 19;
     private static final double BASE_LOG_FONT = 14.5;
+    // Top bar: the nav tab labels and the account name are sized here too, so the Settings
+    // text-scale slider moves them with everything else (see the NAV TABS / account block in
+    // theme.css for the 100% numbers these mirror).
+    private static final double BASE_NAV_TAB_FONT = 19;
+    private static final double BASE_ACCOUNT_NAME_FONT = 20;
     private static final double BASE_PILL_PADDING_V = 10;
     private static final double BASE_PILL_PADDING_H = 22;
     private static final double BASE_INPUT_PADDING = 12;
@@ -50,6 +55,10 @@ public class DynamicStyle {
         sb.append(".field-label { -fx-font-size: ").append(px(BASE_FIELD_LABEL * text)).append("; }\n");
         sb.append(".notice-label { -fx-font-size: ").append(px(BASE_NOTICE * text)).append("; }\n");
         sb.append(".log-area { -fx-font-size: ").append(px(BASE_LOG_FONT * text)).append("; }\n");
+        // Top-bar type: same story as everything else here -- theme.css pins the 100% numbers, and
+        // this override is what lets the Settings text-scale slider move them live.
+        sb.append(".nav-tab-button { -fx-font-size: ").append(px(BASE_NAV_TAB_FONT * text)).append("; }\n");
+        sb.append(".account-btn-name { -fx-font-size: ").append(px(BASE_ACCOUNT_NAME_FONT * text)).append("; }\n");
 
         sb.append(".input-field { -fx-font-size: ").append(px(BASE_INPUT_FONT * text))
                 .append("; -fx-padding: ").append(px(BASE_INPUT_PADDING * ui)).append("; }\n");

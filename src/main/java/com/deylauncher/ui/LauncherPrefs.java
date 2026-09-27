@@ -64,6 +64,11 @@ public class LauncherPrefs {
     // Friends / presence (Account tab, Settings > Launcher)
     public boolean invisibleMode = false;         // broadcast OFFLINE to friends even while actually online
     public boolean shareServerAddress = false;    // whether the server you're on is published to friends.json at all (pure opt-in -- the launcher never turns this on itself)
+    /** Whether a friend's profile shows a "Last online ..." line while they're offline (Settings >
+     *  Launcher > FRIENDS). On by default, because it is about somebody else's published presence --
+     *  the launcher never publishes anything extra for it, and turning it off only changes what this
+     *  PC draws. */
+    public boolean showLastOnline = true;
     /** Legacy field from the builds that auto-filled this with the last server you joined and then
      *  republished it as live presence (which is why a stale "playing on ..." could stick around
      *  forever). Presence is now built from the live game session only -- see
@@ -129,6 +134,7 @@ public class LauncherPrefs {
                     props.getProperty("nativeWayland", String.valueOf(defaultNativeWayland())));
             p.invisibleMode = Boolean.parseBoolean(props.getProperty("invisibleMode", "false"));
             p.shareServerAddress = Boolean.parseBoolean(props.getProperty("shareServerAddress", "false"));
+            p.showLastOnline = Boolean.parseBoolean(props.getProperty("showLastOnline", "true"));
             p.myServerAddress = props.getProperty("myServerAddress", "");
             p.verifyModpackOnLaunch = Boolean.parseBoolean(props.getProperty("verifyModpackOnLaunch", "true"));
         } catch (IOException ignored) {
@@ -163,6 +169,7 @@ public class LauncherPrefs {
             props.setProperty("nativeWayland", String.valueOf(nativeWayland));
             props.setProperty("invisibleMode", String.valueOf(invisibleMode));
             props.setProperty("shareServerAddress", String.valueOf(shareServerAddress));
+            props.setProperty("showLastOnline", String.valueOf(showLastOnline));
             props.setProperty("myServerAddress", myServerAddress == null ? "" : myServerAddress);
             props.setProperty("verifyModpackOnLaunch", String.valueOf(verifyModpackOnLaunch));
             try (OutputStream out = Files.newOutputStream(file())) {
